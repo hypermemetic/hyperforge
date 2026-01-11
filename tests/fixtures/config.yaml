@@ -1,0 +1,44 @@
+# Sample multi-org config.yaml for testing
+# This file demonstrates the full config structure with multiple organizations
+
+default_org: hypermemetic
+
+secret_provider: keychain
+
+organizations:
+  hypermemetic:
+    owner: hypermemetic
+    ssh_key: ~/.ssh/id_hypermemetic
+    origin: github
+    # New object format with per-forge config
+    forges:
+      github:
+        sync: true
+      codeberg:
+        sync: true
+    default_visibility: public
+
+  personal:
+    owner: shmendez
+    ssh_key: ~/.ssh/id_personal
+    origin: github
+    # Legacy array format (for backwards compatibility testing)
+    forges:
+      - github
+    default_visibility: private
+
+  oss-contrib:
+    owner: oss-contrib
+    ssh_key: ~/.ssh/id_oss
+    origin: codeberg
+    forges:
+      github:
+        sync: false  # Read-only mirror
+      codeberg:
+        sync: true
+
+# Workspace bindings
+workspaces:
+  /Users/shmendez/dev/hypermemetic: hypermemetic
+  /Users/shmendez/dev/personal: personal
+  /Users/shmendez/dev/oss: oss-contrib

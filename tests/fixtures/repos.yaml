@@ -1,0 +1,89 @@
+# Sample repos.yaml for testing
+# This file demonstrates various repository states for the 'hypermemetic' org
+
+owner: hypermemetic
+
+repos:
+  # Fully synced repo (exists on all configured forges)
+  hyperforge:
+    description: "Multi-forge infrastructure management hub"
+    visibility: public
+    forges:
+      - github
+      - codeberg
+    protected: true
+    _synced:
+      github:
+        url: "https://github.com/hypermemetic/hyperforge"
+        id: "R_123456"
+        synced_at: "2026-01-10T12:00:00Z"
+      codeberg:
+        url: "https://codeberg.org/hypermemetic/hyperforge"
+        id: "42"
+        synced_at: "2026-01-10T12:00:00Z"
+
+  # Repo synced to GitHub only (Codeberg pending)
+  synapse:
+    description: "Neural command orchestration"
+    visibility: public
+    forges:
+      - github
+      - codeberg
+    _synced:
+      github:
+        url: "https://github.com/hypermemetic/synapse"
+        id: "R_789012"
+        synced_at: "2026-01-09T10:00:00Z"
+    _discovered:
+      github:
+        exists: true
+        url: "https://github.com/hypermemetic/synapse"
+        id: "R_789012"
+      codeberg:
+        exists: false
+
+  # Private repo (auto-detected from dot prefix)
+  .dotfiles:
+    description: "Personal dotfiles"
+    visibility: private
+    forges:
+      - github
+    protected: true
+    _synced:
+      github:
+        url: "https://github.com/hypermemetic/.dotfiles"
+        id: "R_private1"
+        synced_at: "2026-01-08T08:00:00Z"
+
+  # Repo with no synced state (newly created, pending sync)
+  new-project:
+    description: "A brand new project"
+    visibility: public
+    forges:
+      - github
+      - codeberg
+
+  # Repo marked for deletion
+  deprecated-tool:
+    description: "Old tool, no longer needed"
+    visibility: public
+    forges:
+      - github
+    _delete: true
+    _synced:
+      github:
+        url: "https://github.com/hypermemetic/deprecated-tool"
+        id: "R_todelete"
+        synced_at: "2025-12-01T00:00:00Z"
+
+  # Repo with discovered state (found via API but not yet in desired config)
+  discovered-only:
+    visibility: public
+    forges:
+      - github
+    _discovered:
+      github:
+        exists: true
+        url: "https://github.com/hypermemetic/discovered-only"
+        id: "R_discovered"
+      last_refresh: "2026-01-10T11:00:00Z"
