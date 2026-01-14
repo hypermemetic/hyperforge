@@ -145,27 +145,46 @@ impl SshConfigBridge {
     fn remove_org_entries(&self, content: &str, org_name: &str) -> String {
         let marker = format!("{} {}", HYPERFORGE_MARKER, org_name);
         let mut result = Vec::new();
-        let mut skip_until_next_host = false;
+        let mut in_skip_block = false;
+        let mut seen_host_in_block = false;
 
         for line in content.lines() {
             if line.starts_with(&marker) {
                 // Start skipping this hyperforge block
-                skip_until_next_host = true;
+                in_skip_block = true;
+                seen_host_in_block = false;
                 continue;
             }
 
-            if skip_until_next_host {
-                // Check if we've hit a new Host or another hyperforge marker
-                if line.starts_with("Host ") || line.starts_with(HYPERFORGE_MARKER) {
-                    skip_until_next_host = false;
-                    // If it's a hyperforge marker for a different org, keep it
-                    if line.starts_with(HYPERFORGE_MARKER) && !line.starts_with(&marker) {
+            if in_skip_block {
+                if line.starts_with("Host ") {
+                    if !seen_host_in_block {
+                        // This is the Host line belonging to the org we're removing - skip it
+                        seen_host_in_block = true;
+                        continue;
+                    } else {
+                        // A second Host line means we've hit a new entry - stop skipping
+                        in_skip_block = false;
                         result.push(line);
-                    } else if line.starts_with("Host ") {
-                        result.push(line);
+                        continue;
                     }
                 }
-                // Otherwise continue skipping
+
+                if line.starts_with(HYPERFORGE_MARKER) {
+                    // Hit another org's marker - stop skipping and keep it
+                    in_skip_block = false;
+                    result.push(line);
+                    continue;
+                }
+
+                // Skip indented lines (part of the Host block) and blank lines
+                if line.starts_with(char::is_whitespace) || line.trim().is_empty() {
+                    continue;
+                }
+
+                // Non-indented, non-Host, non-marker line - stop skipping
+                in_skip_block = false;
+                result.push(line);
                 continue;
             }
 
