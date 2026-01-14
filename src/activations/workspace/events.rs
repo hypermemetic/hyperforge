@@ -129,7 +129,56 @@ pub enum WorkspaceEvent {
     },
 
     // ============================================================================
-    // Sync Events
+    // Preview Events (sync without --yes)
+    // ============================================================================
+
+    /// Preview operation started for workspace
+    PreviewStarted {
+        workspace_path: PathBuf,
+        org_count: usize,
+    },
+
+    /// Preview started for a specific org
+    OrgPreviewStarted { org_name: String },
+
+    /// Pulumi preview output line
+    PreviewOutput { line: String },
+
+    /// Importing existing resource into Pulumi state
+    PulumiImporting {
+        org_name: String,
+        repo_name: String,
+        forge: String,
+    },
+
+    /// Pulumi import result for a resource
+    PulumiImported {
+        org_name: String,
+        repo_name: String,
+        forge: String,
+        imported: bool,  // true if newly imported, false if already in state
+    },
+
+    /// Preview completed for a specific org - shows what would change
+    OrgPreviewComplete {
+        org_name: String,
+        to_create: usize,
+        to_update: usize,
+        to_delete: usize,
+        unchanged: usize,
+    },
+
+    /// Preview operation completed for entire workspace
+    PreviewComplete {
+        workspace_path: PathBuf,
+        total_to_create: usize,
+        total_to_update: usize,
+        total_to_delete: usize,
+        total_unchanged: usize,
+    },
+
+    // ============================================================================
+    // Sync Events (sync with --yes)
     // ============================================================================
 
     /// Sync operation started for workspace
@@ -140,6 +189,9 @@ pub enum WorkspaceEvent {
 
     /// Sync started for a specific org within workspace sync
     OrgSyncStarted { org_name: String },
+
+    /// Pulumi sync output line
+    SyncOutput { line: String },
 
     /// Sync completed for a specific org within workspace sync
     OrgSyncComplete {

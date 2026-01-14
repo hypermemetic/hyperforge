@@ -4,6 +4,7 @@ use crate::error::Result;
 use super::HyperforgePaths;
 
 /// Storage operations for a specific organization's repos
+#[derive(Clone)]
 pub struct OrgStorage {
     paths: HyperforgePaths,
     org_name: String,
@@ -32,6 +33,7 @@ impl OrgStorage {
     }
 
     /// Load staged repos from staged-repos.yaml
+    /// Handles legacy files that may be missing the `owner` field
     pub async fn load_staged(&self) -> Result<ReposConfig> {
         let path = self.paths.staged_repos_file(&self.org_name);
 
@@ -43,8 +45,23 @@ impl OrgStorage {
         }
 
         let contents = tokio::fs::read_to_string(&path).await?;
-        let config: ReposConfig = serde_yaml::from_str(&contents)?;
-        Ok(config)
+
+        // Try parsing as full ReposConfig first, fall back to repos-only for legacy files
+        match serde_yaml::from_str::<ReposConfig>(&contents) {
+            Ok(config) => Ok(config),
+            Err(_) => {
+                // Legacy format: just repos without owner
+                #[derive(serde::Deserialize)]
+                struct LegacyStagedRepos {
+                    repos: HashMap<String, RepoConfig>,
+                }
+                let legacy: LegacyStagedRepos = serde_yaml::from_str(&contents)?;
+                Ok(ReposConfig {
+                    owner: self.org_name.clone(),
+                    repos: legacy.repos,
+                })
+            }
+        }
     }
 
     /// Save staged repos to staged-repos.yaml

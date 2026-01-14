@@ -1,8 +1,12 @@
 pub mod activations;
+pub mod adapters;
 pub mod bridge;
+pub mod domain;
 pub mod error;
 pub mod events;
 pub mod hub;
+pub mod ports;
+pub mod services;
 pub mod storage;
 pub mod types;
 

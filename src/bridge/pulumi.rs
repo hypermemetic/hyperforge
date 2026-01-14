@@ -306,6 +306,55 @@ impl PulumiBridge {
         Ok(PulumiOutputs { repos })
     }
 
+    /// Import an existing resource into Pulumi state
+    ///
+    /// This adopts an existing forge resource so Pulumi manages it instead of trying to create it.
+    /// Returns Ok(true) if imported, Ok(false) if already exists in state, Err on failure.
+    pub async fn import_resource(
+        &self,
+        org_name: &str,       // Org name for token lookup
+        resource_type: &str,  // e.g., "github:index/repository:Repository"
+        logical_name: &str,   // The name used in Pulumi program
+        resource_id: &str,    // e.g., "owner/repo-name"
+    ) -> Result<bool, String> {
+        // Use ./forge to ensure tokens are set up properly
+        let output = Command::new("./forge")
+            .current_dir(&self.pulumi_dir)
+            .args([
+                "import",
+                resource_type,
+                logical_name,
+                resource_id,
+                "--yes",           // Auto-confirm
+                "--skip-preview",  // Don't show preview
+                "--suppress-outputs", // Less noise
+            ])
+            .env("HYPERFORGE_ORG", org_name)
+            .env("PULUMI_CONFIG_PASSPHRASE", "")
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            Ok(true)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Combine stdout and stderr for error checking
+            let all_output = format!("{}\n{}", stdout, stderr);
+
+            // "already exists" or "already managed" means it's already in state - that's fine
+            if all_output.contains("already exists") || all_output.contains("already managed") {
+                Ok(false)
+            // "does not exist" means the repo doesn't exist on the forge - that's fine, we'll create it
+            } else if all_output.contains("does not exist") {
+                Ok(false)
+            } else {
+                Err(all_output)
+            }
+        }
+    }
+
     /// Select or create a Pulumi stack for an organization
     ///
     /// Each organization gets its own Pulumi stack for isolated state management.
