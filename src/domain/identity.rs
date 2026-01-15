@@ -44,52 +44,80 @@ impl fmt::Display for RepoIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashSet, HashMap};
 
+    /// Table-driven tests for full_path formatting
     #[test]
-    fn test_repo_identity_new() {
-        let id = RepoIdentity::new("hypermemetic", "hyperforge");
-        assert_eq!(id.org, "hypermemetic");
-        assert_eq!(id.name, "hyperforge");
+    fn test_full_path_formatting() {
+        let cases = [
+            ("hypermemetic", "hyperforge", "hypermemetic/hyperforge"),
+            ("my-org", "my-repo", "my-org/my-repo"),
+            ("org_with_underscore", "repo.with.dots", "org_with_underscore/repo.with.dots"),
+            ("", "empty-org", "/empty-org"),  // Edge case: empty org
+            ("org", "", "org/"),              // Edge case: empty name
+        ];
+
+        for (org, name, expected) in cases {
+            let id = RepoIdentity::new(org, name);
+            assert_eq!(
+                id.full_path(),
+                expected,
+                "full_path() failed for org={:?}, name={:?}",
+                org,
+                name
+            );
+            // Display should match full_path
+            assert_eq!(format!("{}", id), expected);
+        }
     }
 
+    /// Verify equality semantics: same org+name = equal, different = not equal
     #[test]
-    fn test_repo_identity_full_path() {
-        let id = RepoIdentity::new("hypermemetic", "hyperforge");
-        assert_eq!(id.full_path(), "hypermemetic/hyperforge");
+    fn test_equality_semantics() {
+        let base = RepoIdentity::new("hypermemetic", "hyperforge");
+
+        // Same values = equal
+        assert_eq!(base, RepoIdentity::new("hypermemetic", "hyperforge"));
+
+        // Different name = not equal
+        assert_ne!(base, RepoIdentity::new("hypermemetic", "other-repo"));
+
+        // Different org = not equal
+        assert_ne!(base, RepoIdentity::new("other-org", "hyperforge"));
+
+        // Both different = not equal
+        assert_ne!(base, RepoIdentity::new("other-org", "other-repo"));
     }
 
+    /// Verify Hash consistency for use in HashSet/HashMap
     #[test]
-    fn test_repo_identity_display() {
-        let id = RepoIdentity::new("hypermemetic", "hyperforge");
-        assert_eq!(format!("{}", id), "hypermemetic/hyperforge");
-    }
-
-    #[test]
-    fn test_repo_identity_equality() {
-        let id1 = RepoIdentity::new("hypermemetic", "hyperforge");
-        let id2 = RepoIdentity::new("hypermemetic", "hyperforge");
-        let id3 = RepoIdentity::new("hypermemetic", "other");
-
-        assert_eq!(id1, id2);
-        assert_ne!(id1, id3);
-    }
-
-    #[test]
-    fn test_repo_identity_hash() {
-        use std::collections::HashSet;
-
+    fn test_hash_consistency_for_collections() {
+        // HashSet deduplication
         let mut set = HashSet::new();
-        set.insert(RepoIdentity::new("hypermemetic", "hyperforge"));
-        set.insert(RepoIdentity::new("hypermemetic", "hyperforge")); // duplicate
+        set.insert(RepoIdentity::new("org", "repo1"));
+        set.insert(RepoIdentity::new("org", "repo1")); // duplicate
+        set.insert(RepoIdentity::new("org", "repo2")); // different
+        assert_eq!(set.len(), 2, "HashSet should deduplicate identical identities");
 
-        assert_eq!(set.len(), 1);
+        // HashMap key lookup
+        let mut map = HashMap::new();
+        map.insert(RepoIdentity::new("org", "repo"), "value1");
+        map.insert(RepoIdentity::new("org", "repo"), "value2"); // overwrites
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&RepoIdentity::new("org", "repo")), Some(&"value2"));
     }
 
+    /// Verify JSON roundtrip preserves identity
     #[test]
-    fn test_repo_identity_serialization() {
-        let id = RepoIdentity::new("hypermemetic", "hyperforge");
-        let json = serde_json::to_string(&id).unwrap();
-        let deserialized: RepoIdentity = serde_json::from_str(&json).unwrap();
-        assert_eq!(id, deserialized);
+    fn test_json_roundtrip() {
+        let original = RepoIdentity::new("hypermemetic", "hyperforge");
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: RepoIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+
+        // Verify JSON structure
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["org"], "hypermemetic");
+        assert_eq!(value["name"], "hyperforge");
     }
 }

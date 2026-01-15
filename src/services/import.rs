@@ -359,74 +359,470 @@ impl ImportService {
 mod tests {
     use super::*;
     use crate::adapters::InMemoryStorageAdapter;
-    use crate::domain::RepoIdentity;
+    use crate::domain::{ForgeRepoState, RepoIdentity};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
+
+    // =========================================================================
+    // MockForgePort - records calls and returns configured responses
+    // =========================================================================
+
+    struct MockForgePort {
+        forge_type: Forge,
+        /// Repos to return from list_repos, keyed by org
+        repos_by_org: Mutex<std::collections::HashMap<String, Vec<ObservedRepo>>>,
+        /// Count of list_repos calls
+        list_repos_calls: AtomicUsize,
+        /// Count of create_repo calls
+        create_repo_calls: AtomicUsize,
+    }
+
+    impl MockForgePort {
+        fn new(forge: Forge) -> Self {
+            Self {
+                forge_type: forge,
+                repos_by_org: Mutex::new(std::collections::HashMap::new()),
+                list_repos_calls: AtomicUsize::new(0),
+                create_repo_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn set_repos(&self, org: &str, repos: Vec<ObservedRepo>) {
+            let mut map = self.repos_by_org.lock().await;
+            map.insert(org.to_string(), repos);
+        }
+
+        fn list_repos_call_count(&self) -> usize {
+            self.list_repos_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ForgePort for MockForgePort {
+        fn forge_type(&self) -> Forge {
+            self.forge_type.clone()
+        }
+
+        async fn list_repos(&self, org: &str) -> Result<Vec<ObservedRepo>, ForgeError> {
+            self.list_repos_calls.fetch_add(1, Ordering::SeqCst);
+
+            let map = self.repos_by_org.lock().await;
+            match map.get(org) {
+                Some(repos) => Ok(repos.clone()),
+                None => Err(ForgeError::OrgNotFound {
+                    forge: self.forge_type.clone(),
+                    org: org.to_string(),
+                }),
+            }
+        }
+
+        async fn create_repo(&self, _repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
+            self.create_repo_calls.fetch_add(1, Ordering::SeqCst);
+            unimplemented!("not needed for import tests")
+        }
+
+        async fn update_repo(&self, _repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
+            unimplemented!("not needed for import tests")
+        }
+
+        async fn delete_repo(&self, _identity: &RepoIdentity) -> Result<(), ForgeError> {
+            unimplemented!("not needed for import tests")
+        }
+
+        async fn repo_exists(&self, _identity: &RepoIdentity) -> Result<bool, ForgeError> {
+            unimplemented!("not needed for import tests")
+        }
+    }
+
+    // =========================================================================
+    // Test helpers
+    // =========================================================================
+
+    fn make_observed_public(org: &str, name: &str, forge: Forge) -> ObservedRepo {
+        ObservedRepo::new(RepoIdentity::new(org, name)).with_forge_state(ForgeRepoState::found(
+            forge.clone(),
+            format!("https://{}/{}/{}", forge.ssh_host(), org, name),
+            Visibility::Public,
+            Some(format!("{}-id", name)),
+            Some(format!("{} description", name)),
+        ))
+    }
+
+    fn make_observed_private(org: &str, name: &str, forge: Forge) -> ObservedRepo {
+        ObservedRepo::new(RepoIdentity::new(org, name)).with_forge_state(ForgeRepoState::found(
+            forge.clone(),
+            format!("https://{}/{}/{}", forge.ssh_host(), org, name),
+            Visibility::Private,
+            Some(format!("{}-id", name)),
+            Some(format!("{} description", name)),
+        ))
+    }
+
+    // =========================================================================
+    // ImportService orchestration tests
+    // =========================================================================
 
     #[tokio::test]
-    async fn test_import_service_creation() {
+    async fn test_import_converts_forge_repos_to_desired_and_saves() {
+        // Given: forge has repos [A, B]
         let storage = Arc::new(InMemoryStorageAdapter::new());
-        let service = ImportService::new(vec![], storage);
-
-        assert!(service.forges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_import_options_builder() {
-        let opts = ImportOptions::all()
-            .from_forge(Forge::GitHub)
-            .skip_existing()
-            .dry_run();
-
-        assert!(opts.include_private);
-        assert!(opts.from_forges.contains(&Forge::GitHub));
-        assert!(opts.skip_existing);
-        assert!(opts.dry_run);
-    }
-
-    #[tokio::test]
-    async fn test_import_options_public_only() {
-        let opts = ImportOptions::public_only();
-
-        assert!(!opts.include_private);
-        assert!(opts.from_forges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_no_forges_configured_error() {
-        let storage = Arc::new(InMemoryStorageAdapter::new());
-        let service = ImportService::new(vec![], storage);
-
-        let result = service
-            .import_org("testorg", &ImportOptions::all())
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos(
+                "testorg",
+                vec![
+                    make_observed_public("testorg", "repo-a", Forge::GitHub),
+                    make_observed_public("testorg", "repo-b", Forge::GitHub),
+                ],
+            )
             .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import org
+        let result = service.import_org("testorg", &ImportOptions::all()).await.unwrap();
+
+        // Then: both repos are imported
+        assert_eq!(result.imported.len(), 2);
+        assert!(result.imported.iter().any(|r| r.name() == "repo-a"));
+        assert!(result.imported.iter().any(|r| r.name() == "repo-b"));
+        assert!(result.is_success());
+
+        // And: they are saved to storage
+        let saved = storage.load_desired("testorg").await.unwrap();
+        assert_eq!(saved.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_import_filters_private_repos_when_include_private_false() {
+        // Given: forge has [public-repo, private-repo]
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos(
+                "testorg",
+                vec![
+                    make_observed_public("testorg", "public-repo", Forge::GitHub),
+                    make_observed_private("testorg", "private-repo", Forge::GitHub),
+                ],
+            )
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import with include_private=false
+        let result = service.import_org("testorg", &ImportOptions::public_only()).await.unwrap();
+
+        // Then: only public repo is imported
+        assert_eq!(result.imported.len(), 1);
+        assert_eq!(result.imported[0].name(), "public-repo");
+
+        // Discovered should still contain both
+        assert_eq!(result.discovered.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_import_includes_private_repos_when_include_private_true() {
+        // Given: forge has [public-repo, private-repo]
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos(
+                "testorg",
+                vec![
+                    make_observed_public("testorg", "public-repo", Forge::GitHub),
+                    make_observed_private("testorg", "private-repo", Forge::GitHub),
+                ],
+            )
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import with include_private=true
+        let result = service.import_org("testorg", &ImportOptions::all()).await.unwrap();
+
+        // Then: both repos are imported
+        assert_eq!(result.imported.len(), 2);
+        assert!(result.imported.iter().any(|r| r.name() == "public-repo"));
+        assert!(result.imported.iter().any(|r| r.name() == "private-repo"));
+    }
+
+    #[tokio::test]
+    async fn test_import_skip_existing_does_not_overwrite() {
+        // Given: storage already has repo-a
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let existing = DesiredRepo::new(
+            RepoIdentity::new("testorg", "repo-a"),
+            Visibility::Private, // existing has Private
+            {
+                let mut forges = HashSet::new();
+                forges.insert(Forge::GitHub);
+                forges
+            },
+        )
+        .with_description("existing description");
+        storage.save_desired("testorg", &[existing]).await.unwrap();
+
+        // And: forge has [repo-a with Public, repo-b]
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos(
+                "testorg",
+                vec![
+                    make_observed_public("testorg", "repo-a", Forge::GitHub), // Public on forge
+                    make_observed_public("testorg", "repo-b", Forge::GitHub),
+                ],
+            )
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import with skip_existing=true
+        let result = service
+            .import_org("testorg", &ImportOptions::all().skip_existing())
+            .await
+            .unwrap();
+
+        // Then: repo-a is skipped, repo-b is imported
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0], "repo-a");
+        assert_eq!(result.imported.len(), 1);
+        assert_eq!(result.imported[0].name(), "repo-b");
+
+        // And: existing repo-a retains its original settings (Private)
+        let saved = storage.load_desired("testorg").await.unwrap();
+        let saved_repo_a = saved.iter().find(|r| r.name() == "repo-a").unwrap();
+        assert_eq!(saved_repo_a.visibility, Visibility::Private);
+        assert_eq!(saved_repo_a.description, Some("existing description".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_import_merges_with_existing_when_skip_existing() {
+        // Given: storage has [repo-a]
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let existing = DesiredRepo::new(
+            RepoIdentity::new("testorg", "repo-a"),
+            Visibility::Public,
+            {
+                let mut forges = HashSet::new();
+                forges.insert(Forge::GitHub);
+                forges
+            },
+        );
+        storage.save_desired("testorg", &[existing]).await.unwrap();
+
+        // And: forge has [repo-a, repo-b]
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos(
+                "testorg",
+                vec![
+                    make_observed_public("testorg", "repo-a", Forge::GitHub),
+                    make_observed_public("testorg", "repo-b", Forge::GitHub),
+                ],
+            )
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import with skip_existing
+        service
+            .import_org("testorg", &ImportOptions::all().skip_existing())
+            .await
+            .unwrap();
+
+        // Then: storage now has both repos
+        let saved = storage.load_desired("testorg").await.unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(saved.iter().any(|r| r.name() == "repo-a"));
+        assert!(saved.iter().any(|r| r.name() == "repo-b"));
+    }
+
+    #[tokio::test]
+    async fn test_import_dry_run_does_not_save() {
+        // Given: forge has [repo-a]
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos("testorg", vec![make_observed_public("testorg", "repo-a", Forge::GitHub)])
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import with dry_run=true
+        let result = service
+            .import_org("testorg", &ImportOptions::all().dry_run())
+            .await
+            .unwrap();
+
+        // Then: result shows what would be imported
+        assert_eq!(result.imported.len(), 1);
+        assert_eq!(result.imported[0].name(), "repo-a");
+
+        // But: nothing is saved to storage
+        let saved = storage.load_desired("testorg").await;
+        assert!(matches!(saved, Err(crate::ports::StorageError::OrgNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_import_returns_error_when_no_forges_configured() {
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let service = ImportService::new(vec![], storage);
+
+        let result = service.import_org("testorg", &ImportOptions::all()).await;
 
         assert!(matches!(result, Err(ImportError::NoForgesConfigured)));
     }
 
     #[tokio::test]
-    async fn test_import_result_new() {
-        let result = ImportResult::new("testorg");
+    async fn test_import_returns_org_not_found_when_no_forge_has_org() {
+        // Given: forge returns OrgNotFound
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        // Don't set any repos - will return OrgNotFound
 
-        assert_eq!(result.org, "testorg");
-        assert!(result.imported.is_empty());
-        assert!(result.skipped.is_empty());
-        assert!(result.discovered.is_empty());
-        assert!(result.errors.is_empty());
-        assert_eq!(result.total(), 0);
-        assert!(result.is_success());
+        let service = ImportService::new(vec![mock_forge.clone()], storage);
+
+        // When: import org that doesn't exist on forge
+        let result = service.import_org("nonexistent", &ImportOptions::all()).await;
+
+        // Then: returns OrgNotFound error
+        assert!(matches!(result, Err(ImportError::OrgNotFound { org }) if org == "nonexistent"));
     }
 
     #[tokio::test]
-    async fn test_import_result_total() {
+    async fn test_import_saves_synced_state() {
+        // Given: forge has repos
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos("testorg", vec![make_observed_public("testorg", "repo-a", Forge::GitHub)])
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import
+        service.import_org("testorg", &ImportOptions::all()).await.unwrap();
+
+        // Then: synced state is also saved (discovered repos)
+        let synced = storage.load_synced("testorg").await.unwrap();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].name(), "repo-a");
+    }
+
+    #[tokio::test]
+    async fn test_import_from_specific_forge_only() {
+        // Given: two forge adapters
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let github_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        let codeberg_forge = Arc::new(MockForgePort::new(Forge::Codeberg));
+
+        github_forge
+            .set_repos("testorg", vec![make_observed_public("testorg", "gh-repo", Forge::GitHub)])
+            .await;
+        codeberg_forge
+            .set_repos("testorg", vec![make_observed_public("testorg", "cb-repo", Forge::Codeberg)])
+            .await;
+
+        let service = ImportService::new(vec![github_forge.clone(), codeberg_forge.clone()], storage.clone());
+
+        // When: import from GitHub only
+        let result = service
+            .import_org("testorg", &ImportOptions::all().from_forge(Forge::GitHub))
+            .await
+            .unwrap();
+
+        // Then: only GitHub repo is imported
+        assert_eq!(result.imported.len(), 1);
+        assert_eq!(result.imported[0].name(), "gh-repo");
+
+        // And: only GitHub adapter was queried
+        assert_eq!(github_forge.list_repos_call_count(), 1);
+        assert_eq!(codeberg_forge.list_repos_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_discover_repos_does_not_save() {
+        // Given: forge has repos
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos("testorg", vec![make_observed_public("testorg", "repo-a", Forge::GitHub)])
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: discover repos (preview mode)
+        let discovered = service.discover_repos("testorg", &ImportOptions::all()).await.unwrap();
+
+        // Then: returns discovered repos
+        assert_eq!(discovered.len(), 1);
+
+        // But: nothing is saved
+        assert!(storage.load_desired("testorg").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_import_result_helpers() {
         let mut result = ImportResult::new("testorg");
+        assert!(result.is_success());
+        assert_eq!(result.total(), 0);
+
         result.imported.push(DesiredRepo::new(
             RepoIdentity::new("testorg", "repo1"),
             Visibility::Public,
             HashSet::new(),
         ));
         result.skipped.push("repo2".to_string());
-        result.errors.push(("repo3".to_string(), "error".to_string()));
+        assert_eq!(result.total(), 2);
+        assert!(result.is_success());
 
+        result.errors.push(("repo3".to_string(), "error msg".to_string()));
         assert_eq!(result.total(), 3);
-        assert!(!result.is_success()); // Has errors
+        assert!(!result.is_success()); // Has errors now
+    }
+
+    #[tokio::test]
+    async fn test_import_options_builders() {
+        let all = ImportOptions::all();
+        assert!(all.include_private);
+        assert!(!all.skip_existing);
+        assert!(!all.dry_run);
+        assert!(all.from_forges.is_empty());
+
+        let public = ImportOptions::public_only();
+        assert!(!public.include_private);
+
+        let modified = ImportOptions::all()
+            .with_private(false)
+            .from_forge(Forge::GitHub)
+            .from_forge(Forge::Codeberg)
+            .skip_existing()
+            .dry_run();
+        assert!(!modified.include_private);
+        assert!(modified.from_forges.contains(&Forge::GitHub));
+        assert!(modified.from_forges.contains(&Forge::Codeberg));
+        assert!(modified.skip_existing);
+        assert!(modified.dry_run);
+    }
+
+    #[tokio::test]
+    async fn test_import_preserves_visibility_from_forge() {
+        // Given: forge has a private repo
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos("testorg", vec![make_observed_private("testorg", "private-repo", Forge::GitHub)])
+            .await;
+
+        let service = ImportService::new(vec![mock_forge.clone()], storage.clone());
+
+        // When: import (include_private=true)
+        let result = service.import_org("testorg", &ImportOptions::all()).await.unwrap();
+
+        // Then: imported repo has Private visibility
+        assert_eq!(result.imported.len(), 1);
+        assert_eq!(result.imported[0].visibility, Visibility::Private);
     }
 }

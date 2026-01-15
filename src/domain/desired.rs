@@ -85,74 +85,133 @@ mod tests {
         RepoIdentity::new("hypermemetic", "hyperforge")
     }
 
-    fn test_forges() -> HashSet<Forge> {
+    fn github_only() -> HashSet<Forge> {
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges
+    }
+
+    fn github_codeberg() -> HashSet<Forge> {
         let mut forges = HashSet::new();
         forges.insert(Forge::GitHub);
         forges.insert(Forge::Codeberg);
         forges
     }
 
-    #[test]
-    fn test_desired_repo_new() {
-        let repo = DesiredRepo::new(test_identity(), Visibility::Public, test_forges());
-
-        assert_eq!(repo.name(), "hyperforge");
-        assert_eq!(repo.org(), "hypermemetic");
-        assert_eq!(repo.visibility, Visibility::Public);
-        assert!(repo.forges.contains(&Forge::GitHub));
-        assert!(repo.forges.contains(&Forge::Codeberg));
-        assert!(!repo.protected);
-        assert!(!repo.marked_for_deletion);
+    fn all_forges() -> HashSet<Forge> {
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges.insert(Forge::Codeberg);
+        forges.insert(Forge::GitLab);
+        forges
     }
 
-    #[test]
-    fn test_desired_repo_builder() {
-        let repo = DesiredRepo::new(test_identity(), Visibility::Private, test_forges())
-            .with_description("A test repository")
-            .with_protected(true);
+    // ==========================================================================
+    // should_exist_on() - Core business logic for determining forge presence
+    // ==========================================================================
 
-        assert_eq!(repo.description, Some("A test repository".to_string()));
-        assert!(repo.protected);
-        assert_eq!(repo.visibility, Visibility::Private);
+    /// Table-driven test: should_exist_on returns true only for forges in the set
+    #[test]
+    fn test_should_exist_on_respects_forge_set() {
+        let cases = [
+            // (forges, query_forge, expected)
+            (github_only(), Forge::GitHub, true),
+            (github_only(), Forge::Codeberg, false),
+            (github_only(), Forge::GitLab, false),
+            (github_codeberg(), Forge::GitHub, true),
+            (github_codeberg(), Forge::Codeberg, true),
+            (github_codeberg(), Forge::GitLab, false),
+            (all_forges(), Forge::GitHub, true),
+            (all_forges(), Forge::Codeberg, true),
+            (all_forges(), Forge::GitLab, true),
+        ];
+
+        for (forges, query_forge, expected) in cases {
+            let repo = DesiredRepo::new(test_identity(), Visibility::Public, forges.clone());
+            assert_eq!(
+                repo.should_exist_on(&query_forge),
+                expected,
+                "should_exist_on({:?}) with forges {:?}",
+                query_forge,
+                forges
+            );
+        }
     }
 
+    /// marked_for_deletion overrides forge membership - repo should NOT exist anywhere
     #[test]
-    fn test_should_exist_on() {
-        let repo = DesiredRepo::new(test_identity(), Visibility::Public, test_forges());
+    fn test_should_exist_on_deletion_mark_overrides_all() {
+        let repo = DesiredRepo::new(test_identity(), Visibility::Public, all_forges())
+            .with_deletion_mark(true);
 
-        assert!(repo.should_exist_on(&Forge::GitHub));
-        assert!(repo.should_exist_on(&Forge::Codeberg));
+        // Even though all forges are in the set, deletion mark means false for all
+        assert!(!repo.should_exist_on(&Forge::GitHub));
+        assert!(!repo.should_exist_on(&Forge::Codeberg));
         assert!(!repo.should_exist_on(&Forge::GitLab));
     }
 
+    /// Empty forge set means repo shouldn't exist anywhere
     #[test]
-    fn test_should_exist_on_with_deletion_mark() {
-        let repo = DesiredRepo::new(test_identity(), Visibility::Public, test_forges())
-            .with_deletion_mark(true);
+    fn test_should_exist_on_empty_forges() {
+        let repo = DesiredRepo::new(test_identity(), Visibility::Public, HashSet::new());
 
-        // Even though it's in forges, marked_for_deletion means it shouldn't exist
         assert!(!repo.should_exist_on(&Forge::GitHub));
         assert!(!repo.should_exist_on(&Forge::Codeberg));
+        assert!(!repo.should_exist_on(&Forge::GitLab));
     }
 
-    #[test]
-    fn test_desired_repo_equality() {
-        let repo1 = DesiredRepo::new(test_identity(), Visibility::Public, test_forges());
-        let repo2 = DesiredRepo::new(test_identity(), Visibility::Public, test_forges());
-        let repo3 = DesiredRepo::new(test_identity(), Visibility::Private, test_forges());
+    // ==========================================================================
+    // Equality behavior with different field combinations
+    // ==========================================================================
 
-        assert_eq!(repo1, repo2);
-        assert_ne!(repo1, repo3);
+    /// Repos with same identity but different properties are not equal
+    #[test]
+    fn test_equality_considers_all_fields() {
+        let base = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg());
+
+        // Same everything = equal
+        let same = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg());
+        assert_eq!(base, same);
+
+        // Different visibility = not equal
+        let diff_visibility = DesiredRepo::new(test_identity(), Visibility::Private, github_codeberg());
+        assert_ne!(base, diff_visibility);
+
+        // Different forges = not equal
+        let diff_forges = DesiredRepo::new(test_identity(), Visibility::Public, github_only());
+        assert_ne!(base, diff_forges);
+
+        // Different description = not equal
+        let with_desc = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg())
+            .with_description("some desc");
+        assert_ne!(base, with_desc);
+
+        // Different protected = not equal
+        let protected = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg())
+            .with_protected(true);
+        assert_ne!(base, protected);
+
+        // Different deletion mark = not equal
+        let marked = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg())
+            .with_deletion_mark(true);
+        assert_ne!(base, marked);
     }
 
+    // ==========================================================================
+    // JSON serialization roundtrip
+    // ==========================================================================
+
+    /// Full roundtrip with all fields populated
     #[test]
-    fn test_desired_repo_serialization() {
-        let repo = DesiredRepo::new(test_identity(), Visibility::Public, test_forges())
-            .with_description("Test repo");
+    fn test_json_roundtrip_all_fields() {
+        let original = DesiredRepo::new(test_identity(), Visibility::Private, github_codeberg())
+            .with_description("Multi-forge repository manager")
+            .with_protected(true)
+            .with_deletion_mark(false);
 
-        let json = serde_json::to_string(&repo).unwrap();
-        let deserialized: DesiredRepo = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: DesiredRepo = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(repo, deserialized);
+        assert_eq!(original, restored);
     }
 }

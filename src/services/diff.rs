@@ -299,228 +299,441 @@ impl DiffService {
 mod tests {
     use super::*;
     use crate::adapters::InMemoryStorageAdapter;
-    use crate::domain::RepoIdentity;
+    use crate::domain::{ForgeRepoState, RepoIdentity};
     use crate::types::Visibility;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
 
-    fn test_forges() -> HashSet<Forge> {
+    // =========================================================================
+    // MockForgePort - records calls and returns configured responses
+    // =========================================================================
+
+    struct MockForgePort {
+        forge_type: Forge,
+        /// Repos to return from list_repos, keyed by org
+        repos_by_org: Mutex<std::collections::HashMap<String, Vec<ObservedRepo>>>,
+        /// Count of list_repos calls
+        list_repos_calls: AtomicUsize,
+    }
+
+    impl MockForgePort {
+        fn new(forge: Forge) -> Self {
+            Self {
+                forge_type: forge,
+                repos_by_org: Mutex::new(std::collections::HashMap::new()),
+                list_repos_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn set_repos(&self, org: &str, repos: Vec<ObservedRepo>) {
+            let mut map = self.repos_by_org.lock().await;
+            map.insert(org.to_string(), repos);
+        }
+
+        fn call_count(&self) -> usize {
+            self.list_repos_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ForgePort for MockForgePort {
+        fn forge_type(&self) -> Forge {
+            self.forge_type.clone()
+        }
+
+        async fn list_repos(&self, org: &str) -> Result<Vec<ObservedRepo>, ForgeError> {
+            self.list_repos_calls.fetch_add(1, Ordering::SeqCst);
+
+            let map = self.repos_by_org.lock().await;
+            match map.get(org) {
+                Some(repos) => Ok(repos.clone()),
+                None => Err(ForgeError::OrgNotFound {
+                    forge: self.forge_type.clone(),
+                    org: org.to_string(),
+                }),
+            }
+        }
+
+        async fn create_repo(&self, _repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
+            unimplemented!("not needed for diff tests")
+        }
+
+        async fn update_repo(&self, _repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
+            unimplemented!("not needed for diff tests")
+        }
+
+        async fn delete_repo(&self, _identity: &crate::domain::RepoIdentity) -> Result<(), ForgeError> {
+            unimplemented!("not needed for diff tests")
+        }
+
+        async fn repo_exists(&self, _identity: &crate::domain::RepoIdentity) -> Result<bool, ForgeError> {
+            unimplemented!("not needed for diff tests")
+        }
+    }
+
+    // =========================================================================
+    // Test helpers
+    // =========================================================================
+
+    fn github_forges() -> HashSet<Forge> {
         let mut forges = HashSet::new();
         forges.insert(Forge::GitHub);
         forges
     }
 
-    fn test_desired_repo(org: &str, name: &str) -> DesiredRepo {
-        DesiredRepo::new(
-            RepoIdentity::new(org, name),
+    fn github_codeberg_forges() -> HashSet<Forge> {
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges.insert(Forge::Codeberg);
+        forges
+    }
+
+    fn make_desired(org: &str, name: &str) -> DesiredRepo {
+        DesiredRepo::new(RepoIdentity::new(org, name), Visibility::Public, github_forges())
+    }
+
+    fn make_observed(org: &str, name: &str, forge: Forge) -> ObservedRepo {
+        ObservedRepo::new(RepoIdentity::new(org, name)).with_forge_state(ForgeRepoState::found(
+            forge.clone(),
+            format!("https://{}/{}/{}", forge.ssh_host(), org, name),
             Visibility::Public,
-            test_forges(),
-        )
+            None,
+            None,
+        ))
     }
 
-    fn test_observed_repo(org: &str, name: &str) -> ObservedRepo {
-        ObservedRepo::new(RepoIdentity::new(org, name)).with_forge_state(
-            crate::domain::ForgeRepoState::found(
-                Forge::GitHub,
-                format!("https://github.com/{}/{}", org, name),
-                Visibility::Public,
-                None,
-                None,
-            ),
-        )
-    }
+    // =========================================================================
+    // Orchestration tests for DiffService
+    // =========================================================================
 
     #[tokio::test]
-    async fn test_diff_service_creation() {
+    async fn test_compute_plan_with_two_creates_when_observed_is_empty() {
+        // Given: desired=[A,B], observed=[]
         let storage = Arc::new(InMemoryStorageAdapter::new());
-        let service = DiffService::new(vec![], storage);
-
-        assert!(service.forges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_diff_options_builder() {
-        let opts = DiffOptions::fresh().for_forge(Forge::GitHub).tracked_only();
-
-        assert!(!opts.use_cached);
-        assert!(opts.forges.contains(&Forge::GitHub));
-        assert!(!opts.include_untracked);
-    }
-
-    #[tokio::test]
-    async fn test_diff_options_cached() {
-        let opts = DiffOptions::cached();
-
-        assert!(opts.use_cached);
-        assert!(opts.include_untracked);
-    }
-
-    #[tokio::test]
-    async fn test_org_not_configured_error() {
-        let storage = Arc::new(InMemoryStorageAdapter::new());
-        let service = DiffService::new(vec![], storage);
-
-        let result = service
-            .compute_plan("nonexistent", &DiffOptions::cached())
-            .await;
-
-        assert!(matches!(result, Err(DiffError::OrgNotConfigured { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_compute_plan_cached_empty() {
-        let storage = Arc::new(InMemoryStorageAdapter::new());
-
-        // Set up org with desired state
         storage
-            .save_desired("testorg", &[test_desired_repo("testorg", "repo1")])
+            .save_desired("testorg", &[make_desired("testorg", "repo-a"), make_desired("testorg", "repo-b")])
             .await
             .unwrap();
 
         let service = DiffService::new(vec![], storage);
 
-        let plan = service
-            .compute_plan("testorg", &DiffOptions::cached())
-            .await
-            .unwrap();
+        // When: compute plan using cached (empty observed)
+        let plan = service.compute_plan("testorg", &DiffOptions::cached()).await.unwrap();
 
-        assert_eq!(plan.org, "testorg");
-        assert_eq!(plan.repo_diffs.len(), 1);
-        // Should show repo needs to be created (no synced state)
-        assert!(plan.summary.creates > 0);
+        // Then: plan has 2 creates (one per repo on GitHub)
+        assert_eq!(plan.summary.creates, 2);
+        assert_eq!(plan.summary.in_sync, 0);
+        assert_eq!(plan.repo_diffs.len(), 2);
+        assert!(plan.has_changes());
     }
 
     #[tokio::test]
-    async fn test_compute_plan_in_sync() {
+    async fn test_compute_plan_empty_when_fully_in_sync() {
+        // Given: desired=[A], observed=[A] (both on GitHub)
         let storage = Arc::new(InMemoryStorageAdapter::new());
-
-        let desired = test_desired_repo("testorg", "repo1");
-        let observed = test_observed_repo("testorg", "repo1");
+        let desired = make_desired("testorg", "repo-a");
+        let observed = make_observed("testorg", "repo-a", Forge::GitHub);
 
         storage.save_desired("testorg", &[desired]).await.unwrap();
         storage.save_synced("testorg", &[observed]).await.unwrap();
 
         let service = DiffService::new(vec![], storage);
 
-        let plan = service
-            .compute_plan("testorg", &DiffOptions::cached())
+        // When: compute plan
+        let plan = service.compute_plan("testorg", &DiffOptions::cached()).await.unwrap();
+
+        // Then: plan has no changes (in sync)
+        assert!(!plan.has_changes());
+        assert_eq!(plan.summary.in_sync, 1);
+        assert_eq!(plan.summary.creates, 0);
+        assert_eq!(plan.summary.updates, 0);
+    }
+
+    #[tokio::test]
+    async fn test_compute_plan_returns_org_not_configured_error() {
+        // Given: storage has no orgs
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let service = DiffService::new(vec![], storage);
+
+        // When: compute plan for nonexistent org
+        let result = service.compute_plan("nonexistent", &DiffOptions::cached()).await;
+
+        // Then: returns OrgNotConfigured error
+        assert!(matches!(result, Err(DiffError::OrgNotConfigured { org }) if org == "nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_compute_plan_queries_forge_when_not_cached() {
+        // Given: desired=[A] on GitHub, forge returns [A]
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage
+            .save_desired("testorg", &[make_desired("testorg", "repo-a")])
             .await
             .unwrap();
 
-        assert_eq!(plan.org, "testorg");
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_repos("testorg", vec![make_observed("testorg", "repo-a", Forge::GitHub)])
+            .await;
+
+        let service = DiffService::new(vec![mock_forge.clone()], storage);
+
+        // When: compute plan with fresh (queries forge)
+        let plan = service.compute_plan("testorg", &DiffOptions::fresh()).await.unwrap();
+
+        // Then: forge was queried and plan shows in sync
+        assert_eq!(mock_forge.call_count(), 1);
         assert!(!plan.has_changes());
         assert_eq!(plan.summary.in_sync, 1);
     }
 
     #[tokio::test]
-    async fn test_has_changes() {
+    async fn test_compute_plan_shows_creates_when_forge_returns_empty() {
+        // Given: desired=[A,B] on GitHub, forge returns []
         let storage = Arc::new(InMemoryStorageAdapter::new());
-
-        // New repo with no synced state = has changes
         storage
-            .save_desired("testorg", &[test_desired_repo("testorg", "repo1")])
+            .save_desired("testorg", &[make_desired("testorg", "repo-a"), make_desired("testorg", "repo-b")])
+            .await
+            .unwrap();
+
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge.set_repos("testorg", vec![]).await;
+
+        let service = DiffService::new(vec![mock_forge.clone()], storage);
+
+        // When: compute plan with fresh options
+        let plan = service.compute_plan("testorg", &DiffOptions::fresh()).await.unwrap();
+
+        // Then: plan shows 2 creates needed
+        assert_eq!(plan.summary.creates, 2);
+        assert!(plan.has_changes());
+    }
+
+    #[tokio::test]
+    async fn test_compute_plan_handles_forge_org_not_found_gracefully() {
+        // Given: desired=[A], forge returns OrgNotFound
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage.save_desired("testorg", &[make_desired("testorg", "repo-a")]).await.unwrap();
+
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        // Don't set any repos - will return OrgNotFound
+
+        let service = DiffService::new(vec![mock_forge.clone()], storage);
+
+        // When: compute plan - forge says org not found
+        let plan = service.compute_plan("testorg", &DiffOptions::fresh()).await.unwrap();
+
+        // Then: plan still works, shows create needed
+        assert_eq!(plan.summary.creates, 1);
+        assert!(plan.has_changes());
+    }
+
+    #[tokio::test]
+    async fn test_compute_all_plans_aggregates_across_orgs() {
+        // Given: two orgs with desired repos
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage.save_desired("org1", &[make_desired("org1", "repo-a")]).await.unwrap();
+        storage.save_desired("org2", &[make_desired("org2", "repo-b"), make_desired("org2", "repo-c")]).await.unwrap();
+
+        let service = DiffService::new(vec![], storage);
+
+        // When: compute all plans
+        let plans = service.compute_all_plans(&DiffOptions::cached()).await.unwrap();
+
+        // Then: returns plans for both orgs
+        assert_eq!(plans.len(), 2);
+
+        let org1_plan = plans.iter().find(|p| p.org == "org1").unwrap();
+        let org2_plan = plans.iter().find(|p| p.org == "org2").unwrap();
+
+        assert_eq!(org1_plan.summary.creates, 1);
+        assert_eq!(org2_plan.summary.creates, 2);
+    }
+
+    #[tokio::test]
+    async fn test_compute_plan_detects_untracked_repos() {
+        // Given: desired=[A], synced=[A, B] (B is untracked)
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage.save_desired("testorg", &[make_desired("testorg", "repo-a")]).await.unwrap();
+        storage
+            .save_synced(
+                "testorg",
+                &[
+                    make_observed("testorg", "repo-a", Forge::GitHub),
+                    make_observed("testorg", "repo-b", Forge::GitHub),
+                ],
+            )
             .await
             .unwrap();
 
         let service = DiffService::new(vec![], storage);
 
-        let has_changes = service
-            .has_changes("testorg", &DiffOptions::cached())
+        // When: compute plan with include_untracked=true (default)
+        let plan = service.compute_plan("testorg", &DiffOptions::cached()).await.unwrap();
+
+        // Then: untracked count is 1
+        assert_eq!(plan.summary.untracked, 1);
+        assert_eq!(plan.summary.in_sync, 1);
+
+        // When: compute plan with tracked_only
+        let plan_tracked = service
+            .compute_plan("testorg", &DiffOptions::cached().tracked_only())
             .await
             .unwrap();
 
+        // Then: untracked is filtered out
+        assert_eq!(plan_tracked.summary.untracked, 0);
+        assert_eq!(plan_tracked.repo_diffs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_compute_plan_detects_visibility_change() {
+        // Given: desired=[A with public], synced=[A with private]
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let desired = DesiredRepo::new(
+            RepoIdentity::new("testorg", "repo-a"),
+            Visibility::Public, // Want public
+            github_forges(),
+        );
+
+        let observed = ObservedRepo::new(RepoIdentity::new("testorg", "repo-a")).with_forge_state(
+            ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/testorg/repo-a".to_string(),
+                Visibility::Private, // Currently private
+                None,
+                None,
+            ),
+        );
+
+        storage.save_desired("testorg", &[desired]).await.unwrap();
+        storage.save_synced("testorg", &[observed]).await.unwrap();
+
+        let service = DiffService::new(vec![], storage);
+
+        // When: compute plan
+        let plan = service.compute_plan("testorg", &DiffOptions::cached()).await.unwrap();
+
+        // Then: shows update needed
+        assert_eq!(plan.summary.updates, 1);
+        assert!(plan.has_changes());
+    }
+
+    #[tokio::test]
+    async fn test_diff_repo_returns_specific_repo_diff() {
+        // Given: multiple repos
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage
+            .save_desired(
+                "testorg",
+                &[make_desired("testorg", "repo-a"), make_desired("testorg", "repo-b")],
+            )
+            .await
+            .unwrap();
+
+        let service = DiffService::new(vec![], storage);
+
+        // When: diff specific repo
+        let diff = service.diff_repo("testorg", "repo-a", &DiffOptions::cached()).await.unwrap();
+
+        // Then: returns only that repo's diff
+        assert!(diff.is_some());
+        assert_eq!(diff.unwrap().name(), "repo-a");
+
+        // And: nonexistent repo returns None
+        let no_diff = service.diff_repo("testorg", "nonexistent", &DiffOptions::cached()).await.unwrap();
+        assert!(no_diff.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_has_changes_returns_true_when_creates_needed() {
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage.save_desired("testorg", &[make_desired("testorg", "repo-a")]).await.unwrap();
+
+        let service = DiffService::new(vec![], storage);
+
+        // When: check has_changes (no synced state = creates needed)
+        let has_changes = service.has_changes("testorg", &DiffOptions::cached()).await.unwrap();
+
+        // Then: true
         assert!(has_changes);
     }
 
     #[tokio::test]
-    async fn test_list_orgs() {
+    async fn test_has_changes_returns_false_when_in_sync() {
         let storage = Arc::new(InMemoryStorageAdapter::new());
+        let desired = make_desired("testorg", "repo-a");
+        let observed = make_observed("testorg", "repo-a", Forge::GitHub);
 
-        storage
-            .save_desired("org1", &[test_desired_repo("org1", "repo")])
-            .await
-            .unwrap();
-        storage
-            .save_desired("org2", &[test_desired_repo("org2", "repo")])
-            .await
-            .unwrap();
+        storage.save_desired("testorg", &[desired]).await.unwrap();
+        storage.save_synced("testorg", &[observed]).await.unwrap();
+
+        let service = DiffService::new(vec![], storage);
+
+        // When: check has_changes
+        let has_changes = service.has_changes("testorg", &DiffOptions::cached()).await.unwrap();
+
+        // Then: false
+        assert!(!has_changes);
+    }
+
+    #[tokio::test]
+    async fn test_list_orgs_returns_all_configured_orgs() {
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage.save_desired("alpha", &[make_desired("alpha", "repo")]).await.unwrap();
+        storage.save_desired("beta", &[make_desired("beta", "repo")]).await.unwrap();
+        storage.save_desired("gamma", &[make_desired("gamma", "repo")]).await.unwrap();
 
         let service = DiffService::new(vec![], storage);
 
         let orgs = service.list_orgs().await.unwrap();
 
-        assert_eq!(orgs.len(), 2);
-        assert!(orgs.contains(&"org1".to_string()));
-        assert!(orgs.contains(&"org2".to_string()));
+        assert_eq!(orgs.len(), 3);
+        assert!(orgs.contains(&"alpha".to_string()));
+        assert!(orgs.contains(&"beta".to_string()));
+        assert!(orgs.contains(&"gamma".to_string()));
     }
 
     #[tokio::test]
-    async fn test_diff_repo() {
+    async fn test_compute_plan_with_multiple_forges() {
+        // Given: desired repo on both GitHub and Codeberg
         let storage = Arc::new(InMemoryStorageAdapter::new());
+        let desired = DesiredRepo::new(
+            RepoIdentity::new("testorg", "repo-a"),
+            Visibility::Public,
+            github_codeberg_forges(),
+        );
+        storage.save_desired("testorg", &[desired]).await.unwrap();
 
-        storage
-            .save_desired(
-                "testorg",
-                &[
-                    test_desired_repo("testorg", "repo1"),
-                    test_desired_repo("testorg", "repo2"),
-                ],
-            )
-            .await
-            .unwrap();
+        // Synced only on GitHub
+        let observed = make_observed("testorg", "repo-a", Forge::GitHub);
+        storage.save_synced("testorg", &[observed]).await.unwrap();
 
         let service = DiffService::new(vec![], storage);
 
-        let diff = service
-            .diff_repo("testorg", "repo1", &DiffOptions::cached())
-            .await
-            .unwrap();
+        // When: compute plan
+        let plan = service.compute_plan("testorg", &DiffOptions::cached()).await.unwrap();
 
-        assert!(diff.is_some());
-        assert_eq!(diff.unwrap().name(), "repo1");
-
-        let diff_none = service
-            .diff_repo("testorg", "nonexistent", &DiffOptions::cached())
-            .await
-            .unwrap();
-
-        assert!(diff_none.is_none());
+        // Then: shows create on Codeberg, in sync on GitHub
+        assert_eq!(plan.summary.creates, 1);
+        assert_eq!(plan.summary.in_sync, 0); // The repo overall needs action
+        assert!(plan.has_changes());
     }
 
     #[tokio::test]
-    async fn test_tracked_only_filter() {
+    async fn test_compute_plan_no_forges_configured_error() {
+        // Given: org exists with desired repos
         let storage = Arc::new(InMemoryStorageAdapter::new());
+        storage.save_desired("testorg", &[make_desired("testorg", "repo-a")]).await.unwrap();
 
-        // Desired has repo1
-        storage
-            .save_desired("testorg", &[test_desired_repo("testorg", "repo1")])
-            .await
-            .unwrap();
-
-        // Synced has repo1 and untracked repo2
-        storage
-            .save_synced(
-                "testorg",
-                &[
-                    test_observed_repo("testorg", "repo1"),
-                    test_observed_repo("testorg", "untracked"),
-                ],
-            )
-            .await
-            .unwrap();
-
+        // No forge adapters configured
         let service = DiffService::new(vec![], storage);
 
-        // With untracked
-        let plan_with = service
-            .compute_plan("testorg", &DiffOptions::cached())
-            .await
-            .unwrap();
-        assert_eq!(plan_with.summary.untracked, 1);
+        // When: compute plan with fresh (requires forge query)
+        let result = service.compute_plan("testorg", &DiffOptions::fresh()).await;
 
-        // Without untracked
-        let plan_without = service
-            .compute_plan("testorg", &DiffOptions::cached().tracked_only())
-            .await
-            .unwrap();
-        assert_eq!(plan_without.summary.untracked, 0);
+        // Then: returns NoForgesConfigured error
+        assert!(matches!(result, Err(DiffError::NoForgesConfigured)));
     }
 }

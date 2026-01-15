@@ -499,86 +499,580 @@ impl SyncService {
 mod tests {
     use super::*;
     use crate::adapters::InMemoryStorageAdapter;
-    use crate::domain::{DesiredRepo, RepoIdentity};
+    use crate::domain::{ForgeRepoState, RepoIdentity};
     use crate::types::Visibility;
+    use async_trait::async_trait;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
 
-    fn test_forges() -> HashSet<Forge> {
+    // =========================================================================
+    // MockForgePort - records calls and returns configured responses
+    // =========================================================================
+
+    struct MockForgePort {
+        forge_type: Forge,
+        /// Recorded create_repo calls
+        create_calls: Mutex<Vec<DesiredRepo>>,
+        /// Recorded update_repo calls
+        update_calls: Mutex<Vec<DesiredRepo>>,
+        /// Recorded delete_repo calls
+        delete_calls: Mutex<Vec<RepoIdentity>>,
+        /// Error to return from create_repo (if set)
+        create_error: Mutex<Option<ForgeError>>,
+        /// Error to return from update_repo (if set)
+        update_error: Mutex<Option<ForgeError>>,
+        /// Error to return from delete_repo (if set)
+        delete_error: Mutex<Option<ForgeError>>,
+        /// Count of operations
+        operation_count: AtomicUsize,
+    }
+
+    impl MockForgePort {
+        fn new(forge: Forge) -> Self {
+            Self {
+                forge_type: forge,
+                create_calls: Mutex::new(Vec::new()),
+                update_calls: Mutex::new(Vec::new()),
+                delete_calls: Mutex::new(Vec::new()),
+                create_error: Mutex::new(None),
+                update_error: Mutex::new(None),
+                delete_error: Mutex::new(None),
+                operation_count: AtomicUsize::new(0),
+            }
+        }
+
+        async fn set_create_error(&self, error: ForgeError) {
+            let mut err = self.create_error.lock().await;
+            *err = Some(error);
+        }
+
+        async fn set_update_error(&self, error: ForgeError) {
+            let mut err = self.update_error.lock().await;
+            *err = Some(error);
+        }
+
+        async fn set_delete_error(&self, error: ForgeError) {
+            let mut err = self.delete_error.lock().await;
+            *err = Some(error);
+        }
+
+        async fn create_call_count(&self) -> usize {
+            self.create_calls.lock().await.len()
+        }
+
+        async fn update_call_count(&self) -> usize {
+            self.update_calls.lock().await.len()
+        }
+
+        async fn delete_call_count(&self) -> usize {
+            self.delete_calls.lock().await.len()
+        }
+
+        async fn get_created_repos(&self) -> Vec<DesiredRepo> {
+            self.create_calls.lock().await.clone()
+        }
+
+        async fn get_updated_repos(&self) -> Vec<DesiredRepo> {
+            self.update_calls.lock().await.clone()
+        }
+
+        async fn get_deleted_repos(&self) -> Vec<RepoIdentity> {
+            self.delete_calls.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl ForgePort for MockForgePort {
+        fn forge_type(&self) -> Forge {
+            self.forge_type.clone()
+        }
+
+        async fn list_repos(&self, _org: &str) -> Result<Vec<ObservedRepo>, ForgeError> {
+            Ok(vec![])
+        }
+
+        async fn create_repo(&self, repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
+            self.operation_count.fetch_add(1, Ordering::SeqCst);
+
+            // Check for configured error
+            let err = self.create_error.lock().await;
+            if let Some(e) = &*err {
+                return Err(ForgeError::api_error(self.forge_type.clone(), e.to_string()));
+            }
+            drop(err);
+
+            // Record the call
+            let mut calls = self.create_calls.lock().await;
+            calls.push(repo.clone());
+
+            // Return success
+            Ok(ObservedRepo::new(repo.identity.clone()).with_forge_state(ForgeRepoState::found(
+                self.forge_type.clone(),
+                format!("https://{}/{}/{}", self.forge_type.ssh_host(), repo.org(), repo.name()),
+                repo.visibility.clone(),
+                Some("new-id".to_string()),
+                repo.description.clone(),
+            )))
+        }
+
+        async fn update_repo(&self, repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
+            self.operation_count.fetch_add(1, Ordering::SeqCst);
+
+            // Check for configured error
+            let err = self.update_error.lock().await;
+            if let Some(e) = &*err {
+                return Err(ForgeError::api_error(self.forge_type.clone(), e.to_string()));
+            }
+            drop(err);
+
+            // Record the call
+            let mut calls = self.update_calls.lock().await;
+            calls.push(repo.clone());
+
+            // Return success
+            Ok(ObservedRepo::new(repo.identity.clone()).with_forge_state(ForgeRepoState::found(
+                self.forge_type.clone(),
+                format!("https://{}/{}/{}", self.forge_type.ssh_host(), repo.org(), repo.name()),
+                repo.visibility.clone(),
+                Some("updated-id".to_string()),
+                repo.description.clone(),
+            )))
+        }
+
+        async fn delete_repo(&self, identity: &RepoIdentity) -> Result<(), ForgeError> {
+            self.operation_count.fetch_add(1, Ordering::SeqCst);
+
+            // Check for configured error
+            let err = self.delete_error.lock().await;
+            if let Some(e) = &*err {
+                return Err(ForgeError::api_error(self.forge_type.clone(), e.to_string()));
+            }
+            drop(err);
+
+            // Record the call
+            let mut calls = self.delete_calls.lock().await;
+            calls.push(identity.clone());
+
+            Ok(())
+        }
+
+        async fn repo_exists(&self, _identity: &RepoIdentity) -> Result<bool, ForgeError> {
+            Ok(false)
+        }
+    }
+
+    // =========================================================================
+    // Test helpers
+    // =========================================================================
+
+    fn github_forges() -> HashSet<Forge> {
         let mut forges = HashSet::new();
         forges.insert(Forge::GitHub);
         forges
     }
 
-    fn test_desired_repo(org: &str, name: &str) -> DesiredRepo {
-        DesiredRepo::new(
-            RepoIdentity::new(org, name),
+    fn make_desired(org: &str, name: &str) -> DesiredRepo {
+        DesiredRepo::new(RepoIdentity::new(org, name), Visibility::Public, github_forges())
+    }
+
+    fn make_observed(org: &str, name: &str, forge: Forge) -> ObservedRepo {
+        ObservedRepo::new(RepoIdentity::new(org, name)).with_forge_state(ForgeRepoState::found(
+            forge.clone(),
+            format!("https://{}/{}/{}", forge.ssh_host(), org, name),
             Visibility::Public,
-            test_forges(),
-        )
+            None,
+            None,
+        ))
     }
 
-    #[tokio::test]
-    async fn test_sync_service_creation() {
-        let storage = Arc::new(InMemoryStorageAdapter::new());
-        let service = SyncService::new(vec![], storage);
-
-        // Service should be created successfully
-        assert!(service.forges.is_empty());
-    }
+    // =========================================================================
+    // SyncService orchestration tests
+    // =========================================================================
 
     #[tokio::test]
-    async fn test_dry_run_returns_skipped() {
+    async fn test_execute_plan_calls_create_for_create_actions() {
+        // Given: plan has create action for repo
         let storage = Arc::new(InMemoryStorageAdapter::new());
-        let service = SyncService::new(vec![], storage);
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
 
-        let desired = vec![test_desired_repo("testorg", "testrepo")];
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![make_desired("testorg", "new-repo")];
         let plan = SyncPlan::from_diff("testorg", &desired, &[]);
 
-        let results = service.execute_plan(&plan, true).await.unwrap();
+        // When: execute plan with context
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
 
-        // All results should be skipped in dry run
+        // Then: create_repo was called
+        assert_eq!(mock_forge.create_call_count().await, 1);
+        let created = mock_forge.get_created_repos().await;
+        assert_eq!(created[0].name(), "new-repo");
+
+        // And: result shows Created
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].outcome, SyncOutcome::Created));
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_calls_update_for_update_actions() {
+        // Given: plan has update action (visibility change)
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        // Desired: Public, Observed: Private (need update)
+        let desired = vec![DesiredRepo::new(
+            RepoIdentity::new("testorg", "repo"),
+            Visibility::Public,
+            github_forges(),
+        )];
+        let observed = vec![ObservedRepo::new(RepoIdentity::new("testorg", "repo")).with_forge_state(
+            ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/testorg/repo".to_string(),
+                Visibility::Private, // Different from desired
+                None,
+                None,
+            ),
+        )];
+        let plan = SyncPlan::from_diff("testorg", &desired, &observed);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: update_repo was called
+        assert_eq!(mock_forge.update_call_count().await, 1);
+        let updated = mock_forge.get_updated_repos().await;
+        assert_eq!(updated[0].name(), "repo");
+
+        // And: result shows Updated
+        assert!(results.iter().any(|r| matches!(r.outcome, SyncOutcome::Updated)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_calls_delete_for_delete_actions() {
+        // Given: plan has delete action (repo marked for deletion)
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        // Desired: marked for deletion, Observed: exists
+        let desired = vec![make_desired("testorg", "to-delete").with_deletion_mark(true)];
+        let observed = vec![make_observed("testorg", "to-delete", Forge::GitHub)];
+        let plan = SyncPlan::from_diff("testorg", &desired, &observed);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: delete_repo was called
+        assert_eq!(mock_forge.delete_call_count().await, 1);
+        let deleted = mock_forge.get_deleted_repos().await;
+        assert_eq!(deleted[0].name, "to-delete");
+
+        // And: result shows Deleted
+        assert!(results.iter().any(|r| matches!(r.outcome, SyncOutcome::Deleted)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_noop_does_not_call_forge() {
+        // Given: plan is in sync (no ops needed)
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![make_desired("testorg", "repo")];
+        let observed = vec![make_observed("testorg", "repo", Forge::GitHub)];
+        let plan = SyncPlan::from_diff("testorg", &desired, &observed);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: no forge operations called
+        assert_eq!(mock_forge.create_call_count().await, 0);
+        assert_eq!(mock_forge.update_call_count().await, 0);
+        assert_eq!(mock_forge.delete_call_count().await, 0);
+
+        // And: result shows NoOp
+        assert!(results.iter().all(|r| matches!(r.outcome, SyncOutcome::NoOp)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_dry_run_skips_all_operations() {
+        // Given: plan has create action
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![make_desired("testorg", "new-repo")];
+        let plan = SyncPlan::from_diff("testorg", &desired, &[]);
+
+        // When: execute with dry_run=true
+        let results = service
+            .execute_plan_with_context(&plan, &desired, true)
+            .await
+            .unwrap();
+
+        // Then: no forge operations called
+        assert_eq!(mock_forge.create_call_count().await, 0);
+
+        // And: all results are Skipped
         for result in results {
             assert!(matches!(result.outcome, SyncOutcome::Skipped));
         }
     }
 
     #[tokio::test]
-    async fn test_no_adapter_returns_failed() {
+    async fn test_execute_plan_partial_failure_reports_correctly() {
+        // Given: plan has two creates, second one will fail
         let storage = Arc::new(InMemoryStorageAdapter::new());
-        // Empty forges - no adapters
-        let service = SyncService::new(vec![], storage);
 
-        let desired = vec![test_desired_repo("testorg", "testrepo")];
+        // Create two forge adapters - one succeeds, one fails
+        let github_success = Arc::new(MockForgePort::new(Forge::GitHub));
+        let codeberg_fail = Arc::new(MockForgePort::new(Forge::Codeberg));
+        codeberg_fail
+            .set_create_error(ForgeError::api_error(Forge::Codeberg, "rate limited"))
+            .await;
+
+        let service = SyncService::new(vec![github_success.clone(), codeberg_fail.clone()], storage);
+
+        // Desired on both forges
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges.insert(Forge::Codeberg);
+        let desired = vec![DesiredRepo::new(
+            RepoIdentity::new("testorg", "new-repo"),
+            Visibility::Public,
+            forges,
+        )];
         let plan = SyncPlan::from_diff("testorg", &desired, &[]);
 
-        let results = service.execute_plan(&plan, false).await.unwrap();
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
 
-        // All results should be failed due to no adapter
-        for result in results {
-            assert!(result.outcome.is_failure());
+        // Then: GitHub succeeded, Codeberg failed
+        let github_result = results.iter().find(|r| r.forge == Forge::GitHub).unwrap();
+        let codeberg_result = results.iter().find(|r| r.forge == Forge::Codeberg).unwrap();
+
+        assert!(matches!(github_result.outcome, SyncOutcome::Created));
+        assert!(matches!(codeberg_result.outcome, SyncOutcome::Failed { .. }));
+
+        // And: forge was still called for both
+        assert_eq!(github_success.create_call_count().await, 1);
+        // Codeberg also attempted (but failed)
+        assert_eq!(codeberg_fail.create_call_count().await, 0); // Error before call recorded
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_no_adapter_returns_failed() {
+        // Given: plan needs GitHub but no GitHub adapter configured
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let codeberg_only = Arc::new(MockForgePort::new(Forge::Codeberg));
+
+        let service = SyncService::new(vec![codeberg_only], storage);
+
+        // Desired on GitHub (no adapter for this)
+        let desired = vec![make_desired("testorg", "repo")]; // GitHub only
+        let plan = SyncPlan::from_diff("testorg", &desired, &[]);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: result shows Failed with "No adapter" message
+        assert_eq!(results.len(), 1);
+        match &results[0].outcome {
+            SyncOutcome::Failed { error } => {
+                assert!(error.contains("No adapter"));
+            }
+            _ => panic!("Expected Failed outcome"),
         }
     }
 
     #[tokio::test]
-    async fn test_sync_outcome_is_success() {
+    async fn test_execute_plan_create_failure_reports_error() {
+        // Given: forge will fail on create
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_create_error(ForgeError::api_error(Forge::GitHub, "quota exceeded"))
+            .await;
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![make_desired("testorg", "repo")];
+        let plan = SyncPlan::from_diff("testorg", &desired, &[]);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: result shows Failed
+        assert!(results[0].outcome.is_failure());
+        match &results[0].outcome {
+            SyncOutcome::Failed { error } => {
+                assert!(error.contains("quota exceeded"));
+            }
+            _ => panic!("Expected Failed outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_update_failure_reports_error() {
+        // Given: forge will fail on update
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_update_error(ForgeError::api_error(Forge::GitHub, "permission denied"))
+            .await;
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        // Visibility change = update
+        let desired = vec![DesiredRepo::new(
+            RepoIdentity::new("testorg", "repo"),
+            Visibility::Public,
+            github_forges(),
+        )];
+        let observed = vec![ObservedRepo::new(RepoIdentity::new("testorg", "repo")).with_forge_state(
+            ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/testorg/repo".to_string(),
+                Visibility::Private,
+                None,
+                None,
+            ),
+        )];
+        let plan = SyncPlan::from_diff("testorg", &desired, &observed);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: shows failure
+        let update_result = results.iter().find(|r| r.forge == Forge::GitHub).unwrap();
+        assert!(update_result.outcome.is_failure());
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_delete_failure_reports_error() {
+        // Given: forge will fail on delete
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+        mock_forge
+            .set_delete_error(ForgeError::api_error(Forge::GitHub, "delete not allowed"))
+            .await;
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![make_desired("testorg", "repo").with_deletion_mark(true)];
+        let observed = vec![make_observed("testorg", "repo", Forge::GitHub)];
+        let plan = SyncPlan::from_diff("testorg", &desired, &observed);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: shows failure
+        let delete_result = results.iter().find(|r| r.forge == Forge::GitHub).unwrap();
+        assert!(delete_result.outcome.is_failure());
+    }
+
+    #[tokio::test]
+    async fn test_sync_outcome_success_and_failure_helpers() {
+        // Success cases
         assert!(SyncOutcome::Created.is_success());
         assert!(SyncOutcome::Updated.is_success());
         assert!(SyncOutcome::Deleted.is_success());
         assert!(SyncOutcome::NoOp.is_success());
         assert!(SyncOutcome::Skipped.is_success());
-        assert!(!SyncOutcome::Failed {
-            error: "test".to_string()
-        }
-        .is_success());
+
+        // Failure cases
+        assert!(!SyncOutcome::Created.is_failure());
+        assert!(!SyncOutcome::Updated.is_failure());
+        assert!(!SyncOutcome::NoOp.is_failure());
+        assert!(!SyncOutcome::Skipped.is_failure());
+
+        let failed = SyncOutcome::Failed {
+            error: "test error".to_string(),
+        };
+        assert!(!failed.is_success());
+        assert!(failed.is_failure());
     }
 
     #[tokio::test]
-    async fn test_sync_outcome_is_failure() {
-        assert!(!SyncOutcome::Created.is_failure());
-        assert!(!SyncOutcome::NoOp.is_failure());
-        assert!(SyncOutcome::Failed {
-            error: "test".to_string()
-        }
-        .is_failure());
+    async fn test_execute_plan_multiple_repos() {
+        // Given: plan with multiple repos to create
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![
+            make_desired("testorg", "repo-1"),
+            make_desired("testorg", "repo-2"),
+            make_desired("testorg", "repo-3"),
+        ];
+        let plan = SyncPlan::from_diff("testorg", &desired, &[]);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: all repos created
+        assert_eq!(mock_forge.create_call_count().await, 3);
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| matches!(r.outcome, SyncOutcome::Created)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_result_contains_repo_and_forge_info() {
+        // Given: plan with action
+        let storage = Arc::new(InMemoryStorageAdapter::new());
+        let mock_forge = Arc::new(MockForgePort::new(Forge::GitHub));
+
+        let service = SyncService::new(vec![mock_forge.clone()], storage);
+
+        let desired = vec![make_desired("testorg", "my-repo")];
+        let plan = SyncPlan::from_diff("testorg", &desired, &[]);
+
+        // When: execute plan
+        let results = service
+            .execute_plan_with_context(&plan, &desired, false)
+            .await
+            .unwrap();
+
+        // Then: result contains correct metadata
+        assert_eq!(results[0].repo_name, "my-repo");
+        assert_eq!(results[0].forge, Forge::GitHub);
     }
 }

@@ -135,119 +135,185 @@ mod tests {
         RepoIdentity::new("hypermemetic", "hyperforge")
     }
 
-    #[test]
-    fn test_forge_repo_state_not_found() {
-        let state = ForgeRepoState::not_found(Forge::GitHub);
-
-        assert_eq!(state.forge, Forge::GitHub);
-        assert!(!state.exists);
-        assert!(state.url.is_none());
-        assert!(state.forge_id.is_none());
-        assert!(state.visibility.is_none());
-    }
-
-    #[test]
-    fn test_forge_repo_state_found() {
-        let state = ForgeRepoState::found(
+    fn github_found() -> ForgeRepoState {
+        ForgeRepoState::found(
             Forge::GitHub,
             "https://github.com/hypermemetic/hyperforge".to_string(),
             Visibility::Public,
-            Some("123456".to_string()),
-            Some("A multi-forge tool".to_string()),
-        );
-
-        assert_eq!(state.forge, Forge::GitHub);
-        assert!(state.exists);
-        assert_eq!(state.url, Some("https://github.com/hypermemetic/hyperforge".to_string()));
-        assert_eq!(state.forge_id, Some("123456".to_string()));
-        assert_eq!(state.visibility, Some(Visibility::Public));
-        assert_eq!(state.description, Some("A multi-forge tool".to_string()));
+            Some("gh-123".to_string()),
+            Some("Description".to_string()),
+        )
     }
 
-    #[test]
-    fn test_observed_repo_new() {
-        let repo = ObservedRepo::new(test_identity());
-
-        assert_eq!(repo.name(), "hyperforge");
-        assert_eq!(repo.org(), "hypermemetic");
-        assert!(repo.forge_states.is_empty());
-        assert!(!repo.exists_anywhere());
+    fn codeberg_found() -> ForgeRepoState {
+        ForgeRepoState::found(
+            Forge::Codeberg,
+            "https://codeberg.org/hypermemetic/hyperforge".to_string(),
+            Visibility::Public,
+            Some("cb-456".to_string()),
+            None,
+        )
     }
 
+    // ==========================================================================
+    // exists_on() - Check if repo exists on a specific forge
+    // ==========================================================================
+
+    /// exists_on returns true only when forge state exists AND is marked as existing
     #[test]
-    fn test_observed_repo_with_forge_states() {
-        let repo = ObservedRepo::new(test_identity())
-            .with_forge_state(ForgeRepoState::found(
-                Forge::GitHub,
-                "https://github.com/hypermemetic/hyperforge".to_string(),
-                Visibility::Public,
-                None,
-                None,
-            ))
+    fn test_exists_on_scenarios() {
+        // No forge states at all
+        let empty = ObservedRepo::new(test_identity());
+        assert!(!empty.exists_on(&Forge::GitHub));
+        assert!(!empty.exists_on(&Forge::Codeberg));
+
+        // Has GitHub found, Codeberg not found
+        let mixed = ObservedRepo::new(test_identity())
+            .with_forge_state(github_found())
             .with_forge_state(ForgeRepoState::not_found(Forge::Codeberg));
 
-        assert!(repo.exists_on(&Forge::GitHub));
-        assert!(!repo.exists_on(&Forge::Codeberg));
-        assert!(repo.exists_anywhere());
+        assert!(mixed.exists_on(&Forge::GitHub));
+        assert!(!mixed.exists_on(&Forge::Codeberg));
+        assert!(!mixed.exists_on(&Forge::GitLab)); // No state at all
+
+        // Both found
+        let both = ObservedRepo::new(test_identity())
+            .with_forge_state(github_found())
+            .with_forge_state(codeberg_found());
+
+        assert!(both.exists_on(&Forge::GitHub));
+        assert!(both.exists_on(&Forge::Codeberg));
+        assert!(!both.exists_on(&Forge::GitLab));
+    }
+
+    // ==========================================================================
+    // exists_anywhere() - Check if repo exists on any forge
+    // ==========================================================================
+
+    #[test]
+    fn test_exists_anywhere() {
+        // No states = doesn't exist anywhere
+        let empty = ObservedRepo::new(test_identity());
+        assert!(!empty.exists_anywhere());
+
+        // Only not_found states = doesn't exist anywhere
+        let all_not_found = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::not_found(Forge::GitHub))
+            .with_forge_state(ForgeRepoState::not_found(Forge::Codeberg));
+        assert!(!all_not_found.exists_anywhere());
+
+        // At least one found = exists somewhere
+        let one_found = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::not_found(Forge::GitHub))
+            .with_forge_state(codeberg_found());
+        assert!(one_found.exists_anywhere());
+    }
+
+    // ==========================================================================
+    // existing_forges() - List all forges where repo exists
+    // ==========================================================================
+
+    #[test]
+    fn test_existing_forges_returns_only_existing() {
+        let repo = ObservedRepo::new(test_identity())
+            .with_forge_state(github_found())
+            .with_forge_state(ForgeRepoState::not_found(Forge::Codeberg))
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitLab,
+                "https://gitlab.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Private,
+                None,
+                None,
+            ));
 
         let existing = repo.existing_forges();
-        assert_eq!(existing.len(), 1);
+        assert_eq!(existing.len(), 2);
         assert!(existing.contains(&Forge::GitHub));
+        assert!(existing.contains(&Forge::GitLab));
+        assert!(!existing.contains(&Forge::Codeberg));
     }
 
     #[test]
-    fn test_observed_repo_get_forge_state() {
-        let repo = ObservedRepo::new(test_identity())
-            .with_forge_state(ForgeRepoState::found(
-                Forge::GitHub,
-                "https://github.com/hypermemetic/hyperforge".to_string(),
-                Visibility::Public,
-                Some("123".to_string()),
-                None,
-            ));
-
-        let github_state = repo.get_forge_state(&Forge::GitHub);
-        assert!(github_state.is_some());
-        assert_eq!(github_state.unwrap().forge_id, Some("123".to_string()));
-
-        let codeberg_state = repo.get_forge_state(&Forge::Codeberg);
-        assert!(codeberg_state.is_none());
-    }
-
-    #[test]
-    fn test_observed_repo_replaces_existing_forge_state() {
+    fn test_existing_forges_empty_when_none_exist() {
         let repo = ObservedRepo::new(test_identity())
             .with_forge_state(ForgeRepoState::not_found(Forge::GitHub))
-            .with_forge_state(ForgeRepoState::found(
-                Forge::GitHub,
-                "https://github.com/hypermemetic/hyperforge".to_string(),
-                Visibility::Public,
-                None,
-                None,
-            ));
+            .with_forge_state(ForgeRepoState::not_found(Forge::Codeberg));
 
-        // Should only have one GitHub state (the latest)
-        let github_states: Vec<_> = repo.forge_states.iter()
-            .filter(|s| s.forge == Forge::GitHub)
-            .collect();
-        assert_eq!(github_states.len(), 1);
-        assert!(github_states[0].exists);
+        assert!(repo.existing_forges().is_empty());
     }
 
+    // ==========================================================================
+    // with_forge_state() - State replacement behavior
+    // ==========================================================================
+
+    /// Adding a state for the same forge replaces the previous state
     #[test]
-    fn test_observed_repo_serialization() {
+    fn test_with_forge_state_replaces_existing() {
         let repo = ObservedRepo::new(test_identity())
-            .with_forge_state(ForgeRepoState::found(
-                Forge::GitHub,
-                "https://github.com/hypermemetic/hyperforge".to_string(),
-                Visibility::Public,
-                None,
-                None,
-            ));
+            .with_forge_state(ForgeRepoState::not_found(Forge::GitHub))
+            .with_forge_state(github_found()); // Replaces the not_found
 
-        let json = serde_json::to_string(&repo).unwrap();
-        let deserialized: ObservedRepo = serde_json::from_str(&json).unwrap();
+        // Should only have one GitHub entry
+        let github_count = repo.forge_states.iter()
+            .filter(|s| s.forge == Forge::GitHub)
+            .count();
+        assert_eq!(github_count, 1);
 
-        assert_eq!(repo, deserialized);
+        // And it should be the "found" one
+        assert!(repo.exists_on(&Forge::GitHub));
+    }
+
+    /// Adding states for different forges accumulates
+    #[test]
+    fn test_with_forge_state_accumulates_different_forges() {
+        let repo = ObservedRepo::new(test_identity())
+            .with_forge_state(github_found())
+            .with_forge_state(codeberg_found())
+            .with_forge_state(ForgeRepoState::not_found(Forge::GitLab));
+
+        assert_eq!(repo.forge_states.len(), 3);
+    }
+
+    // ==========================================================================
+    // get_forge_state() - Retrieve state for a specific forge
+    // ==========================================================================
+
+    #[test]
+    fn test_get_forge_state_returns_correct_data() {
+        let repo = ObservedRepo::new(test_identity())
+            .with_forge_state(github_found())
+            .with_forge_state(codeberg_found());
+
+        // GitHub state should have the right data
+        let gh = repo.get_forge_state(&Forge::GitHub).unwrap();
+        assert_eq!(gh.forge_id, Some("gh-123".to_string()));
+        assert_eq!(gh.description, Some("Description".to_string()));
+        assert_eq!(gh.visibility, Some(Visibility::Public));
+
+        // Codeberg state should have the right data
+        let cb = repo.get_forge_state(&Forge::Codeberg).unwrap();
+        assert_eq!(cb.forge_id, Some("cb-456".to_string()));
+        assert_eq!(cb.description, None);
+
+        // GitLab not queried
+        assert!(repo.get_forge_state(&Forge::GitLab).is_none());
+    }
+
+    // ==========================================================================
+    // JSON serialization roundtrip
+    // ==========================================================================
+
+    #[test]
+    fn test_json_roundtrip_with_mixed_states() {
+        let original = ObservedRepo::new(test_identity())
+            .with_forge_state(github_found())
+            .with_forge_state(ForgeRepoState::not_found(Forge::Codeberg));
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ObservedRepo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original, restored);
+        assert!(restored.exists_on(&Forge::GitHub));
+        assert!(!restored.exists_on(&Forge::Codeberg));
     }
 }

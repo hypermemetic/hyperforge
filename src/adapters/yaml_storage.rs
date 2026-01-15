@@ -453,4 +453,147 @@ mod tests {
         assert_eq!(loaded_repo.protected, original.protected);
         assert_eq!(loaded_repo.marked_for_deletion, original.marked_for_deletion);
     }
+
+    #[tokio::test]
+    async fn test_malformed_yaml_returns_parse_error() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = YamlStorageAdapter::new(tmp.path());
+
+        // Create org directory and write malformed YAML
+        let org_dir = tmp.path().join("orgs").join("testorg");
+        tokio::fs::create_dir_all(&org_dir).await.unwrap();
+
+        let repos_path = org_dir.join("repos.yaml");
+        tokio::fs::write(&repos_path, "this is: [not valid: yaml: {{").await.unwrap();
+
+        let result = adapter.load_desired("testorg").await;
+        assert!(matches!(result, Err(StorageError::ParseError { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_yaml_schema_wrong_structure_returns_parse_error() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = YamlStorageAdapter::new(tmp.path());
+
+        // Create org directory and write valid YAML but wrong schema
+        let org_dir = tmp.path().join("orgs").join("testorg");
+        tokio::fs::create_dir_all(&org_dir).await.unwrap();
+
+        let repos_path = org_dir.join("repos.yaml");
+        // Missing required 'owner' field
+        tokio::fs::write(&repos_path, "repos:\n  my-repo:\n    visibility: public").await.unwrap();
+
+        let result = adapter.load_desired("testorg").await;
+        assert!(matches!(result, Err(StorageError::ParseError { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_yaml_format_is_parseable_by_other_tools() {
+        let tmp = TempDir::new().unwrap();
+        let adapter = YamlStorageAdapter::new(tmp.path());
+
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+
+        let repo = DesiredRepo {
+            identity: RepoIdentity::new("myorg", "my-repo"),
+            description: Some("Test repo".to_string()),
+            visibility: Visibility::Public,
+            forges,
+            protected: false,
+            marked_for_deletion: false,
+        };
+
+        adapter.save_desired("myorg", &[repo]).await.unwrap();
+
+        // Read the raw YAML and verify it has expected structure
+        let repos_path = tmp.path().join("orgs").join("myorg").join("repos.yaml");
+        let contents = tokio::fs::read_to_string(&repos_path).await.unwrap();
+
+        // Parse with serde_yaml directly to verify structure
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+
+        // Verify expected top-level keys
+        let obj = parsed.as_mapping().expect("should be a mapping");
+        assert!(obj.contains_key(&serde_yaml::Value::String("owner".to_string())));
+        assert!(obj.contains_key(&serde_yaml::Value::String("repos".to_string())));
+
+        // Verify owner value
+        let owner = obj.get(&serde_yaml::Value::String("owner".to_string())).unwrap();
+        assert_eq!(owner.as_str(), Some("myorg"));
+    }
+
+    #[tokio::test]
+    async fn test_synced_roundtrip_preserves_forge_states() {
+        let (_tmp, adapter) = setup().await;
+
+        // First create the org
+        adapter.save_desired("testorg", &[test_desired_repo("testorg", "repo1")]).await.unwrap();
+
+        let identity = RepoIdentity::new("testorg", "repo1");
+        let original = ObservedRepo::new(identity.clone())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/testorg/repo1".to_string(),
+                Visibility::Public,
+                Some("gh-123".to_string()),
+                Some("A repo on GitHub".to_string()),
+            ))
+            .with_forge_state(ForgeRepoState::found(
+                Forge::Codeberg,
+                "https://codeberg.org/testorg/repo1".to_string(),
+                Visibility::Private,
+                Some("cb-456".to_string()),
+                Some("A repo on Codeberg".to_string()),
+            ));
+
+        adapter.save_synced("testorg", &[original.clone()]).await.unwrap();
+        let loaded = adapter.load_synced("testorg").await.unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        let loaded_repo = &loaded[0];
+
+        // Verify both forge states are preserved
+        assert!(loaded_repo.exists_on(&Forge::GitHub));
+        assert!(loaded_repo.exists_on(&Forge::Codeberg));
+
+        // Verify GitHub state details
+        let gh_state = loaded_repo.forge_states.iter()
+            .find(|s| s.forge == Forge::GitHub)
+            .expect("GitHub state should exist");
+        assert_eq!(gh_state.url, Some("https://github.com/testorg/repo1".to_string()));
+        assert_eq!(gh_state.forge_id, Some("gh-123".to_string()));
+        assert_eq!(gh_state.visibility, Some(Visibility::Public));
+
+        // Verify Codeberg state details
+        let cb_state = loaded_repo.forge_states.iter()
+            .find(|s| s.forge == Forge::Codeberg)
+            .expect("Codeberg state should exist");
+        assert_eq!(cb_state.url, Some("https://codeberg.org/testorg/repo1".to_string()));
+        assert_eq!(cb_state.forge_id, Some("cb-456".to_string()));
+        assert_eq!(cb_state.visibility, Some(Visibility::Private));
+    }
+
+    #[tokio::test]
+    async fn test_delete_flag_roundtrip() {
+        let (_tmp, adapter) = setup().await;
+
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+
+        let repo_to_delete = DesiredRepo {
+            identity: RepoIdentity::new("myorg", "doomed-repo"),
+            description: None,
+            visibility: Visibility::Public,
+            forges,
+            protected: false,
+            marked_for_deletion: true,  // This should be preserved
+        };
+
+        adapter.save_desired("myorg", &[repo_to_delete]).await.unwrap();
+        let loaded = adapter.load_desired("myorg").await.unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].marked_for_deletion, "delete flag should be preserved through YAML roundtrip");
+    }
 }

@@ -176,7 +176,13 @@ mod tests {
     use crate::types::Visibility;
     use std::collections::HashSet;
 
-    fn github_codeberg_forges() -> HashSet<Forge> {
+    fn github_only() -> HashSet<Forge> {
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges
+    }
+
+    fn github_codeberg() -> HashSet<Forge> {
         let mut forges = HashSet::new();
         forges.insert(Forge::GitHub);
         forges.insert(Forge::Codeberg);
@@ -187,7 +193,7 @@ mod tests {
         DesiredRepo::new(
             RepoIdentity::new("hypermemetic", name),
             Visibility::Public,
-            github_codeberg_forges(),
+            github_codeberg(),
         )
     }
 
@@ -217,17 +223,13 @@ mod tests {
         repo
     }
 
-    #[test]
-    fn test_sync_plan_new() {
-        let plan = SyncPlan::new("hypermemetic");
+    // ==========================================================================
+    // SyncPlan::from_diff() - Core plan generation (PURE FUNCTION)
+    // ==========================================================================
 
-        assert_eq!(plan.org, "hypermemetic");
-        assert!(plan.repo_diffs.is_empty());
-        assert!(!plan.has_changes());
-    }
-
+    /// Empty desired + empty observed = empty plan with zero counts
     #[test]
-    fn test_sync_plan_from_diff_empty() {
+    fn test_from_diff_empty_inputs() {
         let plan = SyncPlan::from_diff("hypermemetic", &[], &[]);
 
         assert_eq!(plan.org, "hypermemetic");
@@ -237,28 +239,33 @@ mod tests {
         assert_eq!(plan.summary.deletes, 0);
         assert_eq!(plan.summary.in_sync, 0);
         assert_eq!(plan.summary.untracked, 0);
+        assert!(!plan.has_changes());
     }
 
+    /// Desired repos with no observed = all creates
     #[test]
-    fn test_sync_plan_from_diff_create_all() {
+    fn test_from_diff_all_creates() {
         let desired = vec![
             make_desired("repo1"),
             make_desired("repo2"),
+            make_desired("repo3"),
         ];
         let observed = vec![];
 
         let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
 
-        assert_eq!(plan.summary.creates, 4); // 2 repos * 2 forges
+        // 3 repos * 2 forges = 6 creates
+        assert_eq!(plan.summary.creates, 6);
+        assert_eq!(plan.summary.updates, 0);
+        assert_eq!(plan.summary.deletes, 0);
         assert_eq!(plan.summary.in_sync, 0);
+        assert_eq!(plan.summary.untracked, 0);
         assert!(plan.has_changes());
-
-        let to_create: Vec<_> = plan.to_create().collect();
-        assert_eq!(to_create.len(), 2);
     }
 
+    /// All repos in sync = zero changes, correct in_sync count
     #[test]
-    fn test_sync_plan_from_diff_all_in_sync() {
+    fn test_from_diff_all_in_sync() {
         let desired = vec![
             make_desired("repo1"),
             make_desired("repo2"),
@@ -274,123 +281,334 @@ mod tests {
         assert_eq!(plan.summary.updates, 0);
         assert_eq!(plan.summary.deletes, 0);
         assert_eq!(plan.summary.in_sync, 2);
+        assert_eq!(plan.summary.untracked, 0);
         assert!(!plan.has_changes());
     }
 
+    /// Observed repos not in desired = untracked
     #[test]
-    fn test_sync_plan_from_diff_untracked() {
-        let desired = vec![make_desired("repo1")];
+    fn test_from_diff_untracked_detection() {
+        let desired = vec![make_desired("tracked-repo")];
         let observed = vec![
-            make_observed("repo1", true, true),
-            make_observed("untracked-repo", true, false), // Not in desired
+            make_observed("tracked-repo", true, true),
+            make_observed("untracked1", true, false),
+            make_observed("untracked2", false, true),
         ];
 
         let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
 
         assert_eq!(plan.summary.in_sync, 1);
-        assert_eq!(plan.summary.untracked, 1);
+        assert_eq!(plan.summary.untracked, 2);
 
-        let untracked: Vec<_> = plan.untracked().collect();
-        assert_eq!(untracked.len(), 1);
-        assert_eq!(untracked[0].name(), "untracked-repo");
+        // Verify untracked repos are marked as such
+        let untracked_names: Vec<_> = plan.untracked().map(|d| d.name()).collect();
+        assert!(untracked_names.contains(&"untracked1"));
+        assert!(untracked_names.contains(&"untracked2"));
     }
 
+    /// Mixed scenario: creates, updates, deletes, in-sync, untracked
     #[test]
-    fn test_sync_plan_from_diff_mixed() {
+    fn test_from_diff_mixed_scenario() {
         let desired = vec![
+            // Repo 1: in sync on both forges
             make_desired("in-sync"),
+            // Repo 2: needs creation on both forges
             make_desired("needs-create"),
+            // Repo 3: needs update (visibility change)
             DesiredRepo::new(
                 RepoIdentity::new("hypermemetic", "needs-update"),
-                Visibility::Private, // Different visibility
-                github_codeberg_forges(),
+                Visibility::Private,
+                github_codeberg(),
             ),
+            // Repo 4: exists on Codeberg but shouldn't (delete)
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "needs-delete"),
+                Visibility::Public,
+                github_only(), // Only GitHub
+            ),
+        ];
+
+        let observed = vec![
+            make_observed("in-sync", true, true),
+            // needs-create not observed
+            make_observed("needs-update", true, true), // Both forges need visibility update
+            make_observed("needs-delete", true, true), // Codeberg should be deleted
+            make_observed("untracked", true, false),   // Not in desired
+        ];
+
+        let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
+
+        assert_eq!(plan.summary.creates, 2);   // needs-create on 2 forges
+        assert_eq!(plan.summary.updates, 2);   // needs-update on 2 forges
+        assert_eq!(plan.summary.deletes, 1);   // needs-delete from Codeberg
+        assert_eq!(plan.summary.in_sync, 1);   // in-sync
+        assert_eq!(plan.summary.untracked, 1); // untracked
+
+        // Total repos in plan: 4 tracked + 1 untracked = 5
+        assert_eq!(plan.repo_diffs.len(), 5);
+    }
+
+    // ==========================================================================
+    // Filter methods: actionable(), to_create(), to_update(), to_delete()
+    // ==========================================================================
+
+    /// actionable() filters out repos with no pending actions
+    #[test]
+    fn test_actionable_filters_correctly() {
+        let desired = vec![
+            make_desired("in-sync"),      // No action needed
+            make_desired("needs-create"), // Needs action
         ];
         let observed = vec![
             make_observed("in-sync", true, true),
             // needs-create not observed
-            make_observed("needs-update", true, true),
-            make_observed("untracked", true, false),
         ];
 
         let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
 
-        assert_eq!(plan.summary.creates, 2); // needs-create on 2 forges
-        assert_eq!(plan.summary.updates, 2); // needs-update on 2 forges
-        assert_eq!(plan.summary.deletes, 0);
-        assert_eq!(plan.summary.in_sync, 1); // in-sync
-        assert_eq!(plan.summary.untracked, 1); // untracked
-        assert!(plan.has_changes());
+        let actionable: Vec<_> = plan.actionable().collect();
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(actionable[0].name(), "needs-create");
     }
 
+    /// to_create() returns only repos that have create actions
     #[test]
-    fn test_sync_plan_actions_for_forge() {
-        let desired = vec![make_desired("repo1")];
+    fn test_to_create_filter() {
+        let desired = vec![
+            make_desired("existing"),
+            make_desired("new-repo"),
+        ];
+        let observed = vec![
+            make_observed("existing", true, true),
+            // new-repo not observed
+        ];
+
+        let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
+
+        let to_create: Vec<_> = plan.to_create().collect();
+        assert_eq!(to_create.len(), 1);
+        assert_eq!(to_create[0].name(), "new-repo");
+    }
+
+    /// to_update() returns only repos that have update actions
+    #[test]
+    fn test_to_update_filter() {
+        let desired = vec![
+            make_desired("in-sync"),
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "needs-update"),
+                Visibility::Private,
+                github_codeberg(),
+            ),
+        ];
+        let observed = vec![
+            make_observed("in-sync", true, true),
+            make_observed("needs-update", true, true),
+        ];
+
+        let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
+
+        let to_update: Vec<_> = plan.to_update().collect();
+        assert_eq!(to_update.len(), 1);
+        assert_eq!(to_update[0].name(), "needs-update");
+    }
+
+    /// to_delete() returns only repos that have delete actions
+    #[test]
+    fn test_to_delete_filter() {
+        let desired = vec![
+            // Only want on GitHub, not Codeberg
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "reduce-forges"),
+                Visibility::Public,
+                github_only(),
+            ),
+            make_desired("keep-both"),
+        ];
+        let observed = vec![
+            make_observed("reduce-forges", true, true), // Codeberg needs deletion
+            make_observed("keep-both", true, true),
+        ];
+
+        let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
+
+        let to_delete: Vec<_> = plan.to_delete().collect();
+        assert_eq!(to_delete.len(), 1);
+        assert_eq!(to_delete[0].name(), "reduce-forges");
+    }
+
+    /// untracked() returns only untracked repos
+    #[test]
+    fn test_untracked_filter() {
+        let desired = vec![make_desired("tracked")];
+        let observed = vec![
+            make_observed("tracked", true, true),
+            make_observed("orphan1", true, false),
+            make_observed("orphan2", false, true),
+        ];
+
+        let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
+
+        let untracked: Vec<_> = plan.untracked().collect();
+        assert_eq!(untracked.len(), 2);
+
+        let names: Vec<_> = untracked.iter().map(|d| d.name()).collect();
+        assert!(names.contains(&"orphan1"));
+        assert!(names.contains(&"orphan2"));
+    }
+
+    // ==========================================================================
+    // actions_for_forge() - Filter actions by specific forge
+    // ==========================================================================
+
+    #[test]
+    fn test_actions_for_forge_filters_correctly() {
+        let desired = vec![
+            make_desired("repo1"), // Create on both
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "repo2"),
+                Visibility::Public,
+                github_only(), // Only GitHub
+            ),
+        ];
         let observed = vec![];
 
         let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
 
+        // GitHub should have 2 create actions (repo1 and repo2)
         let github_actions = plan.actions_for_forge(&Forge::GitHub);
-        assert_eq!(github_actions.len(), 1);
-        assert!(github_actions[0].1.is_create());
+        assert_eq!(github_actions.len(), 2);
+        assert!(github_actions.iter().all(|(_, a)| a.is_create()));
 
+        // Codeberg should have 1 create action (only repo1)
         let codeberg_actions = plan.actions_for_forge(&Forge::Codeberg);
         assert_eq!(codeberg_actions.len(), 1);
-        assert!(codeberg_actions[0].1.is_create());
+        assert_eq!(codeberg_actions[0].0.name(), "repo1");
 
+        // GitLab should have no actions
         let gitlab_actions = plan.actions_for_forge(&Forge::GitLab);
         assert!(gitlab_actions.is_empty());
     }
 
+    // ==========================================================================
+    // get_repo() - Lookup repo by name
+    // ==========================================================================
+
     #[test]
-    fn test_sync_plan_get_repo() {
+    fn test_get_repo_lookup() {
         let desired = vec![
-            make_desired("repo1"),
-            make_desired("repo2"),
+            make_desired("repo-a"),
+            make_desired("repo-b"),
+            make_desired("repo-c"),
         ];
         let observed = vec![];
 
         let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
 
-        assert!(plan.get_repo("repo1").is_some());
-        assert!(plan.get_repo("repo2").is_some());
+        assert!(plan.get_repo("repo-a").is_some());
+        assert!(plan.get_repo("repo-b").is_some());
+        assert!(plan.get_repo("repo-c").is_some());
         assert!(plan.get_repo("nonexistent").is_none());
+        assert!(plan.get_repo("").is_none());
     }
+
+    // ==========================================================================
+    // PlanSummary calculations
+    // ==========================================================================
 
     #[test]
     fn test_plan_summary_has_changes() {
-        let empty = PlanSummary::default();
-        assert!(!empty.has_changes());
+        assert!(!PlanSummary::default().has_changes());
 
-        let with_creates = PlanSummary { creates: 1, ..Default::default() };
-        assert!(with_creates.has_changes());
+        assert!(PlanSummary { creates: 1, ..Default::default() }.has_changes());
+        assert!(PlanSummary { updates: 1, ..Default::default() }.has_changes());
+        assert!(PlanSummary { deletes: 1, ..Default::default() }.has_changes());
 
-        let with_deletes = PlanSummary { deletes: 1, ..Default::default() };
-        assert!(with_deletes.has_changes());
+        // in_sync and untracked don't count as changes
+        assert!(!PlanSummary { in_sync: 100, untracked: 50, ..Default::default() }.has_changes());
     }
 
     #[test]
     fn test_plan_summary_total_actions() {
         let summary = PlanSummary {
-            creates: 2,
+            creates: 5,
             updates: 3,
-            deletes: 1,
-            in_sync: 5,
-            untracked: 2,
+            deletes: 2,
+            in_sync: 10,
+            untracked: 7,
         };
 
-        assert_eq!(summary.total_actions(), 6); // 2 + 3 + 1
+        // Total = creates + updates + deletes (not in_sync or untracked)
+        assert_eq!(summary.total_actions(), 10);
     }
 
+    // ==========================================================================
+    // Summary counts match actual diffs
+    // ==========================================================================
+
+    /// Verify summary counts are accurate by counting diffs directly
     #[test]
-    fn test_sync_plan_serialization() {
-        let desired = vec![make_desired("repo1")];
-        let observed = vec![];
+    fn test_summary_counts_match_actual_diffs() {
+        let desired = vec![
+            make_desired("create-me"),
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "update-me"),
+                Visibility::Private,
+                github_codeberg(),
+            ),
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "delete-from-codeberg"),
+                Visibility::Public,
+                github_only(),
+            ),
+            make_desired("in-sync"),
+        ];
+
+        let observed = vec![
+            // create-me not observed
+            make_observed("update-me", true, true),
+            make_observed("delete-from-codeberg", true, true),
+            make_observed("in-sync", true, true),
+            make_observed("untracked", true, false),
+        ];
+
         let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
 
-        let json = serde_json::to_string(&plan).unwrap();
-        let deserialized: SyncPlan = serde_json::from_str(&json).unwrap();
+        // Manually count from diffs
+        let actual_creates: usize = plan.repo_diffs.iter().map(|d| d.create_count()).sum();
+        let actual_updates: usize = plan.repo_diffs.iter().map(|d| d.update_count()).sum();
+        let actual_deletes: usize = plan.repo_diffs.iter().map(|d| d.delete_count()).sum();
+        let actual_untracked = plan.repo_diffs.iter().filter(|d| !d.is_tracked).count();
 
-        assert_eq!(plan, deserialized);
+        assert_eq!(plan.summary.creates, actual_creates);
+        assert_eq!(plan.summary.updates, actual_updates);
+        assert_eq!(plan.summary.deletes, actual_deletes);
+        assert_eq!(plan.summary.untracked, actual_untracked);
+    }
+
+    // ==========================================================================
+    // JSON serialization
+    // ==========================================================================
+
+    #[test]
+    fn test_sync_plan_json_roundtrip() {
+        let desired = vec![
+            make_desired("repo1"),
+            DesiredRepo::new(
+                RepoIdentity::new("hypermemetic", "repo2"),
+                Visibility::Private,
+                github_codeberg(),
+            ).with_description("Test repo"),
+        ];
+        let observed = vec![
+            make_observed("repo1", true, false),
+        ];
+
+        let plan = SyncPlan::from_diff("hypermemetic", &desired, &observed);
+        let json = serde_json::to_string(&plan).unwrap();
+        let restored: SyncPlan = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(plan, restored);
+        assert_eq!(plan.summary, restored.summary);
     }
 }

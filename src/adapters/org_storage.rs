@@ -164,3 +164,27 @@ impl Default for crate::types::ReposConfig {
         }
     }
 }
+
+// =============================================================================
+// Testing Notes
+// =============================================================================
+//
+// OrgStorageAdapter is a bridge adapter that wraps the existing OrgStorage
+// implementation. Testing this adapter effectively requires:
+//
+// 1. Filesystem setup (OrgStorage reads/writes YAML files)
+// 2. Creating test fixtures in the expected directory structure
+//
+// The meaningful tests for this adapter are:
+// - Integration tests that verify the full roundtrip through OrgStorage
+// - Tests in the storage module itself for OrgStorage behavior
+//
+// The type conversion logic (RepoConfig -> DesiredRepo, etc.) is straightforward
+// field mapping. Since the adapter is largely read-only (save_desired and
+// save_synced return errors), and the conversion is mechanical, unit tests
+// here would mostly duplicate what's tested in:
+// - yaml_storage.rs (for the YamlStorageAdapter which covers similar conversions)
+// - storage/org_storage.rs (for the underlying OrgStorage behavior)
+//
+// If more complex conversion logic is added to this adapter in the future,
+// add unit tests for that specific logic here.

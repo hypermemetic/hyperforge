@@ -248,21 +248,28 @@ mod tests {
         RepoIdentity::new("hypermemetic", "hyperforge")
     }
 
-    fn github_codeberg_forges() -> HashSet<Forge> {
+    fn github_only() -> HashSet<Forge> {
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges
+    }
+
+    fn github_codeberg() -> HashSet<Forge> {
         let mut forges = HashSet::new();
         forges.insert(Forge::GitHub);
         forges.insert(Forge::Codeberg);
         forges
     }
 
+    // ==========================================================================
+    // RepoDiff::compute() - Core diffing logic (PURE FUNCTION)
+    // ==========================================================================
+
+    /// Desired repo + no observed state = Create actions for all target forges
     #[test]
-    fn test_compute_diff_create_everywhere() {
-        let desired = DesiredRepo::new(
-            test_identity(),
-            Visibility::Public,
-            github_codeberg_forges(),
-        );
-        let observed = ObservedRepo::new(test_identity());
+    fn test_compute_create_on_all_target_forges() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg());
+        let observed = ObservedRepo::new(test_identity()); // No forge states
 
         let diff = RepoDiff::compute(Some(&desired), &observed);
 
@@ -272,29 +279,33 @@ mod tests {
         assert_eq!(diff.update_count(), 0);
         assert_eq!(diff.delete_count(), 0);
         assert!(diff.needs_action());
+
+        // Verify both forges have Create actions
+        for action in &diff.forge_actions {
+            assert!(action.is_create(), "Expected Create for {:?}", action.forge());
+        }
     }
 
+    /// Desired matches observed exactly = NoOp for all forges
     #[test]
-    fn test_compute_diff_in_sync() {
-        let desired = DesiredRepo::new(
-            test_identity(),
-            Visibility::Public,
-            github_codeberg_forges(),
-        );
+    fn test_compute_in_sync_produces_noops() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg())
+            .with_description("My repo");
+
         let observed = ObservedRepo::new(test_identity())
             .with_forge_state(ForgeRepoState::found(
                 Forge::GitHub,
                 "https://github.com/hypermemetic/hyperforge".to_string(),
                 Visibility::Public,
                 None,
-                None,
+                Some("My repo".to_string()),
             ))
             .with_forge_state(ForgeRepoState::found(
                 Forge::Codeberg,
                 "https://codeberg.org/hypermemetic/hyperforge".to_string(),
                 Visibility::Public,
                 None,
-                None,
+                Some("My repo".to_string()),
             ));
 
         let diff = RepoDiff::compute(Some(&desired), &observed);
@@ -303,47 +314,161 @@ mod tests {
         assert_eq!(diff.create_count(), 0);
         assert_eq!(diff.update_count(), 0);
         assert_eq!(diff.delete_count(), 0);
+
+        for action in &diff.forge_actions {
+            assert!(action.is_noop());
+        }
     }
 
+    /// Visibility mismatch = Update action with visibility change recorded
     #[test]
-    fn test_compute_diff_visibility_update() {
-        let desired = DesiredRepo::new(
-            test_identity(),
-            Visibility::Private, // Want private
-            github_codeberg_forges(),
-        );
+    fn test_compute_visibility_change_produces_update() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Private, github_only());
         let observed = ObservedRepo::new(test_identity())
             .with_forge_state(ForgeRepoState::found(
                 Forge::GitHub,
                 "https://github.com/hypermemetic/hyperforge".to_string(),
-                Visibility::Public, // Currently public
+                Visibility::Public, // Mismatch: observed Public, want Private
                 None,
                 None,
             ));
 
         let diff = RepoDiff::compute(Some(&desired), &observed);
 
-        assert!(diff.needs_action());
-        assert_eq!(diff.create_count(), 1); // Codeberg
-        assert_eq!(diff.update_count(), 1); // GitHub
-        assert_eq!(diff.delete_count(), 0);
+        assert_eq!(diff.update_count(), 1);
+        let update = diff.forge_actions.iter().find(|a| a.is_update()).unwrap();
 
-        // Check the update action has correct changes
-        let update_action = diff.forge_actions.iter()
-            .find(|a| a.is_update())
-            .unwrap();
-        if let ForgeAction::Update { changes, .. } = update_action {
+        if let ForgeAction::Update { forge, changes } = update {
+            assert_eq!(forge, &Forge::GitHub);
             assert_eq!(changes.visibility, Some((Visibility::Public, Visibility::Private)));
+            assert!(changes.description.is_none());
+        } else {
+            panic!("Expected Update action");
         }
     }
 
+    /// Description mismatch = Update action with description change recorded
     #[test]
-    fn test_compute_diff_delete_extra_forge() {
-        // Only want GitHub, but exists on both
-        let mut forges = HashSet::new();
-        forges.insert(Forge::GitHub);
+    fn test_compute_description_change_produces_update() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_only())
+            .with_description("New description");
 
-        let desired = DesiredRepo::new(test_identity(), Visibility::Public, forges);
+        let observed = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Public,
+                None,
+                Some("Old description".to_string()),
+            ));
+
+        let diff = RepoDiff::compute(Some(&desired), &observed);
+
+        assert_eq!(diff.update_count(), 1);
+        let update = diff.forge_actions.iter().find(|a| a.is_update()).unwrap();
+
+        if let ForgeAction::Update { changes, .. } = update {
+            assert!(changes.visibility.is_none());
+            assert_eq!(
+                changes.description,
+                Some((Some("Old description".to_string()), Some("New description".to_string())))
+            );
+        } else {
+            panic!("Expected Update action");
+        }
+    }
+
+    /// Multiple property changes at once
+    #[test]
+    fn test_compute_multiple_property_changes() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Private, github_only())
+            .with_description("New desc");
+
+        let observed = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Public,
+                None,
+                Some("Old desc".to_string()),
+            ));
+
+        let diff = RepoDiff::compute(Some(&desired), &observed);
+
+        assert_eq!(diff.update_count(), 1);
+        let update = diff.forge_actions.iter().find(|a| a.is_update()).unwrap();
+
+        if let ForgeAction::Update { changes, .. } = update {
+            // Both visibility AND description changed
+            assert!(changes.visibility.is_some());
+            assert!(changes.description.is_some());
+            assert!(!changes.is_empty());
+        } else {
+            panic!("Expected Update action");
+        }
+    }
+
+    /// Description: None -> Some (adding description)
+    #[test]
+    fn test_compute_adding_description() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_only())
+            .with_description("Added description");
+
+        let observed = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Public,
+                None,
+                None, // No description currently
+            ));
+
+        let diff = RepoDiff::compute(Some(&desired), &observed);
+
+        assert_eq!(diff.update_count(), 1);
+        let update = diff.forge_actions.iter().find(|a| a.is_update()).unwrap();
+
+        if let ForgeAction::Update { changes, .. } = update {
+            assert_eq!(
+                changes.description,
+                Some((None, Some("Added description".to_string())))
+            );
+        }
+    }
+
+    /// Description: Some -> None (removing description)
+    #[test]
+    fn test_compute_removing_description() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_only());
+        // No description set (None)
+
+        let observed = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Public,
+                None,
+                Some("Has description".to_string()),
+            ));
+
+        let diff = RepoDiff::compute(Some(&desired), &observed);
+
+        assert_eq!(diff.update_count(), 1);
+        let update = diff.forge_actions.iter().find(|a| a.is_update()).unwrap();
+
+        if let ForgeAction::Update { changes, .. } = update {
+            assert_eq!(
+                changes.description,
+                Some((Some("Has description".to_string()), None))
+            );
+        }
+    }
+
+    /// Repo exists on forge not in desired forges set = Delete action
+    #[test]
+    fn test_compute_delete_from_unwanted_forge() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_only());
+
         let observed = ObservedRepo::new(test_identity())
             .with_forge_state(ForgeRepoState::found(
                 Forge::GitHub,
@@ -362,19 +487,20 @@ mod tests {
 
         let diff = RepoDiff::compute(Some(&desired), &observed);
 
-        assert!(diff.needs_action());
-        assert_eq!(diff.create_count(), 0);
-        assert_eq!(diff.update_count(), 0);
-        assert_eq!(diff.delete_count(), 1); // Delete from Codeberg
+        assert_eq!(diff.delete_count(), 1);
+        let delete = diff.forge_actions.iter().find(|a| a.is_delete()).unwrap();
+
+        if let ForgeAction::Delete { forge, url } = delete {
+            assert_eq!(forge, &Forge::Codeberg);
+            assert_eq!(url, &Some("https://codeberg.org/hypermemetic/hyperforge".to_string()));
+        }
     }
 
+    /// marked_for_deletion = Delete existing, NoOp non-existing
     #[test]
-    fn test_compute_diff_marked_for_deletion() {
-        let desired = DesiredRepo::new(
-            test_identity(),
-            Visibility::Public,
-            github_codeberg_forges(),
-        ).with_deletion_mark(true);
+    fn test_compute_marked_for_deletion() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Public, github_codeberg())
+            .with_deletion_mark(true);
 
         let observed = ObservedRepo::new(test_identity())
             .with_forge_state(ForgeRepoState::found(
@@ -384,17 +510,24 @@ mod tests {
                 None,
                 None,
             ));
+        // Codeberg not observed (doesn't exist)
 
         let diff = RepoDiff::compute(Some(&desired), &observed);
 
         assert!(diff.marked_for_deletion);
-        assert_eq!(diff.delete_count(), 1); // Delete from GitHub
-        // Codeberg is NoOp (nothing to delete)
+        assert_eq!(diff.delete_count(), 1); // Delete from GitHub where it exists
+        // Codeberg should be NoOp since nothing to delete
+
+        let github_action = diff.forge_actions.iter().find(|a| a.forge() == &Forge::GitHub).unwrap();
+        assert!(github_action.is_delete());
+
+        let codeberg_action = diff.forge_actions.iter().find(|a| a.forge() == &Forge::Codeberg).unwrap();
+        assert!(codeberg_action.is_noop());
     }
 
+    /// No desired state = untracked repo with empty actions
     #[test]
-    fn test_compute_diff_untracked() {
-        // No desired state - repo is untracked
+    fn test_compute_untracked_repo() {
         let observed = ObservedRepo::new(test_identity())
             .with_forge_state(ForgeRepoState::found(
                 Forge::GitHub,
@@ -407,8 +540,58 @@ mod tests {
         let diff = RepoDiff::compute(None, &observed);
 
         assert!(!diff.is_tracked);
+        assert!(!diff.marked_for_deletion);
         assert!(diff.forge_actions.is_empty());
+        assert!(!diff.needs_action()); // Untracked repos don't need action
     }
+
+    /// Mixed scenario: create + update + noop on different forges
+    #[test]
+    fn test_compute_mixed_actions() {
+        let mut forges = HashSet::new();
+        forges.insert(Forge::GitHub);
+        forges.insert(Forge::Codeberg);
+        forges.insert(Forge::GitLab);
+
+        let desired = DesiredRepo::new(test_identity(), Visibility::Private, forges);
+
+        let observed = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Private, // In sync
+                None,
+                None,
+            ))
+            .with_forge_state(ForgeRepoState::found(
+                Forge::Codeberg,
+                "https://codeberg.org/hypermemetic/hyperforge".to_string(),
+                Visibility::Public, // Needs update
+                None,
+                None,
+            ));
+        // GitLab not observed = needs create
+
+        let diff = RepoDiff::compute(Some(&desired), &observed);
+
+        assert_eq!(diff.create_count(), 1);  // GitLab
+        assert_eq!(diff.update_count(), 1);  // Codeberg
+        assert!(diff.needs_action());
+
+        // Verify specific actions
+        let gitlab_action = diff.forge_actions.iter().find(|a| a.forge() == &Forge::GitLab).unwrap();
+        assert!(gitlab_action.is_create());
+
+        let codeberg_action = diff.forge_actions.iter().find(|a| a.forge() == &Forge::Codeberg).unwrap();
+        assert!(codeberg_action.is_update());
+
+        let github_action = diff.forge_actions.iter().find(|a| a.forge() == &Forge::GitHub).unwrap();
+        assert!(github_action.is_noop());
+    }
+
+    // ==========================================================================
+    // PropertyChanges helper methods
+    // ==========================================================================
 
     #[test]
     fn test_property_changes_is_empty() {
@@ -417,42 +600,91 @@ mod tests {
 
         let with_visibility = PropertyChanges {
             visibility: Some((Visibility::Public, Visibility::Private)),
-            ..Default::default()
-        };
-        assert!(!with_visibility.is_empty());
-    }
-
-    #[test]
-    fn test_forge_action_accessors() {
-        let create = ForgeAction::Create {
-            forge: Forge::GitHub,
-            visibility: Visibility::Public,
             description: None,
         };
-        assert!(create.is_create());
-        assert!(!create.is_delete());
-        assert!(!create.is_update());
-        assert!(!create.is_noop());
-        assert_eq!(create.forge(), &Forge::GitHub);
+        assert!(!with_visibility.is_empty());
 
-        let noop = ForgeAction::NoOp { forge: Forge::Codeberg };
-        assert!(noop.is_noop());
-        assert!(!noop.is_create());
+        let with_description = PropertyChanges {
+            visibility: None,
+            description: Some((None, Some("desc".to_string()))),
+        };
+        assert!(!with_description.is_empty());
+
+        let with_both = PropertyChanges {
+            visibility: Some((Visibility::Public, Visibility::Private)),
+            description: Some((None, Some("desc".to_string()))),
+        };
+        assert!(!with_both.is_empty());
+    }
+
+    // ==========================================================================
+    // ForgeAction helper methods
+    // ==========================================================================
+
+    #[test]
+    fn test_forge_action_type_predicates() {
+        let cases = [
+            (
+                ForgeAction::Create { forge: Forge::GitHub, visibility: Visibility::Public, description: None },
+                true, false, false, false,
+            ),
+            (
+                ForgeAction::Update { forge: Forge::GitHub, changes: PropertyChanges::default() },
+                false, true, false, false,
+            ),
+            (
+                ForgeAction::Delete { forge: Forge::GitHub, url: None },
+                false, false, true, false,
+            ),
+            (
+                ForgeAction::NoOp { forge: Forge::GitHub },
+                false, false, false, true,
+            ),
+        ];
+
+        for (action, is_create, is_update, is_delete, is_noop) in cases {
+            assert_eq!(action.is_create(), is_create, "is_create for {:?}", action);
+            assert_eq!(action.is_update(), is_update, "is_update for {:?}", action);
+            assert_eq!(action.is_delete(), is_delete, "is_delete for {:?}", action);
+            assert_eq!(action.is_noop(), is_noop, "is_noop for {:?}", action);
+        }
     }
 
     #[test]
-    fn test_diff_serialization() {
-        let desired = DesiredRepo::new(
-            test_identity(),
-            Visibility::Public,
-            github_codeberg_forges(),
-        );
-        let observed = ObservedRepo::new(test_identity());
+    fn test_forge_action_forge_accessor() {
+        let actions = [
+            (ForgeAction::Create { forge: Forge::GitHub, visibility: Visibility::Public, description: None }, Forge::GitHub),
+            (ForgeAction::Update { forge: Forge::Codeberg, changes: PropertyChanges::default() }, Forge::Codeberg),
+            (ForgeAction::Delete { forge: Forge::GitLab, url: None }, Forge::GitLab),
+            (ForgeAction::NoOp { forge: Forge::GitHub }, Forge::GitHub),
+        ];
+
+        for (action, expected_forge) in actions {
+            assert_eq!(action.forge(), &expected_forge);
+        }
+    }
+
+    // ==========================================================================
+    // JSON serialization
+    // ==========================================================================
+
+    #[test]
+    fn test_diff_json_roundtrip() {
+        let desired = DesiredRepo::new(test_identity(), Visibility::Private, github_codeberg())
+            .with_description("Test");
+        let observed = ObservedRepo::new(test_identity())
+            .with_forge_state(ForgeRepoState::found(
+                Forge::GitHub,
+                "https://github.com/hypermemetic/hyperforge".to_string(),
+                Visibility::Public,
+                None,
+                None,
+            ));
+
         let diff = RepoDiff::compute(Some(&desired), &observed);
-
         let json = serde_json::to_string(&diff).unwrap();
-        let deserialized: RepoDiff = serde_json::from_str(&json).unwrap();
+        let restored: RepoDiff = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(diff, deserialized);
+        assert_eq!(diff, restored);
     }
 }
