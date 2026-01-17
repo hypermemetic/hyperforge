@@ -58,8 +58,16 @@
 pub mod diff;
 pub mod import;
 pub mod sync;
+pub mod symmetric_sync;
 
 // Re-export services and their error types
 pub use diff::{DiffService, DiffError, DiffOptions};
 pub use import::{ImportService, ImportError};
 pub use sync::{SyncService, SyncError, SyncResult, SyncOutcome};
+
+// New symmetric sync service
+pub use symmetric_sync::{
+    SymmetricSyncService, SymmetricSyncError,
+    SyncOptions, SyncReport, RepoSyncResult,
+    SyncOutcome as SymmetricSyncOutcome,
+};

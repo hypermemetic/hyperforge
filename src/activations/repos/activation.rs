@@ -42,6 +42,40 @@ impl ReposActivation {
         OrgStorage::new((*self.paths).clone(), self.org_name.clone())
     }
 
+    /// Validate a repository name
+    fn validate_repo_name(name: &str) -> Result<(), String> {
+        // Check not empty
+        if name.is_empty() {
+            return Err("Repository name cannot be empty".to_string());
+        }
+
+        // Check not just whitespace
+        if name.trim().is_empty() {
+            return Err("Repository name cannot be only whitespace".to_string());
+        }
+
+        // Check length (GitHub limit is 100)
+        if name.len() > 100 {
+            return Err("Repository name cannot exceed 100 characters".to_string());
+        }
+
+        // Check for invalid characters (GitHub/Codeberg restrictions)
+        // Note: repos CAN start with '.' (e.g., .github)
+        let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '];
+        for c in invalid_chars {
+            if name.contains(c) {
+                return Err(format!("Repository name cannot contain '{}'", c));
+            }
+        }
+
+        // Check doesn't start with a dash (git restriction)
+        if name.starts_with('-') {
+            return Err("Repository name cannot start with a dash".to_string());
+        }
+
+        Ok(())
+    }
+
     /// Convert domain RepoDiff to event DiffStatus
     fn diff_to_status(diff: &RepoDiff) -> DiffStatus {
         if diff.marked_for_deletion {
@@ -185,6 +219,16 @@ impl ReposActivation {
         let org_config = self.org_config.clone();
 
         stream! {
+            // Validate repo name first
+            if let Err(e) = Self::validate_repo_name(&repo_name) {
+                yield RepoEvent::Error {
+                    org_name,
+                    repo_name: Some(repo_name),
+                    message: e,
+                };
+                return;
+            }
+
             // Parse visibility
             let vis = match visibility.as_deref() {
                 Some("private") => Some(Visibility::Private),
@@ -289,6 +333,105 @@ impl ReposActivation {
         }
     }
 
+    /// Update a repository's configuration
+    #[hub_method(
+        description = "Update repository settings (visibility, description, etc.)",
+        params(
+            repo_name = "Repository to update",
+            visibility = "public or private",
+            description = "Repository description",
+            protected = "Protect repo from deletion"
+        )
+    )]
+    pub async fn update(
+        &self,
+        repo_name: String,
+        visibility: Option<String>,
+        description: Option<String>,
+        protected: Option<bool>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let storage = self.storage();
+        let org_name = self.org_name.clone();
+
+        stream! {
+            // Validate repo name
+            if let Err(e) = Self::validate_repo_name(&repo_name) {
+                yield RepoEvent::Error {
+                    org_name,
+                    repo_name: Some(repo_name),
+                    message: e,
+                };
+                return;
+            }
+
+            // Load existing repos
+            let repos = match storage.load_repos().await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: Some(repo_name),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            // Check repo exists
+            let existing = match repos.repos.get(&repo_name) {
+                Some(cfg) => cfg.clone(),
+                None => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Repository '{}' not found. Use 'repos list' to see available repos.", repo_name),
+                    };
+                    return;
+                }
+            };
+
+            // Parse visibility if provided
+            let new_visibility = match visibility.as_deref() {
+                Some("private") => Some(Visibility::Private),
+                Some("public") => Some(Visibility::Public),
+                None => existing.visibility,
+                Some(v) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: Some(repo_name),
+                        message: format!("Invalid visibility '{}'. Use 'public' or 'private'.", v),
+                    };
+                    return;
+                }
+            };
+
+            // Build updated config, preserving existing fields
+            let updated_config = RepoConfig {
+                description: description.or(existing.description),
+                visibility: new_visibility,
+                forges: existing.forges,
+                protected: protected.unwrap_or(existing.protected),
+                delete: false,
+                synced: existing.synced,
+                discovered: existing.discovered,
+            };
+
+            // Stage the update
+            match storage.stage_repo(repo_name.clone(), updated_config).await {
+                Ok(()) => {
+                    yield RepoEvent::Staged { org_name, repo_name };
+                }
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: Some(repo_name),
+                        message: e.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
     /// Mark a repository for deletion
     #[hub_method(
         description = "Remove a repository",
@@ -307,7 +450,17 @@ impl ReposActivation {
         let force_delete = force.unwrap_or(false);
 
         stream! {
-            // Check protection status
+            // Validate repo name first
+            if let Err(e) = Self::validate_repo_name(&repo_name) {
+                yield RepoEvent::Error {
+                    org_name,
+                    repo_name: Some(repo_name),
+                    message: e,
+                };
+                return;
+            }
+
+            // Load repos to check existence and protection status
             let repos = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -320,15 +473,27 @@ impl ReposActivation {
                 }
             };
 
-            if let Some(config) = repos.repos.get(&repo_name) {
-                if config.protected && !force_delete {
-                    yield RepoEvent::ProtectionError {
+            // Check repo exists
+            let config = match repos.repos.get(&repo_name) {
+                Some(cfg) => cfg,
+                None => {
+                    yield RepoEvent::Error {
                         org_name,
-                        repo_name,
-                        message: "Repository is protected. Use --force true to delete.".into(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Repository '{}' not found. Use 'repos list' to see available repos.", repo_name),
                     };
                     return;
                 }
+            };
+
+            // Check protection status
+            if config.protected && !force_delete {
+                yield RepoEvent::ProtectionError {
+                    org_name,
+                    repo_name,
+                    message: "Repository is protected. Use --force true to delete.".into(),
+                };
+                return;
             }
 
             match storage.stage_deletion(repo_name.clone()).await {

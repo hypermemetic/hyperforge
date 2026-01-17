@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use async_stream::stream;
 use futures::Stream;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,10 +11,13 @@ use hub_core::plexus::{
 };
 use hub_macro::hub_methods;
 
-use crate::bridge::{GitRemoteBridge, PulumiBridge};
+use crate::adapters::{GitHubAdapter, CodebergAdapter, LocalForge};
+use crate::bridge::{GitRemoteBridge, KeychainBridge};
+use crate::ports::ForgePort;
+use crate::services::symmetric_sync::{SymmetricSyncService, SyncOptions, SyncOutcome};
 use crate::storage::{HyperforgePaths, OrgStorage, GlobalConfig, OrgConfig};
 use crate::events::RepoEvent;
-use crate::types::RepoDetails;
+use crate::types::{RepoDetails, Forge};
 
 /// Child router for a specific repository (e.g., org.hypermemetic.repos.substrate)
 /// Receives org-level configuration from parent ReposActivation.
@@ -97,7 +101,7 @@ impl RepoChildRouter {
         let org_config = self.org_config.clone();
         let paths = self.paths.clone();
         let is_dry_run = dry_run.unwrap_or(false);
-        let auto_yes = yes.unwrap_or(false);
+        let _auto_yes = yes.unwrap_or(false); // Not needed - SymmetricSyncService doesn't prompt
 
         stream! {
             yield RepoEvent::SyncStarted {
@@ -211,17 +215,75 @@ impl RepoChildRouter {
                 }
             }
 
-            // Call Pulumi bridge
-            let bridge = PulumiBridge::new(&paths);
+            // Build LocalForge from repos.yaml (source of truth)
             let repos_file = paths.repos_file(&org_name);
-            let staged_file = paths.staged_repos_file(&org_name);
+            let local_forge = match LocalForge::load(&repos_file) {
+                Ok(forge) => forge,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Failed to load repos.yaml: {}", e),
+                    };
+                    return;
+                }
+            };
 
-            // Select/create stack for this org
-            if let Err(e) = bridge.select_stack(&org_name).await {
+            // Build forge adapters for target forges
+            let keychain = KeychainBridge::new(&org_name);
+            let mut target_forges: Vec<(Forge, Arc<dyn ForgePort>)> = Vec::new();
+
+            for forge in forges.iter() {
+                match forge {
+                    Forge::Local => continue, // Skip local forge - it's our source
+                    Forge::GitLab => {
+                        yield RepoEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: "GitLab not yet supported".to_string(),
+                        };
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                let token_key = match forge {
+                    Forge::GitHub => "github-token",
+                    Forge::Codeberg => "codeberg-token",
+                    _ => continue,
+                };
+
+                match keychain.get(token_key).await {
+                    Ok(Some(token)) => {
+                        let adapter: Arc<dyn ForgePort> = match forge {
+                            Forge::GitHub => Arc::new(GitHubAdapter::new(token)),
+                            Forge::Codeberg => Arc::new(CodebergAdapter::new(token)),
+                            _ => continue,
+                        };
+                        target_forges.push((forge.clone(), adapter));
+                    }
+                    Ok(None) => {
+                        yield RepoEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("No token configured for {}", forge),
+                        };
+                    }
+                    Err(e) => {
+                        yield RepoEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("Failed to get {} token: {}", forge, e),
+                        };
+                    }
+                }
+            }
+
+            if target_forges.is_empty() {
                 yield RepoEvent::Error {
                     org_name: org_name.clone(),
                     repo_name: Some(repo_name.clone()),
-                    message: format!("Failed to select Pulumi stack: {}", e),
+                    message: "No forge adapters available for sync".to_string(),
                 };
                 return;
             }
@@ -229,48 +291,63 @@ impl RepoChildRouter {
             yield RepoEvent::SyncProgress {
                 org_name: org_name.clone(),
                 repo_name: repo_name.clone(),
-                stage: "pulumi".to_string(),
+                stage: "sync".to_string(),
             };
 
-            // Run pulumi preview or up
-            use futures::StreamExt;
-            use std::pin::Pin;
+            // Sync to each target forge
+            let mut total_synced = 0;
+            let mut sync_filter = HashSet::new();
+            sync_filter.insert(repo_name.clone());
 
-            let mut pulumi_stream: Pin<Box<dyn Stream<Item = crate::events::PulumiEvent> + Send>> = if is_dry_run {
-                Box::pin(bridge.preview(&org_name, &repos_file, &staged_file))
-            } else {
-                Box::pin(bridge.up(&org_name, &repos_file, &staged_file, auto_yes))
-            };
+            let sync_options = SyncOptions::new()
+                .filter_repos(sync_filter);
+            let sync_options = if is_dry_run { sync_options.dry_run() } else { sync_options };
 
-            // Process Pulumi events and convert to RepoEvents
-            while let Some(event) = pulumi_stream.next().await {
-                match event {
-                    crate::events::PulumiEvent::ResourcePlanned { resource_name, .. } |
-                    crate::events::PulumiEvent::ResourceApplied { resource_name, .. } => {
-                        yield RepoEvent::SyncProgress {
-                            org_name: org_name.clone(),
-                            repo_name: resource_name,
-                            stage: "pulumi".into(),
-                        };
+            for (forge, adapter) in target_forges {
+                yield RepoEvent::SyncProgress {
+                    org_name: org_name.clone(),
+                    repo_name: repo_name.clone(),
+                    stage: format!("syncing to {}", forge),
+                };
+
+                match SymmetricSyncService::sync(
+                    &local_forge,
+                    adapter.as_ref(),
+                    &org_name,
+                    sync_options.clone(),
+                ).await {
+                    Ok(report) => {
+                        // Count successful syncs
+                        for result in &report.results {
+                            match &result.outcome {
+                                SyncOutcome::Applied => total_synced += 1,
+                                SyncOutcome::Skipped => {} // dry run
+                                SyncOutcome::Failed { error } => {
+                                    yield RepoEvent::Error {
+                                        org_name: org_name.clone(),
+                                        repo_name: Some(result.identity.name.clone()),
+                                        message: format!("Failed on {}: {}", forge, error),
+                                    };
+                                }
+                                SyncOutcome::NoOp => {} // already in sync
+                            }
+                        }
                     }
-                    crate::events::PulumiEvent::PreviewComplete { creates, .. } |
-                    crate::events::PulumiEvent::UpComplete { creates, .. } => {
-                        yield RepoEvent::SyncComplete {
-                            org_name: org_name.clone(),
-                            success: true,
-                            synced_count: creates,
-                        };
-                    }
-                    crate::events::PulumiEvent::Error { message } => {
+                    Err(e) => {
                         yield RepoEvent::Error {
                             org_name: org_name.clone(),
                             repo_name: Some(repo_name.clone()),
-                            message,
+                            message: format!("Sync to {} failed: {}", forge, e),
                         };
                     }
-                    _ => {}
                 }
             }
+
+            yield RepoEvent::SyncComplete {
+                org_name: org_name.clone(),
+                success: true,
+                synced_count: total_synced,
+            };
         }
     }
 }

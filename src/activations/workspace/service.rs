@@ -8,11 +8,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::StreamExt;
-
 use crate::activations::org::OrgActivation;
-use crate::bridge::{GitRemoteBridge, PulumiBridge};
-use crate::events::{PulumiEvent, WorkspaceEvent};
+use crate::activations::workspace::events::{RepoStatusEntry, RepoSyncStatus};
+use crate::adapters::{GitHubAdapter, CodebergAdapter, LocalForge};
+use crate::bridge::{GitRemoteBridge, KeychainBridge};
+use crate::domain::PropertyDiff;
+use crate::events::WorkspaceEvent;
+use crate::ports::ForgePort;
+use crate::services::symmetric_sync::{SymmetricSyncService, SyncOptions, SyncOutcome};
 use crate::storage::{GlobalConfig, HyperforgePaths, OrgConfig, OrgStorage};
 use crate::types::{Forge, RepoConfig, WorkspaceBinding};
 
@@ -254,6 +257,25 @@ impl WorkspaceService {
             return Err("Clone failed".to_string());
         }
 
+        // Configure hyperforge org for SSH wrapper
+        let _ = tokio::process::Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "hyperforge.org", org_name])
+            .output()
+            .await;
+
+        // Set core.sshCommand to use hyperforge-ssh wrapper
+        // The wrapper reads hyperforge.org and resolves the correct SSH key
+        if let Some(home) = std::env::var_os("HOME") {
+            let ssh_wrapper = std::path::Path::new(&home)
+                .join(".hypermemetic-infra/scripts/hyperforge-ssh");
+            let _ = tokio::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(["config", "core.sshCommand", ssh_wrapper.to_str().unwrap_or("")])
+                .output()
+                .await;
+        }
+
         // Add remotes for other forges
         for forge in forges {
             if forge == &org_config.origin {
@@ -301,9 +323,52 @@ impl WorkspaceService {
         OrgActivation::new(self.paths.clone())
     }
 
-    /// Get PulumiBridge for sync operations
-    pub fn pulumi_bridge(&self) -> PulumiBridge {
-        PulumiBridge::new(&self.paths)
+    /// Build forge adapters for an organization's configured forges
+    /// Uses `credential_org` for API token lookup (supports sub-orgs with templates)
+    pub async fn build_forge_adapters(
+        &self,
+        credential_org: &str,
+        forges: &[Forge],
+    ) -> (Vec<(Forge, Arc<dyn ForgePort>)>, Vec<String>) {
+        let keychain = KeychainBridge::new(credential_org);
+        let mut adapters: Vec<(Forge, Arc<dyn ForgePort>)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for forge in forges {
+            match forge {
+                Forge::Local => continue,
+                Forge::GitLab => {
+                    errors.push("GitLab not yet supported".to_string());
+                    continue;
+                }
+                _ => {}
+            }
+
+            let token_key = match forge {
+                Forge::GitHub => "github-token",
+                Forge::Codeberg => "codeberg-token",
+                _ => continue,
+            };
+
+            match keychain.get(token_key).await {
+                Ok(Some(token)) => {
+                    let adapter: Arc<dyn ForgePort> = match forge {
+                        Forge::GitHub => Arc::new(GitHubAdapter::new(token)),
+                        Forge::Codeberg => Arc::new(CodebergAdapter::new(token)),
+                        _ => continue,
+                    };
+                    adapters.push((forge.clone(), adapter));
+                }
+                Ok(None) => {
+                    errors.push(format!("No token configured for {}", forge));
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to get {} token: {}", forge, e));
+                }
+            }
+        }
+
+        (adapters, errors)
     }
 
     /// Get OrgStorage for an organization
@@ -369,6 +434,27 @@ impl WorkspaceService {
             .collect()
     }
 
+    /// Build human-readable detail strings from a sync action
+    fn build_action_details(action: &crate::domain::SyncAction) -> Vec<String> {
+        match action {
+            crate::domain::SyncAction::Update { diffs, .. } => {
+                diffs.iter().map(|diff| {
+                    match diff {
+                        PropertyDiff::Visibility { source, target } => {
+                            format!("visibility: {:?} → {:?}", target, source)
+                        }
+                        PropertyDiff::Description { source, target } => {
+                            let from = target.as_deref().unwrap_or("(none)");
+                            let to = source.as_deref().unwrap_or("(none)");
+                            format!("description: \"{}\" → \"{}\"", from, to)
+                        }
+                    }
+                }).collect()
+            }
+            _ => vec![],
+        }
+    }
+
     /// Get paths reference for cloning service
     pub fn paths(&self) -> &Arc<HyperforgePaths> {
         &self.paths
@@ -393,6 +479,7 @@ impl WorkspaceService {
         let org_config = match config.get_org(org_name) {
             Some(c) => c.clone(),
             None => {
+                events.push(WorkspaceEvent::Error { message: format!("Organization not found: {}", org_name) });
                 if auto_yes {
                     events.push(WorkspaceEvent::OrgSyncComplete { org_name: org_name.to_string(), synced: 0, unchanged: 0, failed: 1 });
                 } else {
@@ -403,23 +490,8 @@ impl WorkspaceService {
         };
 
         let storage = self.org_storage(org_name);
-        let bridge = self.pulumi_bridge();
 
-        // Select Pulumi stack
-        if let Err(e) = bridge.select_stack(org_name).await {
-            events.push(WorkspaceEvent::Error { message: format!("Failed to select Pulumi stack: {}", e) });
-            if auto_yes {
-                events.push(WorkspaceEvent::OrgSyncComplete { org_name: org_name.to_string(), synced: 0, unchanged: 0, failed: 1 });
-            } else {
-                events.push(WorkspaceEvent::OrgPreviewComplete { org_name: org_name.to_string(), to_create: 0, to_update: 0, to_delete: 0, unchanged: 0 });
-            }
-            return events;
-        }
-
-        let repos_file = self.repos_file(org_name);
-        let staged_file = self.staged_repos_file(org_name);
-
-        // Load and merge repos
+        // Load and optionally merge repos
         let repos_config = if auto_yes {
             match storage.merge_staged().await {
                 Ok(cfg) => cfg,
@@ -453,97 +525,288 @@ impl WorkspaceService {
             }
         };
 
-        // Import existing repos into Pulumi state
-        for (repo_name, repo_cfg) in &repos_config.repos {
-            if repo_cfg.delete { continue; }
-            for forge in [Forge::GitHub, Forge::Codeberg] {
-                let (resource_type, resource_id) = match forge {
-                    Forge::GitHub => ("github:index/repository:Repository", repo_name.to_string()),
-                    Forge::Codeberg => ("gitea:index/repository:Repository", format!("{}/{}", org_config.owner, repo_name)),
-                    Forge::GitLab => continue,
-                };
+        // Build LocalForge from merged repos config (includes staged changes)
+        // Also collect repos marked for deletion (they're excluded from LocalForge)
+        let local_forge = LocalForge::from_repos_config(&repos_config);
+        let repos_to_delete: Vec<String> = repos_config.repos
+            .iter()
+            .filter(|(_, cfg)| cfg.delete)
+            .map(|(name, _)| name.clone())
+            .collect();
 
-                events.push(WorkspaceEvent::PulumiImporting { org_name: org_name.to_string(), repo_name: repo_name.clone(), forge: forge.to_string() });
+        // Build forge adapters (use credential_org for API token lookup)
+        let forges = org_config.forges.all_forges();
+        let credential_org = org_config.credential_org(org_name);
+        let (target_forges, adapter_errors) = self.build_forge_adapters(credential_org, &forges).await;
 
-                match bridge.import_resource(org_name, resource_type, repo_name, &resource_id).await {
-                    Ok(imported) => events.push(WorkspaceEvent::PulumiImported { org_name: org_name.to_string(), repo_name: repo_name.clone(), forge: forge.to_string(), imported }),
-                    Err(e) if !e.contains("does not exist") && !e.contains("not found") => {
-                        events.push(WorkspaceEvent::Error { message: format!("Failed to import {}/{} on {}: {}", org_name, repo_name, forge, e) });
+        // Report adapter errors
+        for err in adapter_errors {
+            events.push(WorkspaceEvent::Error { message: err });
+        }
+
+        if target_forges.is_empty() {
+            events.push(WorkspaceEvent::Error { message: "No forge adapters available for sync".to_string() });
+            if auto_yes {
+                events.push(WorkspaceEvent::OrgSyncComplete { org_name: org_name.to_string(), synced: 0, unchanged: 0, failed: 1 });
+            } else {
+                events.push(WorkspaceEvent::OrgPreviewComplete { org_name: org_name.to_string(), to_create: 0, to_update: 0, to_delete: 0, unchanged: 0 });
+            }
+            return events;
+        }
+
+        // Configure sync options
+        let sync_options = if auto_yes {
+            SyncOptions::new()
+        } else {
+            SyncOptions::new().dry_run()
+        };
+
+        let mut total_creates = 0;
+        let mut total_updates = 0;
+        let mut total_deletes = 0;
+        let mut total_unchanged = 0;
+        let mut total_failed = 0;
+
+        // Sync to each target forge
+        for (forge, adapter) in target_forges {
+            events.push(WorkspaceEvent::SyncOutput {
+                line: format!("Syncing to {}...", forge),
+            });
+
+            match SymmetricSyncService::sync(
+                &local_forge,
+                adapter.as_ref(),
+                org_name,
+                sync_options.clone(),
+            ).await {
+                Ok(report) => {
+                    // Collect all repo statuses for this forge
+                    let mut repo_entries: Vec<RepoStatusEntry> = Vec::new();
+                    let mut forge_creates = 0;
+                    let mut forge_updates = 0;
+                    let mut forge_deletes = 0;
+                    let mut forge_unchanged = 0;
+                    let mut forge_failed = 0;
+
+                    for result in &report.results {
+                        let details = Self::build_action_details(&result.action);
+
+                        match &result.outcome {
+                            SyncOutcome::Applied => {
+                                if result.action.is_create() {
+                                    forge_creates += 1;
+                                    total_creates += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: result.identity.name.clone(),
+                                        status: RepoSyncStatus::Synced,
+                                        details: vec!["created".to_string()],
+                                    });
+                                    // Update synced state
+                                    let url = format!("{}://{}/{}", forge.to_string().to_lowercase(), org_config.owner, result.identity.name);
+                                    let _ = storage.update_synced(&result.identity.name, forge.clone(), url, None).await;
+                                } else if result.action.is_update() {
+                                    forge_updates += 1;
+                                    total_updates += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: result.identity.name.clone(),
+                                        status: RepoSyncStatus::Synced,
+                                        details,
+                                    });
+                                    // Update synced state for updates too
+                                    let url = format!("{}://{}/{}", forge.to_string().to_lowercase(), org_config.owner, result.identity.name);
+                                    let _ = storage.update_synced(&result.identity.name, forge.clone(), url, None).await;
+                                } else if result.action.is_delete() {
+                                    forge_deletes += 1;
+                                    total_deletes += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: result.identity.name.clone(),
+                                        status: RepoSyncStatus::Synced,
+                                        details: vec!["deleted".to_string()],
+                                    });
+                                }
+                            }
+                            SyncOutcome::Skipped => {
+                                // Dry run - count what would happen
+                                if result.action.is_create() {
+                                    forge_creates += 1;
+                                    total_creates += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: result.identity.name.clone(),
+                                        status: RepoSyncStatus::ToCreate,
+                                        details: vec![],
+                                    });
+                                } else if result.action.is_update() {
+                                    forge_updates += 1;
+                                    total_updates += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: result.identity.name.clone(),
+                                        status: RepoSyncStatus::ToUpdate,
+                                        details,
+                                    });
+                                } else if result.action.is_delete() {
+                                    forge_deletes += 1;
+                                    total_deletes += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: result.identity.name.clone(),
+                                        status: RepoSyncStatus::ToDelete,
+                                        details: vec![],
+                                    });
+                                }
+                            }
+                            SyncOutcome::Failed { error } => {
+                                forge_failed += 1;
+                                total_failed += 1;
+                                repo_entries.push(RepoStatusEntry {
+                                    name: result.identity.name.clone(),
+                                    status: RepoSyncStatus::Failed,
+                                    details: vec![error.clone()],
+                                });
+                            }
+                            SyncOutcome::NoOp => {
+                                forge_unchanged += 1;
+                                total_unchanged += 1;
+                                repo_entries.push(RepoStatusEntry {
+                                    name: result.identity.name.clone(),
+                                    status: RepoSyncStatus::InSync,
+                                    details: vec![],
+                                });
+                            }
+                        }
                     }
-                    _ => {}
+
+                    // Handle repos marked for deletion
+                    for repo_name in &repos_to_delete {
+                        if auto_yes {
+                            // Actually delete the repo from this forge
+                            let identity = crate::domain::RepoIdentity::new(org_name, repo_name);
+                            match adapter.delete_repo(&identity).await {
+                                Ok(_) => {
+                                    forge_deletes += 1;
+                                    total_deletes += 1;
+                                    repo_entries.push(RepoStatusEntry {
+                                        name: repo_name.clone(),
+                                        status: RepoSyncStatus::Synced,
+                                        details: vec!["deleted".to_string()],
+                                    });
+                                }
+                                Err(e) => {
+                                    // Not found is OK - means it's already gone
+                                    if e.to_string().contains("not found") || e.to_string().contains("404") {
+                                        repo_entries.push(RepoStatusEntry {
+                                            name: repo_name.clone(),
+                                            status: RepoSyncStatus::InSync,
+                                            details: vec!["already deleted".to_string()],
+                                        });
+                                    } else {
+                                        forge_failed += 1;
+                                        total_failed += 1;
+                                        repo_entries.push(RepoStatusEntry {
+                                            name: repo_name.clone(),
+                                            status: RepoSyncStatus::Failed,
+                                            details: vec![format!("delete failed: {}", e)],
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            // Preview mode - just show what would be deleted
+                            forge_deletes += 1;
+                            total_deletes += 1;
+                            repo_entries.push(RepoStatusEntry {
+                                name: repo_name.clone(),
+                                status: RepoSyncStatus::ToDelete,
+                                details: vec![],
+                            });
+                        }
+                    }
+
+                    // Sort repos by status (changes first), then by name
+                    repo_entries.sort_by(|a, b| {
+                        let status_order = |s: &RepoSyncStatus| match s {
+                            RepoSyncStatus::ToCreate => 0,
+                            RepoSyncStatus::ToUpdate => 1,
+                            RepoSyncStatus::ToDelete => 2,
+                            RepoSyncStatus::Failed => 3,
+                            RepoSyncStatus::Synced => 4,
+                            RepoSyncStatus::InSync => 5,
+                        };
+                        let order_cmp = status_order(&a.status).cmp(&status_order(&b.status));
+                        if order_cmp == std::cmp::Ordering::Equal {
+                            a.name.cmp(&b.name)
+                        } else {
+                            order_cmp
+                        }
+                    });
+
+                    // Emit grouped event for this forge
+                    if auto_yes {
+                        events.push(WorkspaceEvent::ForgeSynced {
+                            org_name: org_name.to_string(),
+                            forge: forge.to_string(),
+                            repos: repo_entries,
+                            created: forge_creates,
+                            updated: forge_updates,
+                            deleted: forge_deletes,
+                            unchanged: forge_unchanged,
+                            failed: forge_failed,
+                        });
+                    } else {
+                        events.push(WorkspaceEvent::ForgePreview {
+                            org_name: org_name.to_string(),
+                            forge: forge.to_string(),
+                            repos: repo_entries,
+                            to_create: forge_creates,
+                            to_update: forge_updates,
+                            to_delete: forge_deletes,
+                            in_sync: forge_unchanged,
+                        });
+                    }
+                }
+                Err(e) => {
+                    events.push(WorkspaceEvent::Error {
+                        message: format!("Sync to {} failed: {}", forge, e),
+                    });
+                    total_failed += repos_config.repos.len();
                 }
             }
         }
 
-        // Run Pulumi preview or up
+        // Clean up deleted repos from config after successful sync
+        if auto_yes && total_deletes > 0 && total_failed == 0 {
+            let _ = storage.remove_deleted_repos().await;
+        }
+
+        // Clone repos that don't exist locally (only on actual sync)
+        if auto_yes && total_failed == 0 {
+            if let Ok(updated_repos) = storage.load_repos().await {
+                let default_forges = org_config.forges.all_forges();
+                for (repo_name, repo_cfg) in &updated_repos.repos {
+                    if repo_cfg.delete { continue; }
+                    let repo_path = workspace_path.join(repo_name);
+                    if !repo_path.exists() {
+                        let forges = repo_cfg.forges.as_ref().unwrap_or(&default_forges);
+                        let _ = self.clone_repo(workspace_path, repo_name, &org_config, org_name, forges).await;
+                    }
+                }
+            }
+        }
+
+        // Emit completion event
         if auto_yes {
-            let mut pulumi_stream = Box::pin(bridge.up(org_name, &repos_file, &staged_file, true));
-            let mut org_synced = 0;
-            let mut org_failed = 0;
-            let mut up_success = false;
-
-            while let Some(event) = pulumi_stream.next().await {
-                match event {
-                    PulumiEvent::Output { line } => events.push(WorkspaceEvent::SyncOutput { line }),
-                    PulumiEvent::UpComplete { success, creates, updates, .. } => {
-                        up_success = success;
-                        if success { org_synced = creates + updates; } else { org_failed = repos_config.repos.len(); }
-                    }
-                    PulumiEvent::Error { message } => {
-                        events.push(WorkspaceEvent::Error { message: format!("{}: {}", org_name, message) });
-                        org_failed = repos_config.repos.len();
-                    }
-                    _ => {}
-                }
-            }
-
-            // Update synced state and clone new repos
-            if up_success {
-                if let Ok(outputs) = bridge.get_outputs(org_name).await {
-                    for (repo_name, repo_output) in outputs.repos {
-                        if let Some(url) = repo_output.github_url {
-                            let _ = storage.update_synced(&repo_name, Forge::GitHub, url, repo_output.github_id).await;
-                        }
-                        if let Some(url) = repo_output.codeberg_url {
-                            let _ = storage.update_synced(&repo_name, Forge::Codeberg, url, repo_output.codeberg_id).await;
-                        }
-                    }
-                }
-
-                // Clone repos that don't exist locally
-                if let Ok(updated_repos) = storage.load_repos().await {
-                    let default_forges = org_config.forges.all_forges();
-                    for (repo_name, repo_cfg) in &updated_repos.repos {
-                        if repo_cfg.delete { continue; }
-                        let repo_path = workspace_path.join(repo_name);
-                        if !repo_path.exists() {
-                            let forges = repo_cfg.forges.as_ref().unwrap_or(&default_forges);
-                            let _ = self.clone_repo(workspace_path, repo_name, &org_config, org_name, forges).await;
-                        }
-                    }
-                }
-            }
-
-            events.push(WorkspaceEvent::OrgSyncComplete { org_name: org_name.to_string(), synced: org_synced, unchanged: repos_config.repos.len().saturating_sub(org_synced), failed: org_failed });
+            events.push(WorkspaceEvent::OrgSyncComplete {
+                org_name: org_name.to_string(),
+                synced: total_creates + total_updates,
+                unchanged: total_unchanged,
+                failed: total_failed,
+            });
         } else {
-            let mut pulumi_stream = Box::pin(bridge.preview(org_name, &repos_file, &staged_file));
-            let (mut org_creates, mut org_updates, mut org_deletes, mut org_unchanged) = (0, 0, 0, 0);
-
-            while let Some(event) = pulumi_stream.next().await {
-                match event {
-                    PulumiEvent::Output { line } => events.push(WorkspaceEvent::PreviewOutput { line }),
-                    PulumiEvent::PreviewComplete { creates, updates, deletes, unchanged } => {
-                        org_creates = creates;
-                        org_updates = updates;
-                        org_deletes = deletes;
-                        org_unchanged = unchanged;
-                    }
-                    PulumiEvent::Error { message } => events.push(WorkspaceEvent::Error { message: format!("{}: {}", org_name, message) }),
-                    _ => {}
-                }
-            }
-
-            events.push(WorkspaceEvent::OrgPreviewComplete { org_name: org_name.to_string(), to_create: org_creates, to_update: org_updates, to_delete: org_deletes, unchanged: org_unchanged });
+            events.push(WorkspaceEvent::OrgPreviewComplete {
+                org_name: org_name.to_string(),
+                to_create: total_creates,
+                to_update: total_updates,
+                to_delete: total_deletes,
+                unchanged: total_unchanged,
+            });
         }
 
         events

@@ -136,27 +136,18 @@ impl ForgePort for CodebergAdapter {
     }
 
     async fn update_repo(&self, repo: &DesiredRepo) -> Result<ObservedRepo, ForgeError> {
-        // Gitea/Codeberg doesn't have a direct update endpoint that matches our needs.
-        // For now, we'll fetch the current state and return it.
-        // A full implementation would use PATCH /repos/{owner}/{repo}.
-        //
-        // TODO: Implement proper repo update via Gitea PATCH API
-        self.repo_exists(&repo.identity)
-            .await?
-            .then_some(())
-            .ok_or_else(|| ForgeError::RepoNotFound(repo.identity.clone()))?;
+        let config = RepoCreateConfig {
+            description: repo.description.clone(),
+            visibility: repo.visibility.clone(),
+            auto_init: false,
+        };
 
-        // Return a synthetic observed repo based on desired state
-        // In a full implementation, we'd actually update and return the result
-        let forge_state = ForgeRepoState::found(
-            Forge::Codeberg,
-            format!("https://codeberg.org/{}/{}", repo.org(), repo.name()),
-            repo.visibility.clone(),
-            None,
-            repo.description.clone(),
-        );
+        let result = self.client
+            .update_repo(repo.org(), repo.name(), &config, &self.token)
+            .await
+            .map_err(|e| self.map_error(e))?;
 
-        Ok(ObservedRepo::new(repo.identity.clone()).with_forge_state(forge_state))
+        Ok(self.forge_repo_to_observed(result, repo.org()))
     }
 
     async fn delete_repo(&self, identity: &RepoIdentity) -> Result<(), ForgeError> {

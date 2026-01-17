@@ -16,6 +16,11 @@ impl OrgStorage {
         Self { paths, org_name }
     }
 
+    /// Get the paths configuration
+    pub fn paths(&self) -> &HyperforgePaths {
+        &self.paths
+    }
+
     /// Load committed repos from repos.yaml
     pub async fn load_repos(&self) -> Result<ReposConfig> {
         let path = self.paths.repos_file(&self.org_name);
@@ -92,13 +97,20 @@ impl OrgStorage {
 
     /// Merge staged repos into committed repos (for sync operations)
     /// Returns the merged repos config
+    ///
+    /// Note: Repos marked for deletion are kept with `delete: true` so the sync
+    /// can delete them from forges. Call `remove_deleted_repos()` after successful sync.
     pub async fn merge_staged(&self) -> Result<ReposConfig> {
         let mut repos = self.load_repos().await?;
         let staged = self.load_staged().await?;
 
         for (name, config) in staged.repos {
             if config.delete {
-                repos.repos.remove(&name);
+                // Mark for deletion but keep in config so sync can delete from forges
+                if let Some(existing) = repos.repos.get_mut(&name) {
+                    existing.delete = true;
+                }
+                // If repo doesn't exist in config, nothing to delete
             } else {
                 repos.repos.insert(name, config);
             }
@@ -110,10 +122,18 @@ impl OrgStorage {
             tokio::fs::remove_file(&staged_path).await?;
         }
 
-        // Save merged repos
+        // Save merged repos (with delete markers still present)
         self.save_repos(&repos).await?;
 
         Ok(repos)
+    }
+
+    /// Remove repos that were successfully deleted from forges
+    /// Call this after sync successfully deletes the repos
+    pub async fn remove_deleted_repos(&self) -> Result<()> {
+        let mut repos = self.load_repos().await?;
+        repos.repos.retain(|_, config| !config.delete);
+        self.save_repos(&repos).await
     }
 
     /// Stage a repo for creation/update

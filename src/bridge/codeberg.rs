@@ -165,6 +165,15 @@ struct CreateRepoRequest {
     auto_init: bool,
 }
 
+/// Gitea update repository request
+#[derive(Debug, Serialize)]
+struct UpdateRepoRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private: Option<bool>,
+}
+
 #[async_trait]
 impl ForgeClient for CodebergClient {
     fn forge(&self) -> Forge {
@@ -288,6 +297,39 @@ impl ForgeClient for CodebergClient {
                 message: body,
             }),
         }
+    }
+
+    async fn update_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        config: &RepoCreateConfig,
+        token: &str,
+    ) -> ForgeResult<ForgeRepo> {
+        let url = format!("{}/repos/{}/{}", self.base_url, owner, name);
+        let headers = self.build_headers(token);
+
+        let request = UpdateRepoRequest {
+            description: config.description.clone(),
+            private: Some(matches!(config.visibility, Visibility::Private)),
+        };
+
+        let response = self
+            .client
+            .patch(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await?;
+
+        if response.status().as_u16() == 404 {
+            return Err(ForgeError::RepoNotFound {
+                name: format!("{}/{}", owner, name),
+            });
+        }
+
+        let repo: GiteaRepo = self.handle_response(response).await?;
+        Ok(repo.into())
     }
 }
 

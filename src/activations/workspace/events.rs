@@ -7,6 +7,47 @@ use std::path::PathBuf;
 use crate::types::{ResolutionSource, WorkspaceBinding};
 
 // ============================================================================
+// RepoSyncStatus - Status of a repo during sync/preview
+// ============================================================================
+
+/// Status of a repo during sync or preview operations
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoSyncStatus {
+    /// Repo will be created on target forge
+    ToCreate,
+    /// Repo will be updated on target forge
+    ToUpdate,
+    /// Repo will be deleted from target forge
+    ToDelete,
+    /// Repo is in sync, no action needed
+    InSync,
+    /// Repo sync failed
+    Failed,
+    /// Repo sync succeeded (for actual sync, not preview)
+    Synced,
+}
+
+/// Summary of a single repo's status within a forge
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatusEntry {
+    pub name: String,
+    pub status: RepoSyncStatus,
+    /// Human-readable details (e.g., "visibility: public → private")
+    pub details: Vec<String>,
+}
+
+/// Info about a repo in the workspace context
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceRepoInfo {
+    pub name: String,
+    /// Whether the repo is cloned locally in the workspace
+    pub cloned: bool,
+    /// Whether the repo is migrated to use hyperforge-ssh
+    pub migrated: bool,
+}
+
+// ============================================================================
 // WorkspaceEvent
 // ============================================================================
 
@@ -37,6 +78,13 @@ pub enum WorkspaceEvent {
 
     /// Repo staged during auto-create
     RepoStaged { repo_name: String },
+
+    /// List of repos in workspace
+    ReposListed {
+        org_name: String,
+        workspace_path: PathBuf,
+        repos: Vec<WorkspaceRepoInfo>,
+    },
 
     /// Error during workspace operation
     Error { message: String },
@@ -157,6 +205,29 @@ pub enum WorkspaceEvent {
         repo_name: String,
         forge: String,
         imported: bool,  // true if newly imported, false if already in state
+    },
+
+    /// Grouped status for all repos on a single forge (preview mode)
+    ForgePreview {
+        org_name: String,
+        forge: String,
+        repos: Vec<RepoStatusEntry>,
+        to_create: usize,
+        to_update: usize,
+        to_delete: usize,
+        in_sync: usize,
+    },
+
+    /// Grouped status for all repos on a single forge (sync mode)
+    ForgeSynced {
+        org_name: String,
+        forge: String,
+        repos: Vec<RepoStatusEntry>,
+        created: usize,
+        updated: usize,
+        deleted: usize,
+        unchanged: usize,
+        failed: usize,
     },
 
     /// Preview completed for a specific org - shows what would change

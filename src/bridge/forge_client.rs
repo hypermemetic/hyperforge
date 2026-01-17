@@ -164,6 +164,25 @@ pub trait ForgeClient: Send + Sync {
     /// * `Ok(())` - Repository deleted
     /// * `Err(ForgeError::RepoNotFound)` - Repository doesn't exist
     async fn delete_repo(&self, owner: &str, name: &str, token: &str) -> ForgeResult<()>;
+
+    /// Update a repository's settings
+    ///
+    /// # Arguments
+    /// * `owner` - The repository owner
+    /// * `name` - The repository name
+    /// * `config` - New repository configuration
+    /// * `token` - The API token to use
+    ///
+    /// # Returns
+    /// * `Ok(ForgeRepo)` - The updated repository
+    /// * `Err(ForgeError::RepoNotFound)` - Repository doesn't exist
+    async fn update_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        config: &RepoCreateConfig,
+        token: &str,
+    ) -> ForgeResult<ForgeRepo>;
 }
 
 /// Factory function to create a forge client for the given forge type
@@ -175,6 +194,11 @@ pub fn create_client(forge: Forge) -> Box<dyn ForgeClient> {
             // GitLab support is not yet implemented
             // For now, return a placeholder that will error on all operations
             unimplemented!("GitLab client not yet implemented")
+        }
+        Forge::Local => {
+            // Local forge uses LocalForge adapter directly, not ForgeClient
+            // Use hyperforge::adapters::LocalForge instead
+            unimplemented!("Local forge does not use ForgeClient - use LocalForge adapter")
         }
     }
 }

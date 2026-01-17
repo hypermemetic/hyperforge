@@ -2,12 +2,18 @@
 //!
 //! This module defines types that represent the actions needed to
 //! reconcile desired state with observed state.
+//!
+//! ## New Symmetric Diff API
+//!
+//! The [`compute_sync_actions`] function computes differences between
+//! repos from any two forges, enabling symmetric sync operations.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::types::{Forge, Visibility};
-use super::{RepoIdentity, DesiredRepo, ObservedRepo};
+use super::{RepoIdentity, DesiredRepo, ObservedRepo, Repo, SyncAction, PropertyDiff};
 
 /// What changed about a repository's properties.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -236,6 +242,98 @@ impl RepoDiff {
     pub fn org(&self) -> &str {
         &self.identity.org
     }
+}
+
+// =============================================================================
+// Symmetric Sync Functions
+// =============================================================================
+
+/// Compute sync actions needed to make target match source.
+///
+/// This is the core of symmetric sync - the same function works for:
+/// - `sync(github, local)` = import from GitHub
+/// - `sync(local, github)` = push to GitHub
+/// - `sync(github, codeberg)` = mirror GitHub to Codeberg
+///
+/// # Arguments
+/// * `source_repos` - Repos from source forge (the "truth")
+/// * `target_repos` - Repos from target forge (to be updated)
+/// * `delete_missing` - If true, delete repos in target not in source
+///
+/// # Returns
+/// List of actions to apply to target forge
+pub fn compute_sync_actions(
+    source_repos: &[Repo],
+    target_repos: &[Repo],
+    delete_missing: bool,
+) -> Vec<SyncAction> {
+    let mut actions = Vec::new();
+
+    // Index target repos by identity for fast lookup
+    let target_map: HashMap<&RepoIdentity, &Repo> = target_repos
+        .iter()
+        .map(|r| (&r.identity, r))
+        .collect();
+
+    // Index source repos by identity
+    let source_map: HashMap<&RepoIdentity, &Repo> = source_repos
+        .iter()
+        .map(|r| (&r.identity, r))
+        .collect();
+
+    // Check each source repo
+    for source in source_repos {
+        match target_map.get(&source.identity) {
+            Some(target) => {
+                // Exists in both - check for differences
+                let diffs = compute_property_diffs(source, target);
+                if diffs.is_empty() {
+                    actions.push(SyncAction::InSync(source.identity.clone()));
+                } else {
+                    actions.push(SyncAction::Update {
+                        repo: source.clone(),
+                        diffs,
+                    });
+                }
+            }
+            None => {
+                // Only in source - needs create in target
+                actions.push(SyncAction::Create(source.clone()));
+            }
+        }
+    }
+
+    // Check for repos only in target (potential deletes)
+    if delete_missing {
+        for target in target_repos {
+            if !source_map.contains_key(&target.identity) {
+                actions.push(SyncAction::Delete(target.identity.clone()));
+            }
+        }
+    }
+
+    actions
+}
+
+/// Compute property differences between two repos
+fn compute_property_diffs(source: &Repo, target: &Repo) -> Vec<PropertyDiff> {
+    let mut diffs = Vec::new();
+
+    if source.visibility != target.visibility {
+        diffs.push(PropertyDiff::Visibility {
+            source: source.visibility.clone(),
+            target: target.visibility.clone(),
+        });
+    }
+
+    if source.description != target.description {
+        diffs.push(PropertyDiff::Description {
+            source: source.description.clone(),
+            target: target.description.clone(),
+        });
+    }
+
+    diffs
 }
 
 #[cfg(test)]
@@ -686,5 +784,133 @@ mod tests {
         let restored: RepoDiff = serde_json::from_str(&json).unwrap();
 
         assert_eq!(diff, restored);
+    }
+
+    // ==========================================================================
+    // Symmetric Sync Tests (compute_sync_actions)
+    // ==========================================================================
+
+    fn make_repo(org: &str, name: &str) -> Repo {
+        Repo::new(RepoIdentity::new(org, name), Visibility::Public)
+    }
+
+    #[test]
+    fn test_sync_empty_source_and_target() {
+        let actions = compute_sync_actions(&[], &[], false);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_sync_create_when_only_in_source() {
+        let source = vec![make_repo("org", "repo1")];
+        let target = vec![];
+
+        let actions = compute_sync_actions(&source, &target, false);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].is_create());
+    }
+
+    #[test]
+    fn test_sync_in_sync_when_identical() {
+        let source = vec![make_repo("org", "repo1")];
+        let target = vec![make_repo("org", "repo1")];
+
+        let actions = compute_sync_actions(&source, &target, false);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].is_in_sync());
+    }
+
+    #[test]
+    fn test_sync_update_when_visibility_differs() {
+        let source = vec![Repo::new(RepoIdentity::new("org", "repo1"), Visibility::Private)];
+        let target = vec![Repo::new(RepoIdentity::new("org", "repo1"), Visibility::Public)];
+
+        let actions = compute_sync_actions(&source, &target, false);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].is_update());
+    }
+
+    #[test]
+    fn test_sync_update_when_description_differs() {
+        let source = vec![make_repo("org", "repo1").with_description("new")];
+        let target = vec![make_repo("org", "repo1").with_description("old")];
+
+        let actions = compute_sync_actions(&source, &target, false);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].is_update());
+        if let SyncAction::Update { diffs, .. } = &actions[0] {
+            assert_eq!(diffs.len(), 1);
+            assert!(matches!(diffs[0], PropertyDiff::Description { .. }));
+        }
+    }
+
+    #[test]
+    fn test_sync_delete_when_only_in_target_and_flag_set() {
+        let source = vec![];
+        let target = vec![make_repo("org", "orphan")];
+
+        let actions = compute_sync_actions(&source, &target, true);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].is_delete());
+    }
+
+    #[test]
+    fn test_sync_no_delete_when_flag_not_set() {
+        let source = vec![];
+        let target = vec![make_repo("org", "orphan")];
+
+        let actions = compute_sync_actions(&source, &target, false);
+
+        // No actions because we're not deleting missing repos
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_sync_mixed_actions() {
+        let source = vec![
+            make_repo("org", "existing"),  // Same in both
+            make_repo("org", "new"),       // Only in source
+            Repo::new(RepoIdentity::new("org", "changed"), Visibility::Private),  // Different vis
+        ];
+        let target = vec![
+            make_repo("org", "existing"),  // Same
+            make_repo("org", "orphan"),    // Only in target
+            Repo::new(RepoIdentity::new("org", "changed"), Visibility::Public),   // Different vis
+        ];
+
+        let actions = compute_sync_actions(&source, &target, true);
+
+        // Should have: 1 in_sync, 1 create, 1 update, 1 delete
+        assert_eq!(actions.len(), 4);
+
+        let in_sync_count = actions.iter().filter(|a| a.is_in_sync()).count();
+        let create_count = actions.iter().filter(|a| a.is_create()).count();
+        let update_count = actions.iter().filter(|a| a.is_update()).count();
+        let delete_count = actions.iter().filter(|a| a.is_delete()).count();
+
+        assert_eq!(in_sync_count, 1);
+        assert_eq!(create_count, 1);
+        assert_eq!(update_count, 1);
+        assert_eq!(delete_count, 1);
+    }
+
+    #[test]
+    fn test_sync_multiple_repos_create() {
+        let source = vec![
+            make_repo("org", "repo1"),
+            make_repo("org", "repo2"),
+            make_repo("org", "repo3"),
+        ];
+        let target = vec![];
+
+        let actions = compute_sync_actions(&source, &target, false);
+
+        assert_eq!(actions.len(), 3);
+        assert!(actions.iter().all(|a| a.is_create()));
     }
 }

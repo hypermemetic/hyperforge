@@ -142,6 +142,23 @@ impl GitHubClient {
             }
         }
     }
+
+    /// Determine if an owner is a User or Organization
+    async fn get_owner_type(&self, owner: &str, token: &str) -> ForgeResult<String> {
+        let url = format!("{}/users/{}", self.base_url, owner);
+        let headers = self.build_headers(token);
+
+        let response = self.client.get(&url).headers(headers).send().await?;
+
+        #[derive(Deserialize)]
+        struct OwnerInfo {
+            #[serde(rename = "type")]
+            owner_type: String,
+        }
+
+        let info: OwnerInfo = self.handle_response(response).await?;
+        Ok(info.owner_type)
+    }
 }
 
 impl Default for GitHubClient {
@@ -193,6 +210,15 @@ struct CreateRepoRequest {
     auto_init: bool,
 }
 
+/// GitHub update repository request
+#[derive(Debug, Serialize)]
+struct UpdateRepoRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private: Option<bool>,
+}
+
 #[async_trait]
 impl ForgeClient for GitHubClient {
     fn forge(&self) -> Forge {
@@ -229,14 +255,19 @@ impl ForgeClient for GitHubClient {
 
     async fn list_repos(&self, owner: &str, token: &str) -> ForgeResult<Vec<ForgeRepo>> {
         let headers = self.build_headers(token);
+
+        // First, determine if owner is a user or organization
+        let owner_type = self.get_owner_type(owner, token).await?;
+        let endpoint = match owner_type.as_str() {
+            "Organization" => format!("{}/orgs/{}/repos", self.base_url, owner),
+            _ => format!("{}/users/{}/repos", self.base_url, owner),
+        };
+
         let mut all_repos = Vec::new();
         let mut page = 1;
 
         loop {
-            let url = format!(
-                "{}/users/{}/repos?per_page=100&page={}",
-                self.base_url, owner, page
-            );
+            let url = format!("{}?per_page=100&page={}", endpoint, page);
 
             let response = self.client.get(&url).headers(headers.clone()).send().await?;
 
@@ -321,6 +352,39 @@ impl ForgeClient for GitHubClient {
                 message: body,
             }),
         }
+    }
+
+    async fn update_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        config: &RepoCreateConfig,
+        token: &str,
+    ) -> ForgeResult<ForgeRepo> {
+        let url = format!("{}/repos/{}/{}", self.base_url, owner, name);
+        let headers = self.build_headers(token);
+
+        let request = UpdateRepoRequest {
+            description: config.description.clone(),
+            private: Some(matches!(config.visibility, Visibility::Private)),
+        };
+
+        let response = self
+            .client
+            .patch(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await?;
+
+        if response.status().as_u16() == 404 {
+            return Err(ForgeError::RepoNotFound {
+                name: format!("{}/{}", owner, name),
+            });
+        }
+
+        let repo: GitHubRepo = self.handle_response(response).await?;
+        Ok(repo.into())
     }
 }
 

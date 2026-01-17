@@ -242,6 +242,23 @@ impl ForgeClient for ValidatedForgeClient {
         // Handle the result, marking expired on 401
         self.wrap_result(result).await
     }
+
+    async fn update_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        config: &RepoCreateConfig,
+        token: &str,
+    ) -> ForgeResult<ForgeRepo> {
+        // Check if token is already known to be expired
+        self.check_token_status().await?;
+
+        // Make the actual API call
+        let result = self.client.update_repo(owner, name, config, token).await;
+
+        // Handle the result, marking expired on 401
+        self.wrap_result(result).await
+    }
 }
 
 /// Factory function to create a validated forge client

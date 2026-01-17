@@ -3,7 +3,6 @@ pub mod forge_client;
 mod git_remote;
 pub mod github;
 mod keychain;
-pub mod pulumi;
 mod ssh_config;
 pub mod validated_client;
 
@@ -21,6 +20,5 @@ pub use forge_client::{
 pub use git_remote::GitRemoteBridge;
 pub use github::GitHubClient;
 pub use keychain::KeychainBridge;
-pub use pulumi::PulumiBridge;
 pub use ssh_config::SshConfigBridge;
 pub use validated_client::{create_validated_client, ValidatedForgeClient};

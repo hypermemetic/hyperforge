@@ -41,12 +41,14 @@
 
 pub mod codeberg;
 pub mod github;
+pub mod local_forge;
 pub mod memory_storage;
 pub mod org_storage;
 pub mod yaml_storage;
 
 pub use codeberg::CodebergAdapter;
 pub use github::GitHubAdapter;
+pub use local_forge::{LocalForge, PersistenceConfig, PersistenceError};
 pub use memory_storage::InMemoryStorageAdapter;
 pub use org_storage::OrgStorageAdapter;
 pub use yaml_storage::YamlStorageAdapter;

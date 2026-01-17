@@ -147,6 +147,7 @@ impl OrgActivation {
                         origin: origin_forge,
                         forges: ForgesConfig::from_forges(forge_list),
                         default_visibility: visibility,
+                        credential_source: None,  // Not a templated org
                     });
 
                     if let Err(e) = config.save(&paths).await {
@@ -226,6 +227,7 @@ impl OrgActivation {
                     Forge::GitHub => "github-token",
                     Forge::Codeberg => "codeberg-token",
                     Forge::GitLab => { token_errors.push("GitLab not yet supported".to_string()); continue; }
+                    Forge::Local => continue, // Local forge doesn't need import - it IS the target
                 };
                 match keychain.get(token_key).await {
                     Ok(Some(token)) => {
@@ -233,6 +235,7 @@ impl OrgActivation {
                             Forge::GitHub => Arc::new(GitHubAdapter::new(token)),
                             Forge::Codeberg => Arc::new(CodebergAdapter::new(token)),
                             Forge::GitLab => unreachable!(),
+                            Forge::Local => unreachable!("handled above"),
                         };
                         forge_adapters.push(adapter);
                     }

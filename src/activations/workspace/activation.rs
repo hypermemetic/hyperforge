@@ -6,7 +6,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use hub_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
+use hub_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream, ChildSummary};
 use hub_macro::hub_methods;
 use super::service::WorkspaceService;
 use crate::events::{OrgEvent, WorkspaceEvent};
@@ -19,7 +19,7 @@ impl WorkspaceActivation {
     pub fn new(paths: Arc<HyperforgePaths>) -> Self { Self { service: WorkspaceService::new(paths) } }
 }
 
-#[hub_methods(namespace = "workspace", version = "1.0.0", description = "Workspace binding management", crate_path = "hub_core")]
+#[hub_methods(namespace = "workspace", version = "1.0.0", description = "Workspace binding management", crate_path = "hub_core", hub)]
 impl WorkspaceActivation {
     #[hub_method(description = "List all workspace bindings")]
     pub async fn list(&self) -> impl Stream<Item = WorkspaceEvent> + Send + 'static {
@@ -75,16 +75,18 @@ impl WorkspaceActivation {
         let p = PathBuf::from(&path);
         let svc = WorkspaceService::new(self.service.paths().clone());
         stream! {
+            let cfg = match svc.load_config().await { Ok(c) => c, Err(e) => { yield WorkspaceEvent::Error { message: e }; return; } };
             let r = match svc.resolve_workspace(&p).await { Ok(Some(r)) if !r.bound_orgs.is_empty() => r, _ => { yield WorkspaceEvent::NotBound { path: p }; return; } };
-            yield WorkspaceEvent::DiffStarted { workspace_path: r.workspace_path.clone(), org_count: r.bound_orgs.len() };
-            let (mut ti, mut tc, mut tu, mut td) = (0, 0, 0, 0);
+            yield WorkspaceEvent::PreviewStarted { workspace_path: r.workspace_path.clone(), org_count: r.bound_orgs.len() };
+            let (mut tc, mut tup, mut td, mut tu) = (0, 0, 0, 0);
             for org in &r.bound_orgs {
-                match svc.compute_org_diff(org).await {
-                    Ok(s) => { yield WorkspaceEvent::OrgDiffResult { org_name: org.clone(), in_sync: s.in_sync, to_create: s.to_create, to_update: s.to_update, to_delete: s.to_delete }; ti += s.in_sync; tc += s.to_create; tu += s.to_update; td += s.to_delete; }
-                    Err(e) => yield WorkspaceEvent::OrgDiffError { org_name: org.clone(), message: e },
+                // Use process_org_sync with auto_yes=false for dry-run with detailed output
+                for ev in svc.process_org_sync(&cfg, org, &r.workspace_path, false).await {
+                    match &ev { WorkspaceEvent::OrgPreviewComplete { to_create, to_update, to_delete, unchanged, .. } => { tc += to_create; tup += to_update; td += to_delete; tu += unchanged; } _ => {} }
+                    yield ev;
                 }
             }
-            yield WorkspaceEvent::DiffComplete { total_orgs: r.bound_orgs.len(), total_in_sync: ti, total_to_create: tc, total_to_update: tu, total_to_delete: td };
+            yield WorkspaceEvent::PreviewComplete { workspace_path: r.workspace_path, total_to_create: tc, total_to_update: tup, total_to_delete: td, total_unchanged: tu };
         }
     }
 
@@ -159,11 +161,26 @@ impl WorkspaceActivation {
             else { yield WorkspaceEvent::PreviewComplete { workspace_path: r.workspace_path, total_to_create: tc, total_to_update: tup, total_to_delete: td, total_unchanged: tu }; }
         }
     }
+
+    pub fn plugin_children(&self) -> Vec<ChildSummary> {
+        vec![
+            ChildSummary {
+                namespace: "repos".into(),
+                description: "Repository management for workspace".into(),
+                hash: "repos".into(),
+            },
+        ]
+    }
 }
 
 #[async_trait]
 impl ChildRouter for WorkspaceActivation {
     fn router_namespace(&self) -> &str { "workspace" }
     async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> { Activation::call(self, method, params).await }
-    async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> { None }
+    async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
+        match name {
+            "repos" => Some(Box::new(super::WorkspaceReposRouter::new(self.service.paths().clone()))),
+            _ => None,
+        }
+    }
 }

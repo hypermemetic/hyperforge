@@ -15,16 +15,30 @@ pub struct Org {
 }
 
 impl Org {
-    /// Get the SSH host alias for a forge
-    /// Pattern: `<forge>-<org_name>` (e.g., `github-hypermemetic`)
-    pub fn ssh_host(&self, forge: &Forge) -> String {
-        format!("{}-{}", forge.to_string().to_lowercase(), self.name)
+    /// Get the SSH key for a specific forge
+    /// Returns forge-specific override if set, otherwise org-level ssh_key
+    pub fn ssh_key_for(&self, forge: &Forge) -> String {
+        self.forges.ssh_key_for(forge)
+            .unwrap_or_else(|| self.ssh_key.clone())
+    }
+
+    /// Get the owner for a specific forge
+    /// Returns forge-specific override if set, otherwise org-level owner
+    pub fn owner_for(&self, forge: &Forge) -> String {
+        self.forges.owner_for(forge)
+            .unwrap_or_else(|| self.owner.clone())
+    }
+
+    /// Get the SSH host for a forge (direct hostname, not aliased)
+    /// Pattern: `github.com`, `codeberg.org`
+    pub fn ssh_host(&self, forge: &Forge) -> &'static str {
+        forge.ssh_host()
     }
 
     /// Get the SSH URL for a repository on a forge
-    /// Pattern: `git@<ssh_host>:<owner>/<repo>.git`
+    /// Pattern: `git@<host>:<owner>/<repo>.git`
     pub fn ssh_url(&self, forge: &Forge, repo_name: &str) -> String {
-        format!("git@{}:{}/{}.git", self.ssh_host(forge), self.owner, repo_name)
+        format!("git@{}:{}/{}.git", forge.ssh_host(), &self.owner_for(forge), repo_name)
     }
 
     /// Get the SSH URL for origin forge

@@ -20,12 +20,16 @@
 //! ## Module Structure
 //!
 //! - `identity` - Repository identity (org + name)
-//! - `desired` - Desired state (what user wants)
-//! - `observed` - Observed state (what exists on forges)
+//! - `repo` - Unified repository type (replaces desired/observed split)
+//! - `sync_action` - Symmetric sync actions between forges
+//! - `desired` - Desired state (legacy, use `Repo` instead)
+//! - `observed` - Observed state (legacy, use `Repo` instead)
 //! - `diff` - Diff computation (what actions are needed)
 //! - `plan` - Sync plan (aggregated diffs with summary)
 
 pub mod identity;
+pub mod repo;
+pub mod sync_action;
 pub mod desired;
 pub mod observed;
 pub mod diff;
@@ -33,6 +37,13 @@ pub mod plan;
 
 // Re-export main types for convenience
 pub use identity::RepoIdentity;
+
+// New unified types
+pub use repo::Repo;
+pub use sync_action::{SyncAction, PropertyDiff};
+pub use diff::compute_sync_actions;
+
+// Legacy types (still used during migration)
 pub use desired::DesiredRepo;
 pub use observed::{ObservedRepo, ForgeRepoState};
 pub use diff::{RepoDiff, ForgeAction, PropertyChanges};

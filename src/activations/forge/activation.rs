@@ -92,11 +92,25 @@ impl ForgeActivation {
                 org_name: org_name.clone(),
             };
 
+            // Local forge doesn't need authentication
+            if matches!(forge_type, Forge::Local) {
+                yield ForgeEvent::AuthResult {
+                    forge: forge_type,
+                    org_name,
+                    status: TokenStatus::Valid,
+                    username: Some("local".to_string()),
+                    scopes: vec![],
+                    last_validated: None,
+                };
+                return;
+            }
+
             // Determine the keychain key for this forge
             let token_key = match forge_type {
                 Forge::GitHub => "github-token",
                 Forge::Codeberg => "codeberg-token",
                 Forge::GitLab => "gitlab-token",
+                Forge::Local => unreachable!("handled above"),
             };
 
             // Get token from keychain
@@ -257,6 +271,14 @@ impl ForgeActivation {
                         Forge::GitHub => "GITHUB_TOKEN",
                         Forge::Codeberg => "CODEBERG_TOKEN",
                         Forge::GitLab => "GITLAB_TOKEN",
+                        Forge::Local => {
+                            yield ForgeEvent::RefreshComplete {
+                                forge: forge_type,
+                                org_name,
+                                status: TokenStatus::Valid,
+                            };
+                            return;
+                        }
                     };
 
                     match std::env::var(env_var) {
@@ -285,6 +307,7 @@ impl ForgeActivation {
                         Forge::GitHub => "github-token",
                         Forge::Codeberg => "codeberg-token",
                         Forge::GitLab => "gitlab-token",
+                        Forge::Local => unreachable!("Local forge handled above"),
                     };
 
                     let keychain = KeychainBridge::new(&org_name);

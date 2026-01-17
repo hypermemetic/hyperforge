@@ -21,6 +21,8 @@ pub enum Forge {
     GitHub,
     Codeberg,
     GitLab,
+    /// Local in-memory forge (not a remote service)
+    Local,
 }
 
 /// Per-forge configuration options
@@ -29,6 +31,15 @@ pub struct ForgeConfig {
     /// Whether to sync repositories to this forge (default: true)
     #[serde(default = "default_sync")]
     pub sync: bool,
+
+    /// Override SSH key for this forge (uses org ssh_key if not set)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<String>,
+
+    /// Override owner/org name for this forge (uses org owner if not set)
+    /// Useful for sub-organizations that share credentials but have different names
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 fn default_sync() -> bool {
@@ -37,7 +48,11 @@ fn default_sync() -> bool {
 
 impl Default for ForgeConfig {
     fn default() -> Self {
-        Self { sync: true }
+        Self {
+            sync: true,
+            ssh_key: None,
+            owner: None,
+        }
     }
 }
 
@@ -111,6 +126,16 @@ impl ForgesConfig {
         }
     }
 
+    /// Get the SSH key for a specific forge (if overridden)
+    pub fn ssh_key_for(&self, forge: &Forge) -> Option<String> {
+        self.get(forge).and_then(|c| c.ssh_key)
+    }
+
+    /// Get the owner for a specific forge (if overridden)
+    pub fn owner_for(&self, forge: &Forge) -> Option<String> {
+        self.get(forge).and_then(|c| c.owner)
+    }
+
     /// Check if this config contains a forge
     pub fn contains(&self, forge: &Forge) -> bool {
         match self {
@@ -167,6 +192,7 @@ impl Forge {
             Forge::GitHub => "https://api.github.com",
             Forge::Codeberg => "https://codeberg.org/api/v1",
             Forge::GitLab => "https://gitlab.com/api/v4",
+            Forge::Local => "local://",
         }
     }
 
@@ -175,7 +201,13 @@ impl Forge {
             Forge::GitHub => "github.com",
             Forge::Codeberg => "codeberg.org",
             Forge::GitLab => "gitlab.com",
+            Forge::Local => "localhost",
         }
+    }
+
+    /// Returns true if this is a remote forge (not local)
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Forge::Local)
     }
 }
 
@@ -185,6 +217,7 @@ impl std::fmt::Display for Forge {
             Forge::GitHub => write!(f, "github"),
             Forge::Codeberg => write!(f, "codeberg"),
             Forge::GitLab => write!(f, "gitlab"),
+            Forge::Local => write!(f, "local"),
         }
     }
 }
@@ -197,6 +230,7 @@ impl std::str::FromStr for Forge {
             "github" => Ok(Forge::GitHub),
             "codeberg" => Ok(Forge::Codeberg),
             "gitlab" => Ok(Forge::GitLab),
+            "local" => Ok(Forge::Local),
             _ => Err(format!("Unknown forge: {}", s)),
         }
     }

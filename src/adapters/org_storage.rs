@@ -4,7 +4,7 @@
 //! hexagonal architecture's StoragePort interface.
 
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::domain::{DesiredRepo, ForgeRepoState, ObservedRepo, RepoIdentity};
 use crate::ports::{StorageError, StoragePort};
@@ -31,6 +31,66 @@ impl OrgStorageAdapter {
         // This is a limitation - for now we'll extract it from errors
         // In practice, callers should ensure they use the correct org
         "unknown"
+    }
+
+    /// Load synced state from separate synced.yaml file (fallback for legacy storage)
+    async fn load_synced_file(&self, org: &str) -> Result<Vec<ObservedRepo>, StorageError> {
+        let synced_path = self.storage.paths().org_dir(org).join("synced.yaml");
+
+        if !synced_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let contents = tokio::fs::read_to_string(&synced_path).await.map_err(|e| {
+            StorageError::read_error(e.to_string(), Some(synced_path.clone()))
+        })?;
+
+        // Parse the synced.yaml format
+        #[derive(serde::Deserialize)]
+        struct SyncedReposFile {
+            owner: String,
+            repos: std::collections::HashMap<String, SyncedRepoConfig>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct SyncedRepoConfig {
+            #[serde(default)]
+            forge_states: Vec<ForgeStateConfig>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ForgeStateConfig {
+            forge: crate::types::Forge,
+            exists: bool,
+            url: Option<String>,
+            forge_id: Option<String>,
+            visibility: Option<Visibility>,
+            description: Option<String>,
+        }
+
+        let file: SyncedReposFile = serde_yaml::from_str(&contents).map_err(|e| {
+            StorageError::parse_error(e.to_string(), Some(synced_path))
+        })?;
+
+        let repos = file.repos.into_iter()
+            .map(|(name, config)| {
+                let identity = RepoIdentity::new(&file.owner, &name);
+                let forge_states = config.forge_states.into_iter()
+                    .filter(|s| s.exists)
+                    .map(|s| ForgeRepoState {
+                        forge: s.forge,
+                        exists: s.exists,
+                        url: s.url,
+                        forge_id: s.forge_id,
+                        visibility: s.visibility,
+                        description: s.description,
+                    })
+                    .collect();
+                ObservedRepo { identity, forge_states }
+            })
+            .collect();
+
+        Ok(repos)
     }
 }
 
@@ -108,32 +168,44 @@ impl StoragePort for OrgStorageAdapter {
     }
 
     async fn load_synced(&self, org: &str) -> Result<Vec<ObservedRepo>, StorageError> {
+        let mut repos_by_name: HashMap<String, ObservedRepo> = HashMap::new();
+
+        // 1. Load from synced.yaml first (baseline)
+        if let Ok(legacy_repos) = self.load_synced_file(org).await {
+            for repo in legacy_repos {
+                repos_by_name.insert(repo.identity.name.clone(), repo);
+            }
+        }
+
+        // 2. Overlay _synced from repos.yaml (takes precedence per-forge)
         let repos_config = self.storage.load_repos().await.map_err(|e| {
             StorageError::read_error(e.to_string(), None)
         })?;
 
-        let mut repos = Vec::new();
+        for (name, config) in &repos_config.repos {
+            if let Some(synced) = &config.synced {
+                // Get or create the observed repo entry
+                let identity = RepoIdentity::new(org, name);
+                let observed = repos_by_name
+                    .entry(name.clone())
+                    .or_insert_with(|| ObservedRepo::new(identity));
 
-        for (name, config) in repos_config.repos {
-            if let Some(synced) = config.synced {
-                let identity = RepoIdentity::new(org, &name);
-                let mut observed = ObservedRepo::new(identity);
-
-                for (forge, state) in synced.forges {
-                    observed = observed.with_forge_state(ForgeRepoState::found(
-                        forge,
-                        state.url,
+                // Merge forge states (repos.yaml _synced takes precedence per-forge)
+                for (forge, state) in &synced.forges {
+                    // Remove any existing state for this forge, then add the new one
+                    observed.forge_states.retain(|s| &s.forge != forge);
+                    observed.forge_states.push(ForgeRepoState::found(
+                        forge.clone(),
+                        state.url.clone(),
                         config.visibility.clone().unwrap_or(Visibility::Public),
-                        state.id,
+                        state.id.clone(),
                         config.description.clone(),
                     ));
                 }
-
-                repos.push(observed);
             }
         }
 
-        Ok(repos)
+        Ok(repos_by_name.into_values().collect())
     }
 
     async fn save_synced(&self, _org: &str, _repos: &[ObservedRepo]) -> Result<(), StorageError> {
