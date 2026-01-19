@@ -111,16 +111,18 @@ impl GitRemoteBridge {
         Ok(true)
     }
 
-    /// Build the SSH URL for a forge using the org's SSH host alias
+    /// Build the SSH URL for a forge using plain hostnames
     ///
-    /// Format: `git@{forge}-{org_name}:{owner}/{repo_name}.git`
-    /// Example: `git@github-hypermemetic:hypermemetic/substrate.git`
+    /// Format: `git@{forge_host}:{owner}/{repo_name}.git`
+    /// Example: `git@github.com:hypermemetic/substrate.git`
     ///
-    /// This uses SSH config host aliases to support multiple SSH keys per forge.
+    /// Key routing is handled by per-repo `core.sshCommand` config pointing to
+    /// the hyperforge-ssh wrapper, which reads `hyperforge.org` and resolves
+    /// the correct SSH key dynamically.
     fn build_remote_url(&self, forge: &Forge, repo_name: &str) -> String {
         format!(
-            "git@{}-{}:{}/{}.git",
-            forge.to_string().to_lowercase(), self.org_name, self.owner, repo_name
+            "git@{}:{}/{}.git",
+            forge.ssh_host(), self.owner, repo_name
         )
     }
 
@@ -172,6 +174,103 @@ impl GitRemoteBridge {
 
         output.map(|o| o.status.success()).unwrap_or(false)
     }
+
+    /// Ensure the per-repo SSH config is set up correctly
+    ///
+    /// Sets:
+    /// - `hyperforge.org` = org_name (for key lookup)
+    /// - `core.sshCommand` = path to hyperforge-ssh wrapper
+    ///
+    /// Returns `Ok(true)` if any config was changed, `Ok(false)` if already correct.
+    pub async fn ensure_ssh_config(&self) -> Result<bool, String> {
+        let mut changed = false;
+
+        // Check current hyperforge.org
+        let current_org = self.get_git_config("hyperforge.org").await?;
+        if current_org.as_deref() != Some(&self.org_name) {
+            self.set_git_config("hyperforge.org", &self.org_name).await?;
+            changed = true;
+        }
+
+        // Build expected sshCommand path
+        let ssh_wrapper = std::env::var("HOME")
+            .map(|home| format!("{}/.hypermemetic-infra/scripts/hyperforge-ssh", home))
+            .map_err(|_| "HOME not set".to_string())?;
+
+        // Check current core.sshCommand
+        let current_ssh_cmd = self.get_git_config("core.sshCommand").await?;
+        if current_ssh_cmd.as_deref() != Some(&ssh_wrapper) {
+            self.set_git_config("core.sshCommand", &ssh_wrapper).await?;
+            changed = true;
+        }
+
+        Ok(changed)
+    }
+
+    /// Get the current SSH config status for this repo
+    ///
+    /// Returns (hyperforge_org, ssh_command) as Option<String> values
+    pub async fn get_ssh_config_status(&self) -> Result<(Option<String>, Option<String>), String> {
+        let org = self.get_git_config("hyperforge.org").await?;
+        let ssh_cmd = self.get_git_config("core.sshCommand").await?;
+        Ok((org, ssh_cmd))
+    }
+
+    /// Get a git config value
+    async fn get_git_config(&self, key: &str) -> Result<Option<String>, String> {
+        let output = Command::new("git")
+            .current_dir(&self.repo_path)
+            .args(["config", "--get", key])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git config: {}", e))?;
+
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(Some(value))
+        } else {
+            // Key not set
+            Ok(None)
+        }
+    }
+
+    /// Set a git config value
+    async fn set_git_config(&self, key: &str, value: &str) -> Result<(), String> {
+        let output = Command::new("git")
+            .current_dir(&self.repo_path)
+            .args(["config", key, value])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git config: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git config failed: {}", stderr));
+        }
+
+        Ok(())
+    }
+
+    /// Remove a git config value
+    pub async fn unset_git_config(&self, key: &str) -> Result<(), String> {
+        let output = Command::new("git")
+            .current_dir(&self.repo_path)
+            .args(["config", "--unset", key])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git config: {}", e))?;
+
+        // --unset returns non-zero if key doesn't exist, which is fine
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Only error if it's not a "key not found" situation
+            if !stderr.is_empty() && !stderr.contains("No such") {
+                return Err(format!("git config --unset failed: {}", stderr));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -187,12 +286,13 @@ mod tests {
             "user".to_string(),
         );
 
-        // Pattern: git@<forge>-<org>:<owner>/<repo>.git
+        // Pattern: git@<forge_host>:<owner>/<repo>.git (plain URLs)
+        // Key routing handled by core.sshCommand + hyperforge.org
         let url = bridge.build_remote_url(&Forge::GitHub, "substrate");
-        assert_eq!(url, "git@github-hypermemetic:user/substrate.git");
+        assert_eq!(url, "git@github.com:user/substrate.git");
 
         let url = bridge.build_remote_url(&Forge::Codeberg, "dotfiles");
-        assert_eq!(url, "git@codeberg-hypermemetic:user/dotfiles.git");
+        assert_eq!(url, "git@codeberg.org:user/dotfiles.git");
     }
 
     #[test]

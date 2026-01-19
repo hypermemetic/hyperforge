@@ -279,4 +279,66 @@ pub enum WorkspaceEvent {
         total_unchanged: usize,
         total_failed: usize,
     },
+
+    // ============================================================================
+    // SSH Config Enforcement Events
+    // ============================================================================
+
+    /// SSH config enforcement started for workspace
+    SshEnforceStarted {
+        workspace_path: PathBuf,
+        repo_count: usize,
+    },
+
+    /// SSH config updated for a single repo
+    SshConfigUpdated {
+        repo_name: String,
+        org_name: String,
+    },
+
+    /// SSH config already correct for a repo
+    SshConfigUnchanged { repo_name: String },
+
+    /// SSH config enforcement failed for a repo
+    SshConfigError {
+        repo_name: String,
+        message: String,
+    },
+
+    /// SSH config enforcement completed
+    SshEnforceComplete {
+        workspace_path: PathBuf,
+        updated: usize,
+        unchanged: usize,
+        failed: usize,
+    },
+
+    // ============================================================================
+    // Uninitialized Repos Discovery Events
+    // ============================================================================
+
+    /// Uninitialized repos discovered (git repos not in config)
+    UninitializedRepos {
+        workspace_path: PathBuf,
+        repos: Vec<String>,
+    },
+
+    // ============================================================================
+    // Forge Query Events
+    // ============================================================================
+
+    /// Repos found on a specific forge
+    ForgeRepos {
+        org_name: String,
+        forge: String,
+        repos: Vec<ForgeRepoInfo>,
+    },
+}
+
+/// Info about a repo on a forge
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ForgeRepoInfo {
+    pub name: String,
+    pub visibility: crate::types::Visibility,
+    pub description: Option<String>,
 }

@@ -261,6 +261,34 @@ impl ForgeClient for MockForgeClient {
 
         Ok(())
     }
+
+    async fn update_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        config: &RepoCreateConfig,
+        token: &str,
+    ) -> ForgeResult<ForgeRepo> {
+        self.log_call(MockCall::CreateRepo {
+            name: name.to_string(),
+            config: config.clone(),
+            token: token.to_string(),
+        });
+
+        self.check_error()?;
+
+        // Find and update the repo
+        let mut mock_config = self.config.lock().unwrap();
+        if let Some(repo) = mock_config.repos.iter_mut().find(|r| r.name == name) {
+            repo.description = config.description.clone();
+            repo.visibility = config.visibility.clone();
+            Ok(repo.clone())
+        } else {
+            Err(ForgeError::RepoNotFound {
+                name: name.to_string(),
+            })
+        }
+    }
 }
 
 /// Builder for creating test ForgeRepo instances

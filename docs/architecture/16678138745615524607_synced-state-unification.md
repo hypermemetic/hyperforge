@@ -279,20 +279,23 @@ Rationale:
 
 ## Implementation Status
 
-### Phase 1: Merge on Read - COMPLETED (2026-01-16)
+### Phase 1: Merge on Read - COMPLETED (2026-01-17)
 
 **Changes implemented:**
 
 | File | Change |
 |------|--------|
-| `src/adapters/org_storage.rs:170-206` | `load_synced()` now merges both `synced.yaml` (baseline) and `_synced` from `repos.yaml` (takes precedence) |
+| `src/adapters/org_storage.rs:170-208` | `load_synced()` now merges both `synced.yaml` (baseline) and `_synced` from `repos.yaml` (takes precedence **per-forge**) |
 | `src/adapters/org_storage.rs:36-94` | Added `load_synced_file()` helper to read legacy `synced.yaml` format |
 | `src/storage/org_storage.rs` | Added `paths()` getter to expose `HyperforgePaths` for adapter |
 
 **Key behavior:**
 1. Load all repos from `synced.yaml` into HashMap (keyed by repo name)
-2. Overlay any `_synced` data from `repos.yaml` (newer data takes precedence)
-3. Return merged collection
+2. For each repo with `_synced` in repos.yaml, **merge forge states** (not replace entire repo)
+3. `_synced` forge entries take precedence over `synced.yaml` for the same forge
+4. Forge states from `synced.yaml` that aren't in `_synced` are preserved
+
+**Bug fix (2026-01-17):** Initial implementation replaced entire repo entries instead of merging at forge level. Fixed to use `entry().or_insert_with()` and retain/push pattern for per-forge merging.
 
 ### Testing Results
 
@@ -336,17 +339,35 @@ The `update_repo()` implementation was also fixed during this session:
 - `src/bridge/codeberg.rs`: Added PATCH API implementation
 - Verified: `hypermemetic-infra` visibility changed to private on GitHub
 
-### Workspace Sync Status
+#### GitHub Private Repos Fix (2026-01-17)
 
-| Workspace | Synced with Remote | Notes |
-|-----------|-------------------|-------|
-| hypermemetic | Partial | 6 repos need description updates on Codeberg |
-| hypermemetic-infra | N/A | This is a repo, not a separate workspace |
+**Problem:** GitHub's `/users/{owner}/repos` endpoint only returns PUBLIC repos. Private repos like `hypermemetic-infra` weren't listed, causing sync to attempt CREATE instead of UPDATE.
 
-**Current pending sync actions:**
-- `hypermemetic-infra`: Update visibility on both forges (config says private, synced says public)
-- `synapse`, `hub-macro`, `substrate`, `substrate-protocol`: Update description on Codeberg
-- `claude-container`: Delete from GitHub (removed from forges list)
+**Solution:** Modified `src/bridge/github.rs:list_repos()` to:
+1. Check if owner is the authenticated user
+2. Use `/user/repos` endpoint for authenticated user (includes private repos)
+3. Filter results by owner (since `/user/repos` returns all accessible repos)
+
+**Result:** Sync now correctly identifies private repos as existing, enabling UPDATE operations.
+
+### Workspace Sync Status - COMPLETED (2026-01-17)
+
+| Workspace | Status | Repos | Notes |
+|-----------|--------|-------|-------|
+| hypermemetic | **FULLY SYNCED** | 8 | All repos mirrored to GitHub + Codeberg |
+| juggernautlabs | **FULLY SYNCED** | 18 | All repos synced to GitHub |
+
+**Final sync results (hypermemetic):**
+```
+total_failed: 0
+total_synced: 5
+total_unchanged: 11
+```
+
+**Repos synced:**
+- GitHub: 7 unchanged, 1 updated (claude-container description)
+- Codeberg: 4 updated (hub-macro, substrate, substrate-protocol, synapse descriptions), 4 unchanged
+- `hypermemetic-infra`: in_sync on both forges (private repo now correctly detected)
 
 ### Phase 2: Migration Command - PENDING
 
@@ -356,10 +377,21 @@ Not yet implemented. With Phase 1 complete, the system works correctly but legac
 
 Blocked by Phase 2 completion.
 
+## Related Fixes
+
+### GitHub Private Repos API Issue
+
+| File | Change |
+|------|--------|
+| `src/bridge/github.rs:256-317` | `list_repos()` now uses `/user/repos` for authenticated user to include private repos |
+
+This fix was necessary because the sync service calls `list_repos()` on the target forge to determine which repos need CREATE vs UPDATE actions.
+
 ## References
 
-- `src/adapters/org_storage.rs:170-206` - Updated `load_synced()` implementation
+- `src/adapters/org_storage.rs:170-208` - Updated `load_synced()` implementation with per-forge merge
 - `src/adapters/org_storage.rs:36-94` - New `load_synced_file()` helper
+- `src/bridge/github.rs:256-317` - GitHub `list_repos()` with private repo support
 - `src/storage/org_storage.rs:157-176` - Current `update_synced()` implementation
 - `src/activations/workspace/service.rs:604-617` - Sync state update calls
-- `~/.config/hyperforge/orgs/hypermemetic/synced.yaml` - Example legacy file (13 repos)
+- `~/.config/hyperforge/orgs/hypermemetic/synced.yaml` - Legacy synced state file

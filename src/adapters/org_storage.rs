@@ -232,6 +232,7 @@ impl Default for crate::types::ReposConfig {
     fn default() -> Self {
         Self {
             owner: String::new(),
+            default_forges: None,
             repos: std::collections::HashMap::new(),
         }
     }

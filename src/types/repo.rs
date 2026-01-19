@@ -37,7 +37,21 @@ pub struct RepoDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReposConfig {
     pub owner: String,
+    /// Default forges for repos that don't specify their own.
+    /// If set, repos without explicit `forges` field inherit these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_forges: Option<Vec<Forge>>,
     pub repos: HashMap<String, RepoConfig>,
+}
+
+impl ReposConfig {
+    /// Get the effective forges for a repo, applying inheritance.
+    /// Returns the repo's explicit forges if set, otherwise default_forges.
+    pub fn effective_forges(&self, repo_config: &RepoConfig) -> Vec<Forge> {
+        repo_config.forges.clone()
+            .or_else(|| self.default_forges.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

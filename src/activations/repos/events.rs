@@ -246,6 +246,20 @@ pub enum RepoEvent {
         reason: String,
     },
 
+    /// Bulk operation completed (add-forge, set-default-forges, etc.)
+    BulkUpdated {
+        org_name: String,
+        operation: String,
+        repos_updated: Vec<String>,
+        repos_skipped: Vec<String>,
+    },
+
+    /// Default forges set for organization
+    DefaultForgesSet {
+        org_name: String,
+        forges: Vec<Forge>,
+    },
+
     /// Error during repo operation
     Error {
         org_name: String,

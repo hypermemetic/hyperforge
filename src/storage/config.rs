@@ -202,6 +202,15 @@ impl GlobalConfig {
             .max_by_key(|(ws_dir, _)| ws_dir.components().count())
             .map(|(_, org)| org.clone())
     }
+
+    /// Get all workspace paths bound to a specific org
+    pub fn workspaces_for_org(&self, org_name: &str) -> Vec<PathBuf> {
+        self.workspaces
+            .iter()
+            .filter(|(_, org)| *org == org_name)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
 }
 
 /// Expand tilde (~) to home directory in a directory path

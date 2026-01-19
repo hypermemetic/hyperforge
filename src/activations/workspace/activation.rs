@@ -140,11 +140,12 @@ impl WorkspaceActivation {
         }
     }
 
-    #[hub_method(description = "Sync repos for workspace orgs", params(path = "Path", yes = "Skip confirmation"))]
-    pub async fn sync(&self, path: String, yes: Option<bool>) -> impl Stream<Item = WorkspaceEvent> + Send + 'static {
+    #[hub_method(description = "Sync repos for workspace orgs", params(path = "Path", yes = "Apply changes", enforce_ssh = "Also enforce SSH config"))]
+    pub async fn sync(&self, path: String, yes: Option<bool>, enforce_ssh: Option<bool>) -> impl Stream<Item = WorkspaceEvent> + Send + 'static {
         let p = PathBuf::from(&path);
         let svc = WorkspaceService::new(self.service.paths().clone());
         let ay = yes.unwrap_or(false);
+        let do_enforce_ssh = enforce_ssh.unwrap_or(false);
         stream! {
             let cfg = match svc.load_config().await { Ok(c) => c, Err(e) => { yield WorkspaceEvent::Error { message: e }; return; } };
             let r = match svc.resolve_workspace(&p).await { Ok(Some(r)) if !r.bound_orgs.is_empty() => r, _ => { yield WorkspaceEvent::NotBound { path: p }; return; } };
@@ -156,9 +157,136 @@ impl WorkspaceActivation {
                     match &ev { WorkspaceEvent::OrgSyncComplete { synced, unchanged, failed, .. } => { ts += synced; tu += unchanged; tf += failed; } WorkspaceEvent::OrgPreviewComplete { to_create, to_update, to_delete, unchanged, .. } => { tc += to_create; tup += to_update; td += to_delete; tu += unchanged; } _ => {} }
                     yield ev;
                 }
+                // Optionally enforce SSH config after sync
+                if do_enforce_ssh && ay {
+                    for ev in svc.enforce_ssh_config(org, &r.workspace_path).await {
+                        yield ev;
+                    }
+                }
             }
             if ay { yield WorkspaceEvent::SyncComplete { workspace_path: r.workspace_path, total_synced: ts, total_unchanged: tu, total_failed: tf }; }
             else { yield WorkspaceEvent::PreviewComplete { workspace_path: r.workspace_path, total_to_create: tc, total_to_update: tup, total_to_delete: td, total_unchanged: tu }; }
+        }
+    }
+
+    #[hub_method(description = "Stage uninitialized local repos (dry-run by default)", params(path = "Workspace path", yes = "Apply changes (default: dry-run)"))]
+    pub async fn init(&self, path: String, yes: Option<bool>) -> impl Stream<Item = WorkspaceEvent> + Send + 'static {
+        let p = PathBuf::from(&path);
+        let svc = WorkspaceService::new(self.service.paths().clone());
+        let auto_yes = yes.unwrap_or(false);
+        stream! {
+            let cfg = match svc.load_config().await {
+                Ok(c) => c,
+                Err(e) => { yield WorkspaceEvent::Error { message: e }; return; }
+            };
+            let r = match svc.resolve_workspace(&p).await {
+                Ok(Some(r)) if !r.bound_orgs.is_empty() => r,
+                _ => { yield WorkspaceEvent::NotBound { path: p }; return; }
+            };
+
+            let org_name = &r.bound_orgs[0];
+            let org_config = match cfg.get_org(org_name) {
+                Some(c) => c.clone(),
+                None => { yield WorkspaceEvent::Error { message: format!("Org not found: {}", org_name) }; return; }
+            };
+
+            // Discover uninitialized repos
+            let uninitialized = match svc.discover_uninitialized_repos(org_name, &r.workspace_path).await {
+                Ok(repos) => repos,
+                Err(e) => { yield WorkspaceEvent::Error { message: e }; return; }
+            };
+
+            if uninitialized.is_empty() {
+                yield WorkspaceEvent::UninitializedRepos { workspace_path: r.workspace_path, repos: vec![] };
+                return;
+            }
+
+            if !auto_yes {
+                // Dry-run: show what would be created
+                yield WorkspaceEvent::UninitializedRepos { workspace_path: r.workspace_path, repos: uninitialized };
+                return;
+            }
+
+            // Actually stage the repos
+            let storage = svc.org_storage(org_name);
+            let default_forges = org_config.forges.all_forges();
+
+            for repo_name in &uninitialized {
+                let repo_config = crate::types::RepoConfig {
+                    description: None,
+                    visibility: None,
+                    forges: Some(default_forges.clone()),
+                    protected: false,
+                    delete: false,
+                    synced: None,
+                    discovered: None,
+                };
+
+                match storage.stage_repo(repo_name.clone(), repo_config).await {
+                    Ok(()) => yield WorkspaceEvent::RepoStaged { repo_name: repo_name.clone() },
+                    Err(e) => yield WorkspaceEvent::Error { message: format!("{}: {}", repo_name, e) },
+                }
+            }
+
+            yield WorkspaceEvent::UninitializedRepos { workspace_path: r.workspace_path, repos: uninitialized };
+        }
+    }
+
+    #[hub_method(description = "List repos on all forges for this workspace", params(path = "Workspace path"))]
+    pub async fn list_forge_repos(&self, path: String) -> impl Stream<Item = WorkspaceEvent> + Send + 'static {
+        let p = PathBuf::from(&path);
+        let svc = WorkspaceService::new(self.service.paths().clone());
+        stream! {
+            let cfg = match svc.load_config().await {
+                Ok(c) => c,
+                Err(e) => { yield WorkspaceEvent::Error { message: e }; return; }
+            };
+            let r = match svc.resolve_workspace(&p).await {
+                Ok(Some(r)) if !r.bound_orgs.is_empty() => r,
+                _ => { yield WorkspaceEvent::NotBound { path: p }; return; }
+            };
+
+            // Use first bound org
+            let org_name = &r.bound_orgs[0];
+            let org_config = match cfg.get_org(org_name) {
+                Some(c) => c.clone(),
+                None => { yield WorkspaceEvent::Error { message: format!("Org not found: {}", org_name) }; return; }
+            };
+
+            // Build forge adapters
+            let forges = org_config.forges.all_forges();
+            let credential_org = org_config.credential_org(org_name);
+            let (adapters, errors) = svc.build_forge_adapters(credential_org, &forges).await;
+
+            for err in errors {
+                yield WorkspaceEvent::Error { message: err };
+            }
+
+            // Query each forge
+            for (forge, adapter) in adapters {
+                match adapter.list_repos(org_name).await {
+                    Ok(repos) => {
+                        let repo_infos: Vec<super::events::ForgeRepoInfo> = repos.iter().map(|r| {
+                            super::events::ForgeRepoInfo {
+                                name: r.identity.name.clone(),
+                                visibility: r.forge_states.first()
+                                    .and_then(|s| s.visibility.clone())
+                                    .unwrap_or(crate::types::Visibility::Public),
+                                description: r.forge_states.first()
+                                    .and_then(|s| s.description.clone()),
+                            }
+                        }).collect();
+                        yield WorkspaceEvent::ForgeRepos {
+                            org_name: org_name.clone(),
+                            forge: forge.to_string(),
+                            repos: repo_infos,
+                        };
+                    }
+                    Err(e) => {
+                        yield WorkspaceEvent::Error { message: format!("{}: {}", forge, e) };
+                    }
+                }
+            }
         }
     }
 

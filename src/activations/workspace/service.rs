@@ -144,6 +144,61 @@ impl WorkspaceService {
         Ok(repos)
     }
 
+    /// Discover git repositories that are NOT worktrees
+    ///
+    /// A worktree has a `.git` file (containing a path), while a real repo has a `.git` directory.
+    /// This returns only real repos (with `.git` as a directory).
+    pub async fn discover_real_git_repos(&self, base_path: &PathBuf) -> Result<Vec<String>, String> {
+        let mut repos = Vec::new();
+        let mut entries = tokio::fs::read_dir(base_path)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+            let path = entry.path();
+            let git_path = path.join(".git");
+
+            // Must be a directory AND .git must be a directory (not a file/worktree)
+            if path.is_dir() && git_path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    repos.push(name.to_string());
+                }
+            }
+        }
+
+        repos.sort();
+        Ok(repos)
+    }
+
+    /// Discover uninitialized repos - git repos in workspace that aren't in config
+    ///
+    /// Returns repos that:
+    /// 1. Have a `.git` directory (not worktrees)
+    /// 2. Are NOT in the org's repos.yaml config
+    pub async fn discover_uninitialized_repos(
+        &self,
+        org_name: &str,
+        workspace_path: &PathBuf,
+    ) -> Result<Vec<String>, String> {
+        // Get all real git repos in workspace
+        let local_repos = self.discover_real_git_repos(workspace_path).await?;
+
+        // Get repos from config
+        let storage = self.org_storage(org_name);
+        let config_repos: std::collections::HashSet<String> = match storage.load_repos().await {
+            Ok(cfg) => cfg.repos.keys().cloned().collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+
+        // Filter to repos not in config
+        let uninitialized: Vec<String> = local_repos
+            .into_iter()
+            .filter(|name| !config_repos.contains(name))
+            .collect();
+
+        Ok(uninitialized)
+    }
+
     /// Stage a repository for an organization
     pub async fn stage_repo(
         &self,
@@ -458,6 +513,98 @@ impl WorkspaceService {
     /// Get paths reference for cloning service
     pub fn paths(&self) -> &Arc<HyperforgePaths> {
         &self.paths
+    }
+
+    /// Enforce SSH config for all repos in a workspace
+    ///
+    /// For each local git repo that matches a repo in the org config,
+    /// ensures `hyperforge.org` and `core.sshCommand` are set correctly.
+    pub async fn enforce_ssh_config(
+        &self,
+        org_name: &str,
+        workspace_path: &PathBuf,
+    ) -> Vec<WorkspaceEvent> {
+        let mut events = Vec::new();
+
+        // Load repos config
+        let storage = self.org_storage(org_name);
+        let repos_config = match storage.load_repos().await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                events.push(WorkspaceEvent::Error {
+                    message: format!("Failed to load repos config: {}", e),
+                });
+                return events;
+            }
+        };
+
+        // Discover local git repos
+        let local_repos = match self.discover_git_repos(workspace_path).await {
+            Ok(repos) => repos,
+            Err(e) => {
+                events.push(WorkspaceEvent::Error {
+                    message: format!("Failed to discover repos: {}", e),
+                });
+                return events;
+            }
+        };
+
+        // Filter to repos that are in our config
+        let config_repos: std::collections::HashSet<_> = repos_config.repos.keys().collect();
+        let repos_to_process: Vec<_> = local_repos
+            .iter()
+            .filter(|name| config_repos.contains(name))
+            .collect();
+
+        events.push(WorkspaceEvent::SshEnforceStarted {
+            workspace_path: workspace_path.clone(),
+            repo_count: repos_to_process.len(),
+        });
+
+        let mut updated = 0;
+        let mut unchanged = 0;
+        let mut failed = 0;
+
+        for repo_name in repos_to_process {
+            let repo_path = workspace_path.join(repo_name);
+            let git_bridge = GitRemoteBridge::new(
+                repo_path,
+                org_name.to_string(),
+                repos_config.owner.clone(),
+            );
+
+            match git_bridge.ensure_ssh_config().await {
+                Ok(true) => {
+                    updated += 1;
+                    events.push(WorkspaceEvent::SshConfigUpdated {
+                        repo_name: repo_name.clone(),
+                        org_name: org_name.to_string(),
+                    });
+                }
+                Ok(false) => {
+                    unchanged += 1;
+                    events.push(WorkspaceEvent::SshConfigUnchanged {
+                        repo_name: repo_name.clone(),
+                    });
+                }
+                Err(e) => {
+                    failed += 1;
+                    events.push(WorkspaceEvent::SshConfigError {
+                        repo_name: repo_name.clone(),
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        events.push(WorkspaceEvent::SshEnforceComplete {
+            workspace_path: workspace_path.clone(),
+            updated,
+            unchanged,
+            failed,
+        });
+
+        events
     }
 
     /// Process sync/preview for a single org - returns collected events

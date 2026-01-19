@@ -258,9 +258,23 @@ impl ForgeClient for GitHubClient {
 
         // First, determine if owner is a user or organization
         let owner_type = self.get_owner_type(owner, token).await?;
-        let endpoint = match owner_type.as_str() {
-            "Organization" => format!("{}/orgs/{}/repos", self.base_url, owner),
-            _ => format!("{}/users/{}/repos", self.base_url, owner),
+
+        // For user accounts, check if it's the authenticated user
+        // /users/{owner}/repos only returns public repos
+        // /user/repos returns all repos (including private) for the authenticated user
+        let (endpoint, filter_by_owner) = match owner_type.as_str() {
+            "Organization" => (format!("{}/orgs/{}/repos", self.base_url, owner), false),
+            _ => {
+                // Check if this is the authenticated user
+                let auth = self.authenticate(token).await?;
+                if auth.username.to_lowercase() == owner.to_lowercase() {
+                    // Use /user/repos for authenticated user (includes private repos)
+                    (format!("{}/user/repos", self.base_url), true)
+                } else {
+                    // Different user - use public endpoint
+                    (format!("{}/users/{}/repos", self.base_url, owner), false)
+                }
+            }
         };
 
         let mut all_repos = Vec::new();
@@ -277,7 +291,20 @@ impl ForgeClient for GitHubClient {
                 break;
             }
 
-            all_repos.extend(repos.into_iter().map(ForgeRepo::from));
+            // Filter repos by owner if using /user/repos (which returns all accessible repos)
+            let filtered: Vec<ForgeRepo> = repos
+                .into_iter()
+                .filter(|r| {
+                    if filter_by_owner {
+                        r.full_name.starts_with(&format!("{}/", owner))
+                    } else {
+                        true
+                    }
+                })
+                .map(ForgeRepo::from)
+                .collect();
+
+            all_repos.extend(filtered);
             page += 1;
 
             // Safety limit to prevent infinite loops

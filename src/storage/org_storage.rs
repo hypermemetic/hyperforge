@@ -28,6 +28,7 @@ impl OrgStorage {
         if !path.exists() {
             return Ok(ReposConfig {
                 owner: self.org_name.clone(),
+                default_forges: None,
                 repos: HashMap::new(),
             });
         }
@@ -45,6 +46,7 @@ impl OrgStorage {
         if !path.exists() {
             return Ok(ReposConfig {
                 owner: self.org_name.clone(),
+                default_forges: None,
                 repos: HashMap::new(),
             });
         }
@@ -63,6 +65,7 @@ impl OrgStorage {
                 let legacy: LegacyStagedRepos = serde_yaml::from_str(&contents)?;
                 Ok(ReposConfig {
                     owner: self.org_name.clone(),
+                    default_forges: None,
                     repos: legacy.repos,
                 })
             }

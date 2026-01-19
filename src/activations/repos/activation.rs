@@ -19,10 +19,11 @@ use hub_core::plexus::{
 };
 use hub_macro::hub_methods;
 
-use crate::storage::{HyperforgePaths, OrgStorage, OrgConfig};
+use crate::storage::{HyperforgePaths, OrgStorage, OrgConfig, GlobalConfig};
 use crate::types::{RepoSummary, RepoConfig, Visibility, Forge};
 use crate::domain::{RepoDiff, ForgeAction, SyncPlan};
 use crate::services::{DiffService, DiffOptions};
+use crate::activations::workspace::{WorkspaceService, WorkspaceEvent};
 
 use super::RepoChildRouter;
 use super::events::{RepoEvent, DiffStatus};
@@ -507,6 +508,186 @@ impl ReposActivation {
                         message: e.to_string(),
                     };
                 }
+            }
+        }
+    }
+
+    /// Add a forge to all repos that don't have it
+    #[hub_method(
+        description = "Add a forge to all repos that don't already have it",
+        params(forge = "Forge to add (github or codeberg)")
+    )]
+    pub async fn add_forge(
+        &self,
+        forge: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let storage = self.storage();
+        let org_name = self.org_name.clone();
+
+        stream! {
+            // Parse forge
+            let target_forge: Forge = match forge.parse() {
+                Ok(f) => f,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: None,
+                        message: e,
+                    };
+                    return;
+                }
+            };
+
+            // Load repos
+            let mut repos_config = match storage.load_repos().await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: None,
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            let mut updated = Vec::new();
+            let mut skipped = Vec::new();
+
+            for (name, config) in repos_config.repos.iter_mut() {
+                let current_forges = config.forges.get_or_insert_with(Vec::new);
+
+                if current_forges.contains(&target_forge) {
+                    skipped.push(name.clone());
+                } else {
+                    current_forges.push(target_forge.clone());
+                    updated.push(name.clone());
+                }
+            }
+
+            // Save if any updates
+            if !updated.is_empty() {
+                if let Err(e) = storage.save_repos(&repos_config).await {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: None,
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            }
+
+            yield RepoEvent::BulkUpdated {
+                org_name,
+                operation: format!("add-forge {}", target_forge),
+                repos_updated: updated,
+                repos_skipped: skipped,
+            };
+        }
+    }
+
+    /// Set default forges for the organization (inheritance)
+    #[hub_method(
+        description = "Set default forges for repos without explicit forges",
+        params(forges = "Comma-separated forge list (e.g., github,codeberg)")
+    )]
+    pub async fn set_default_forges(
+        &self,
+        forges: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let storage = self.storage();
+        let org_name = self.org_name.clone();
+
+        stream! {
+            // Parse forges
+            let forge_list: Vec<Forge> = match forges
+                .split(',')
+                .map(|s| s.trim().parse())
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(list) => list,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: None,
+                        message: e,
+                    };
+                    return;
+                }
+            };
+
+            // Load repos
+            let mut repos_config = match storage.load_repos().await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        org_name,
+                        repo_name: None,
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            // Set default forges
+            repos_config.default_forges = Some(forge_list.clone());
+
+            // Save
+            if let Err(e) = storage.save_repos(&repos_config).await {
+                yield RepoEvent::Error {
+                    org_name,
+                    repo_name: None,
+                    message: e.to_string(),
+                };
+                return;
+            }
+
+            yield RepoEvent::DefaultForgesSet {
+                org_name,
+                forges: forge_list,
+            };
+        }
+    }
+
+    /// Enforce SSH config on all local repos in workspace
+    #[hub_method(
+        description = "Enforce hyperforge SSH config on all local repos",
+        params()
+    )]
+    pub async fn enforce_ssh(&self) -> impl Stream<Item = WorkspaceEvent> + Send + 'static {
+        let paths = self.paths.clone();
+        let org_name = self.org_name.clone();
+
+        stream! {
+            // Load global config to find workspace path
+            let config = match GlobalConfig::load(&paths).await {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspaceEvent::Error {
+                        message: format!("Failed to load config: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Find workspace paths for this org
+            let workspace_paths = config.workspaces_for_org(&org_name);
+
+            if workspace_paths.is_empty() {
+                yield WorkspaceEvent::Error {
+                    message: format!("No workspace bound to org '{}'. Use 'workspace bind' first.", org_name),
+                };
+                return;
+            }
+
+            // Use the first workspace path
+            let workspace_path = workspace_paths[0].clone();
+
+            // Create workspace service and enforce SSH config
+            let svc = WorkspaceService::new(paths);
+
+            for event in svc.enforce_ssh_config(&org_name, &workspace_path).await {
+                yield event;
             }
         }
     }
