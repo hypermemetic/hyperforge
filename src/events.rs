@@ -15,7 +15,7 @@ use crate::types::{PackageSummary, PackageType, PublishResult};
 // Re-export all domain-specific events from activation modules
 pub use crate::activations::forge::events::{ForgeEvent, ForgeRepoSummary};
 pub use crate::activations::org::events::OrgEvent;
-pub use crate::activations::repos::events::{ConvergeResult, DiffStatus, RepoEvent};
+pub use crate::activations::repos::events::{ConvergeResult, DiffStatus};
 pub use crate::activations::secrets::events::SecretEvent;
 pub use crate::activations::workspace::events::WorkspaceEvent;
 
