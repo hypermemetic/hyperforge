@@ -10,6 +10,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::types::{PackageSummary, PackageType, PublishResult};
+
 // Re-export all domain-specific events from activation modules
 pub use crate::activations::forge::events::{ForgeEvent, ForgeRepoSummary};
 pub use crate::activations::org::events::OrgEvent;
@@ -77,4 +79,56 @@ pub enum PulumiEvent {
 
     /// Error
     Error { message: String },
+}
+
+// ============================================================================
+// PackageEvent - Package registry events
+// ============================================================================
+
+/// Events emitted during package operations (list, publish, status).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PackageEvent {
+    /// List of packages in a repo
+    PackageList {
+        org_name: String,
+        repo_name: String,
+        packages: Vec<PackageSummary>,
+    },
+
+    /// Status of packages (local vs published versions)
+    PackageStatus {
+        org_name: String,
+        repo_name: String,
+        packages: Vec<PackageSummary>,
+    },
+
+    /// Publish operation started
+    PublishStarted {
+        org_name: String,
+        repo_name: String,
+        package_name: String,
+        package_type: PackageType,
+        dry_run: bool,
+    },
+
+    /// Publish operation completed
+    PublishComplete {
+        org_name: String,
+        repo_name: String,
+        result: PublishResult,
+    },
+
+    /// No packages configured for this repo
+    NoPackages {
+        org_name: String,
+        repo_name: String,
+    },
+
+    /// Error during package operation
+    Error {
+        org_name: String,
+        repo_name: String,
+        message: String,
+    },
 }

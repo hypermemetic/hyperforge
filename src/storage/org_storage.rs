@@ -117,6 +117,8 @@ impl OrgStorage {
             delete: true,
             synced: None,
             discovered: None,
+            packages: vec![],
+            build: None,
         });
         self.save_staged(&staged).await
     }

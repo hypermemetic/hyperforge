@@ -45,6 +45,9 @@ pub enum SecretEvent {
         source: String,
     },
 
+    /// Secret deleted
+    Deleted { org_name: String, key: String },
+
     /// Error during secret operation
     Error {
         org_name: String,

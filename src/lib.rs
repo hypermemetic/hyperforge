@@ -4,6 +4,7 @@ pub mod error;
 pub mod events;
 pub mod hub;
 pub mod storage;
+pub mod templates;
 pub mod types;
 
 // Re-export serde_helpers from hub_core (required by hub-macro generated code)

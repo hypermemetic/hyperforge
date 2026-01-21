@@ -111,17 +111,82 @@ impl GitRemoteBridge {
         Ok(true)
     }
 
-    /// Build the SSH URL for a forge using the org's SSH host alias
+    /// Build the SSH URL for a forge using plain URLs
     ///
-    /// Format: `git@{forge}-{org_name}:{owner}/{repo_name}.git`
-    /// Example: `git@github-hypermemetic:hypermemetic/substrate.git`
+    /// Format: `git@{host}:{owner}/{repo_name}.git`
+    /// Example: `git@github.com:hypermemetic/substrate.git`
     ///
-    /// This uses SSH config host aliases to support multiple SSH keys per forge.
+    /// We use plain URLs and rely on per-repo git config (core.sshCommand) for SSH key routing.
     fn build_remote_url(&self, forge: &Forge, repo_name: &str) -> String {
         format!(
-            "git@{}-{}:{}/{}.git",
-            forge.to_string().to_lowercase(), self.org_name, self.owner, repo_name
+            "git@{}:{}/{}.git",
+            forge.ssh_host(), self.owner, repo_name
         )
+    }
+
+    /// Ensure the repo has hyperforge.org and core.sshCommand configured
+    ///
+    /// This sets up per-repo git config so that hyperforge-ssh can route to the correct SSH key.
+    /// Returns Ok(true) if config was updated, Ok(false) if already configured.
+    pub async fn ensure_ssh_config(&self) -> Result<bool, String> {
+        // Check current hyperforge.org value
+        let current_org = Command::new("git")
+            .current_dir(&self.repo_path)
+            .args(["config", "--local", "hyperforge.org"])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to read git config: {}", e))?;
+
+        let current_org_value = String::from_utf8_lossy(&current_org.stdout).trim().to_string();
+
+        // Check current core.sshCommand value
+        let current_ssh = Command::new("git")
+            .current_dir(&self.repo_path)
+            .args(["config", "--local", "core.sshCommand"])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to read git config: {}", e))?;
+
+        let current_ssh_value = String::from_utf8_lossy(&current_ssh.stdout).trim().to_string();
+
+        let needs_org = current_org_value != self.org_name;
+        let needs_ssh = current_ssh_value != "hyperforge-ssh";
+
+        if !needs_org && !needs_ssh {
+            return Ok(false);
+        }
+
+        // Set hyperforge.org if needed
+        if needs_org {
+            let output = Command::new("git")
+                .current_dir(&self.repo_path)
+                .args(["config", "--local", "hyperforge.org", &self.org_name])
+                .output()
+                .await
+                .map_err(|e| format!("Failed to set hyperforge.org: {}", e))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("git config hyperforge.org failed: {}", stderr));
+            }
+        }
+
+        // Set core.sshCommand if needed
+        if needs_ssh {
+            let output = Command::new("git")
+                .current_dir(&self.repo_path)
+                .args(["config", "--local", "core.sshCommand", "hyperforge-ssh"])
+                .output()
+                .await
+                .map_err(|e| format!("Failed to set core.sshCommand: {}", e))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("git config core.sshCommand failed: {}", stderr));
+            }
+        }
+
+        Ok(true)
     }
 
     /// Get the remote name for a forge
@@ -187,12 +252,12 @@ mod tests {
             "user".to_string(),
         );
 
-        // Pattern: git@<forge>-<org>:<owner>/<repo>.git
+        // Pattern: git@<host>:<owner>/<repo>.git (plain URLs)
         let url = bridge.build_remote_url(&Forge::GitHub, "substrate");
-        assert_eq!(url, "git@github-hypermemetic:user/substrate.git");
+        assert_eq!(url, "git@github.com:user/substrate.git");
 
         let url = bridge.build_remote_url(&Forge::Codeberg, "dotfiles");
-        assert_eq!(url, "git@codeberg-hypermemetic:user/dotfiles.git");
+        assert_eq!(url, "git@codeberg.org:user/dotfiles.git");
     }
 
     #[test]
