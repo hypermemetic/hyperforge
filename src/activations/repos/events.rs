@@ -1,13 +1,16 @@
 //! Event types for repository activations.
+//!
+//! Each repository operation has its own event type to provide type-safe,
+//! operation-specific event streams.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::types::Forge;
+use crate::types::{Forge, PackageConfig, RepoSummary, RepoDetails};
 
 // ============================================================================
-// ConvergeResult - Result of a convergence operation
+// Shared Types
 // ============================================================================
 
 /// Result of a convergence operation
@@ -24,10 +27,6 @@ pub struct ConvergeResult {
     /// Whether drift was detected after apply
     pub drift_detected: bool,
 }
-
-// ============================================================================
-// DiffStatus - Shared type for diff operations
-// ============================================================================
 
 /// Status of a repository in a diff operation
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -46,32 +45,153 @@ pub enum DiffStatus {
 }
 
 // ============================================================================
-// RepoEvent
+// List Events
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum RepoEvent {
+pub enum RepoListEvent {
     /// List of repositories
     Listed {
         org_name: String,
-        repos: Vec<crate::types::RepoSummary>,
+        repos: Vec<RepoSummary>,
         staged: bool,
     },
 
     /// Details of a single repository
     Details {
         org_name: String,
-        repo: crate::types::RepoDetails,
+        repo: RepoDetails,
     },
 
+    /// Error during list operation
+    Error {
+        org_name: String,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Create Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoCreateEvent {
     /// Repository staged for creation
     Staged {
         org_name: String,
         repo_name: String,
     },
 
-    /// Repository created/synced on forge
+    /// Local git repository initialized
+    LocalInitialized {
+        org_name: String,
+        repo_name: String,
+        path: PathBuf,
+    },
+
+    /// .gitignore file created
+    GitignoreCreated {
+        org_name: String,
+        repo_name: String,
+        path: PathBuf,
+    },
+
+    /// Git remote added to local repository
+    RemoteAdded {
+        org_name: String,
+        repo_name: String,
+        remote: String,
+        url: String,
+    },
+
+    /// Local repository setup complete
+    LocalSetupComplete {
+        org_name: String,
+        repo_name: String,
+        path: PathBuf,
+    },
+
+    /// Error during create operation
+    Error {
+        org_name: String,
+        repo_name: Option<String>,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Adopt Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoAdoptEvent {
+    /// Adopt operation started
+    Started {
+        org_name: String,
+        repo_name: String,
+        path: PathBuf,
+    },
+
+    /// Git repository initialized during adopt
+    GitInitialized {
+        org_name: String,
+        repo_name: String,
+        path: PathBuf,
+    },
+
+    /// Git remotes detected during adopt
+    RemotesDetected {
+        org_name: String,
+        repo_name: String,
+        forges: Vec<Forge>,
+    },
+
+    /// Packages detected during adopt
+    PackagesDetected {
+        org_name: String,
+        repo_name: String,
+        packages: Vec<PackageConfig>,
+    },
+
+    /// Adopt operation completed
+    Complete {
+        org_name: String,
+        repo_name: String,
+        path: PathBuf,
+    },
+
+    /// Error during adopt operation
+    Error {
+        org_name: String,
+        repo_name: Option<String>,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Sync Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoSyncEvent {
+    /// Sync operation started
+    Started {
+        org_name: String,
+        repo_count: usize,
+    },
+
+    /// Sync progress update
+    Progress {
+        org_name: String,
+        repo_name: String,
+        stage: String,
+    },
+
+    /// Repository synced to forge
     Synced {
         org_name: String,
         repo_name: String,
@@ -79,23 +199,44 @@ pub enum RepoEvent {
         url: String,
     },
 
-    /// Sync operation started
-    SyncStarted { org_name: String, repo_count: usize },
+    /// Forge skipped due to sync flag being false
+    ForgeSkipped {
+        org_name: String,
+        forge: Forge,
+        reason: String,
+    },
 
-    /// Sync progress update
-    SyncProgress {
+    /// Outputs captured from Pulumi after apply
+    OutputsCaptured {
         org_name: String,
         repo_name: String,
-        stage: String,
+        forge: Forge,
+        url: String,
+        id: Option<String>,
     },
 
     /// Sync operation completed
-    SyncComplete {
+    Complete {
         org_name: String,
         success: bool,
         synced_count: usize,
     },
 
+    /// Error during sync operation
+    Error {
+        org_name: String,
+        repo_name: Option<String>,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Remove Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoRemoveEvent {
     /// Repository marked for deletion
     MarkedForDeletion {
         org_name: String,
@@ -115,51 +256,56 @@ pub enum RepoEvent {
         repo_name: String,
     },
 
-    /// Git remote added to local repository
-    RemoteAdded {
+    /// Error during remove operation
+    Error {
         org_name: String,
-        repo_name: String,
-        remote: String,
-        url: String,
+        repo_name: Option<String>,
+        message: String,
     },
+}
 
-    /// Git remotes validated for a repository
-    RemotesValidated {
-        org_name: String,
-        repo_name: String,
-        remotes: Vec<String>,
-    },
+// ============================================================================
+// Refresh Events
+// ============================================================================
 
-    /// Outputs captured from Pulumi after apply
-    OutputsCaptured {
-        org_name: String,
-        repo_name: String,
-        forge: Forge,
-        url: String,
-        id: Option<String>,
-    },
-
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoRefreshEvent {
     /// Refresh started - querying forges for remote state
-    RefreshStarted {
+    Started {
         org_name: String,
         forges: Vec<Forge>,
     },
 
     /// Forge query progress during refresh
-    RefreshProgress {
+    Progress {
         org_name: String,
         forge: Forge,
         repos_found: usize,
     },
 
     /// Refresh completed with discovery statistics
-    RefreshComplete {
+    Complete {
         org_name: String,
         discovered: usize,
         matched: usize,
         untracked: usize,
     },
 
+    /// Error during refresh operation
+    Error {
+        org_name: String,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Diff Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoDiffEvent {
     /// Diff result for a single repository
     RepoDiff {
         org_name: String,
@@ -169,7 +315,7 @@ pub enum RepoEvent {
     },
 
     /// Overall diff summary for an organization
-    DiffSummary {
+    Summary {
         org_name: String,
         to_create: usize,
         to_update: usize,
@@ -178,36 +324,64 @@ pub enum RepoEvent {
         untracked: usize,
     },
 
+    /// Error during diff operation
+    Error {
+        org_name: String,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Converge Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoConvergeEvent {
     /// Converge operation started
-    ConvergeStarted {
+    Started {
         org_name: String,
         phases: Vec<String>,
     },
 
     /// Converge phase status update
-    ConvergePhase {
+    Phase {
         org_name: String,
         phase: String,
         status: String,
     },
 
     /// Converge operation completed
-    ConvergeComplete {
+    Complete {
         org_name: String,
         success: bool,
         changes_applied: usize,
         final_state: ConvergeResult,
     },
 
+    /// Error during converge operation
+    Error {
+        org_name: String,
+        message: String,
+    },
+}
+
+// ============================================================================
+// Clone Events
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RepoCloneEvent {
     /// Clone operation started
-    CloneStarted {
+    Started {
         org_name: String,
         repo_name: String,
         target_path: PathBuf,
     },
 
     /// Clone progress - cloning from forge
-    CloneProgress {
+    Progress {
         org_name: String,
         repo_name: String,
         forge: Forge,
@@ -215,18 +389,17 @@ pub enum RepoEvent {
     },
 
     /// Remote added during clone
-    CloneRemoteAdded {
+    RemoteAdded {
         org_name: String,
         repo_name: String,
         remote_name: String,
         url: String,
     },
 
-    /// Clone completed successfully
-    CloneComplete {
+    /// Git remotes validated for a repository
+    RemotesValidated {
         org_name: String,
         repo_name: String,
-        target_path: PathBuf,
         remotes: Vec<String>,
     },
 
@@ -239,14 +412,15 @@ pub enum RepoEvent {
         details: Vec<String>,
     },
 
-    /// Forge skipped due to sync flag being false
-    ForgeSkipped {
+    /// Clone completed successfully
+    Complete {
         org_name: String,
-        forge: Forge,
-        reason: String,
+        repo_name: String,
+        target_path: PathBuf,
+        remotes: Vec<String>,
     },
 
-    /// Error during repo operation
+    /// Error during clone operation
     Error {
         org_name: String,
         repo_name: Option<String>,

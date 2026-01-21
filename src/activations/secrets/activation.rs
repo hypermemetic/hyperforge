@@ -1,7 +1,7 @@
 //! SecretsActivation - manages API tokens and credentials for organizations
 //!
 //! This activation provides methods for listing, getting, setting, and acquiring
-//! secrets from various providers (keychain, environment variables, etc.).
+//! secrets from various providers (keychain, environment variables, file, pass).
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use hub_core::plexus::{ChildRouter, PlexusError, PlexusStream};
 
-use crate::bridge::KeychainBridge;
+use crate::bridge::create_secret_store;
 use crate::events::SecretEvent;
 use crate::storage::{GlobalConfig, HyperforgePaths, OrgConfig};
 use crate::types::SecretKey;
@@ -20,7 +20,7 @@ use crate::types::SecretKey;
 pub struct SecretsActivation {
     paths: Arc<HyperforgePaths>,
     org_name: String,
-    /// Organization configuration passed from parent - avoids reloading from disk
+    #[allow(dead_code)]
     org_config: OrgConfig,
 }
 
@@ -50,6 +50,8 @@ impl SecretsActivation {
                 .map(|c| c.secret_provider)
                 .unwrap_or_default();
 
+            let store = create_secret_store(&provider, &org_name);
+
             // Known secret keys
             let known_keys = vec![
                 crate::types::secret::keys::GITHUB_TOKEN,
@@ -61,8 +63,7 @@ impl SecretsActivation {
             let mut keys = Vec::new();
 
             for key in known_keys {
-                let service = KeychainBridge::new(&org_name);
-                let is_set = service.exists(key).await.unwrap_or(false);
+                let is_set = store.exists(key).await.unwrap_or(false);
 
                 keys.push(SecretKey {
                     key: key.to_string(),
@@ -82,11 +83,16 @@ impl SecretsActivation {
     )]
     pub async fn get(&self, key: String) -> impl Stream<Item = SecretEvent> + Send + 'static {
         let org_name = self.org_name.clone();
+        let paths = self.paths.clone();
 
         stream! {
-            let service = KeychainBridge::new(&org_name);
+            let provider = GlobalConfig::load(&paths)
+                .await
+                .map(|c| c.secret_provider)
+                .unwrap_or_default();
+            let store = create_secret_store(&provider, &org_name);
 
-            match service.get(&key).await {
+            match store.get(&key).await {
                 Ok(Some(value)) => {
                     yield SecretEvent::Retrieved {
                         org_name,
@@ -126,6 +132,7 @@ impl SecretsActivation {
         value: Option<String>,
     ) -> impl Stream<Item = SecretEvent> + Send + 'static {
         let org_name = self.org_name.clone();
+        let paths = self.paths.clone();
 
         stream! {
             // If no value provided, request interactive input
@@ -139,9 +146,13 @@ impl SecretsActivation {
             }
 
             let secret_value = value.unwrap();
-            let service = KeychainBridge::new(&org_name);
+            let provider = GlobalConfig::load(&paths)
+                .await
+                .map(|c| c.secret_provider)
+                .unwrap_or_default();
+            let store = create_secret_store(&provider, &org_name);
 
-            match service.set(&key, &secret_value).await {
+            match store.set(&key, &secret_value).await {
                 Ok(()) => {
                     yield SecretEvent::Updated { org_name, key };
                 }
@@ -163,12 +174,19 @@ impl SecretsActivation {
     )]
     pub async fn acquire(&self, forge: String) -> impl Stream<Item = SecretEvent> + Send + 'static {
         let org_name = self.org_name.clone();
+        let paths = self.paths.clone();
 
         stream! {
             yield SecretEvent::AcquireStarted {
                 org_name: org_name.clone(),
                 forge: forge.clone(),
             };
+
+            let provider = GlobalConfig::load(&paths)
+                .await
+                .map(|c| c.secret_provider)
+                .unwrap_or_default();
+            let store = create_secret_store(&provider, &org_name);
 
             match forge.as_str() {
                 "github" => {
@@ -183,8 +201,7 @@ impl SecretsActivation {
                                 .trim()
                                 .to_string();
 
-                            let service = KeychainBridge::new(&org_name);
-                            if let Err(e) = service.set("github-token", &token).await {
+                            if let Err(e) = store.set("github-token", &token).await {
                                 yield SecretEvent::Error {
                                     org_name,
                                     key: Some("github-token".into()),
@@ -213,6 +230,37 @@ impl SecretsActivation {
                         org_name,
                         key: None,
                         message: format!("Acquire not supported for forge: {}", forge),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Delete a secret
+    #[hub_macro::hub_method(
+        description = "Delete a secret",
+        params(key = "Secret key name")
+    )]
+    pub async fn delete(&self, key: String) -> impl Stream<Item = SecretEvent> + Send + 'static {
+        let org_name = self.org_name.clone();
+        let paths = self.paths.clone();
+
+        stream! {
+            let provider = GlobalConfig::load(&paths)
+                .await
+                .map(|c| c.secret_provider)
+                .unwrap_or_default();
+            let store = create_secret_store(&provider, &org_name);
+
+            match store.delete(&key).await {
+                Ok(()) => {
+                    yield SecretEvent::Deleted { org_name, key };
+                }
+                Err(e) => {
+                    yield SecretEvent::Error {
+                        org_name,
+                        key: Some(key),
+                        message: e,
                     };
                 }
             }

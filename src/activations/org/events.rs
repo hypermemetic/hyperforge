@@ -31,12 +31,6 @@ pub enum OrgEvent {
         value: String,
     },
 
-    /// SSH config updated with Host entries for the org's forges
-    SshConfigUpdated {
-        org_name: String,
-        hosts: Vec<String>,
-    },
-
     /// Informational message about organization
     Info { name: String, message: String },
 

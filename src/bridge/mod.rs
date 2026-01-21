@@ -3,9 +3,13 @@ pub mod forge_client;
 mod git_remote;
 pub mod github;
 mod keychain;
+pub mod package_registry;
 pub mod pulumi;
-mod ssh_config;
+pub mod secret_store;
 pub mod validated_client;
+
+// NOTE: ssh_config.rs removed - we now use per-repo git config (core.sshCommand)
+// instead of global ~/.ssh/config host aliases. See GitRemoteBridge::ensure_ssh_config().
 
 #[cfg(test)]
 pub mod mock_forge_client;
@@ -21,6 +25,7 @@ pub use forge_client::{
 pub use git_remote::GitRemoteBridge;
 pub use github::GitHubClient;
 pub use keychain::KeychainBridge;
+pub use package_registry::{PackageRegistry, create_registry, CratesRegistry, NpmRegistry, HexRegistry, HackageRegistry, PyPiRegistry};
 pub use pulumi::PulumiBridge;
-pub use ssh_config::SshConfigBridge;
+pub use secret_store::{SecretStore, create_secret_store, KeychainStore, EnvStore, FileStore, PassStore};
 pub use validated_client::{create_validated_client, ValidatedForgeClient};

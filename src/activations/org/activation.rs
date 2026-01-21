@@ -10,7 +10,7 @@ use hub_core::plexus::{
 };
 use hub_macro::hub_methods;
 
-use crate::bridge::{KeychainBridge, SshConfigBridge};
+use crate::bridge::KeychainBridge;
 use crate::storage::{GlobalConfig, HyperforgePaths, OrgConfig, OrgStorage};
 use crate::events::OrgEvent;
 use crate::types::{Org, OrgSummary, Forge, ForgesConfig, Visibility, ReposConfig, RepoConfig, SyncedState, ForgeSyncedState};
@@ -166,9 +166,6 @@ impl OrgActivation {
 
             match GlobalConfig::load(&paths).await {
                 Ok(mut config) => {
-                    let ssh_key_clone = ssh_key.clone();
-                    let forge_list_clone = forge_list.clone();
-
                     config.organizations.insert(org_name.clone(), OrgConfig {
                         owner,
                         ssh_key,
@@ -182,23 +179,7 @@ impl OrgActivation {
                         return;
                     }
 
-                    yield OrgEvent::Created { org_name: org_name.clone() };
-
-                    // Update SSH config with Host entries for each forge
-                    let ssh_bridge = SshConfigBridge::new();
-                    match ssh_bridge.update_org(&org_name, &ssh_key_clone, &forge_list_clone).await {
-                        Ok(hosts) => {
-                            yield OrgEvent::SshConfigUpdated {
-                                org_name,
-                                hosts,
-                            };
-                        }
-                        Err(e) => {
-                            yield OrgEvent::Error {
-                                message: format!("Failed to update SSH config: {}", e),
-                            };
-                        }
-                    }
+                    yield OrgEvent::Created { org_name };
                 }
                 Err(e) => {
                     yield OrgEvent::Error { message: e.to_string() };
@@ -401,6 +382,8 @@ impl OrgActivation {
                     delete: false,
                     synced: Some(synced),
                     discovered: None,
+                    packages: vec![],
+                    build: None,
                 });
             }
 

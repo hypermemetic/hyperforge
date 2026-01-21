@@ -14,8 +14,14 @@ use hub_macro::hub_methods;
 
 use crate::bridge::{GitRemoteBridge, KeychainBridge};
 use crate::storage::{HyperforgePaths, OrgStorage, GlobalConfig, OrgConfig};
-use crate::events::{ConvergeResult, DiffStatus, PulumiEvent, RepoEvent};
+use crate::events::{ConvergeResult, DiffStatus, PulumiEvent};
 use crate::types::{RepoSummary, RepoConfig, Visibility, Forge};
+
+use super::events::{
+    RepoListEvent, RepoCreateEvent, RepoAdoptEvent, RepoSyncEvent,
+    RepoRemoveEvent, RepoRefreshEvent, RepoDiffEvent, RepoConvergeEvent,
+    RepoCloneEvent,
+};
 
 use super::RepoChildRouter;
 
@@ -123,7 +129,7 @@ impl ReposActivation {
         description = "List repositories",
         params(staged = "Show staged repos instead of committed")
     )]
-    pub async fn list(&self, staged: Option<bool>) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    pub async fn list(&self, staged: Option<bool>) -> impl Stream<Item = RepoListEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let show_staged = staged.unwrap_or(false);
@@ -148,14 +154,14 @@ impl ReposActivation {
                         })
                         .collect();
 
-                    yield RepoEvent::Listed {
+                    yield RepoListEvent::Listed {
                         org_name,
                         repos,
                         staged: show_staged,
                     };
                 }
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoListEvent::Error {
                         org_name,
                         repo_name: None,
                         message: e.to_string(),
@@ -172,7 +178,9 @@ impl ReposActivation {
             repo_name = "Repository name",
             description = "Repository description",
             visibility = "public or private",
-            forges = "Comma-separated forge list"
+            forges = "Comma-separated forge list",
+            init_local = "Initialize local git repo with .gitignore",
+            path = "Local path for init_local (defaults to workspace path)"
         )
     )]
     pub async fn create(
@@ -181,10 +189,15 @@ impl ReposActivation {
         description: Option<String>,
         visibility: Option<String>,
         forges: Option<String>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        init_local: Option<bool>,
+        path: Option<String>,
+    ) -> impl Stream<Item = RepoCreateEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
+        let paths = self.paths.clone();
+        let should_init = init_local.unwrap_or(false);
+        let custom_path = path;
 
         stream! {
             // Parse visibility
@@ -193,7 +206,7 @@ impl ReposActivation {
                 Some("public") => Some(Visibility::Public),
                 None => None,
                 Some(v) => {
-                    yield RepoEvent::Error {
+                    yield RepoCreateEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(repo_name.clone()),
                         message: format!("Invalid visibility: {}", v),
@@ -213,7 +226,7 @@ impl ReposActivation {
                     match parsed {
                         Ok(list) => Some(list),
                         Err(e) => {
-                            yield RepoEvent::Error {
+                            yield RepoCreateEvent::Error {
                                 org_name: org_name.clone(),
                                 repo_name: Some(repo_name.clone()),
                                 message: e,
@@ -229,27 +242,516 @@ impl ReposActivation {
             };
 
             let config = RepoConfig {
-                description,
+                description: description.clone(),
+                visibility: vis,
+                forges: forge_list.clone(),
+                protected: false,
+                delete: false,
+                synced: None,
+                discovered: None,
+                packages: vec![],
+                build: None,
+            };
+
+            match storage.stage_repo(repo_name.clone(), config).await {
+                Ok(()) => {
+                    yield RepoCreateEvent::Staged {
+                        org_name: org_name.clone(),
+                        repo_name: repo_name.clone(),
+                    };
+                }
+                Err(e) => {
+                    yield RepoCreateEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            }
+
+            // Initialize local repo if requested
+            if should_init {
+                // Determine the local path
+                let local_path = if let Some(p) = custom_path {
+                    PathBuf::from(p).join(&repo_name)
+                } else {
+                    // Find workspace path for this org
+                    let global_config = match GlobalConfig::load(&paths).await {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            yield RepoCreateEvent::Error {
+                                org_name: org_name.clone(),
+                                repo_name: Some(repo_name.clone()),
+                                message: format!("Failed to load config: {}", e),
+                            };
+                            return;
+                        }
+                    };
+
+                    // Find first workspace bound to this org
+                    let workspace_path = global_config.workspaces
+                        .iter()
+                        .find(|(_, org)| *org == &org_name)
+                        .map(|(path, _)| path.clone());
+
+                    match workspace_path {
+                        Some(ws) => ws.join(&repo_name),
+                        None => {
+                            yield RepoCreateEvent::Error {
+                                org_name: org_name.clone(),
+                                repo_name: Some(repo_name.clone()),
+                                message: "No workspace bound to this org. Use --path to specify location.".to_string(),
+                            };
+                            return;
+                        }
+                    }
+                };
+
+                // Check if directory already exists
+                if local_path.exists() {
+                    yield RepoCreateEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Directory already exists: {}", local_path.display()),
+                    };
+                    return;
+                }
+
+                // Create directory
+                if let Err(e) = tokio::fs::create_dir_all(&local_path).await {
+                    yield RepoCreateEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Failed to create directory: {}", e),
+                    };
+                    return;
+                }
+
+                // Run git init
+                let git_init = tokio::process::Command::new("git")
+                    .current_dir(&local_path)
+                    .args(["init"])
+                    .output()
+                    .await;
+
+                match git_init {
+                    Ok(output) if output.status.success() => {
+                        yield RepoCreateEvent::LocalInitialized {
+                            org_name: org_name.clone(),
+                            repo_name: repo_name.clone(),
+                            path: local_path.clone(),
+                        };
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        yield RepoCreateEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("git init failed: {}", stderr),
+                        };
+                        return;
+                    }
+                    Err(e) => {
+                        yield RepoCreateEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("Failed to run git: {}", e),
+                        };
+                        return;
+                    }
+                }
+
+                // Write .gitignore
+                let gitignore_path = local_path.join(".gitignore");
+                if let Err(e) = tokio::fs::write(&gitignore_path, crate::templates::DEFAULT_GITIGNORE).await {
+                    yield RepoCreateEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Failed to write .gitignore: {}", e),
+                    };
+                    return;
+                }
+
+                yield RepoCreateEvent::GitignoreCreated {
+                    org_name: org_name.clone(),
+                    repo_name: repo_name.clone(),
+                    path: gitignore_path,
+                };
+
+                // Set up hyperforge.org and core.sshCommand
+                let git_bridge = GitRemoteBridge::new(
+                    local_path.clone(),
+                    org_name.clone(),
+                    org_config.owner.clone(),
+                );
+
+                if let Err(e) = git_bridge.ensure_ssh_config().await {
+                    yield RepoCreateEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Failed to configure SSH: {}", e),
+                    };
+                    // Non-fatal, continue
+                }
+
+                // Set up remotes for configured forges
+                let forges_to_setup = forge_list.unwrap_or_else(|| org_config.forges.all_forges());
+                match git_bridge.setup_forge_remotes(&forges_to_setup, &repo_name).await {
+                    Ok(added) => {
+                        for remote_info in added {
+                            if let Some((name, url)) = remote_info.split_once('=') {
+                                yield RepoCreateEvent::RemoteAdded {
+                                    org_name: org_name.clone(),
+                                    repo_name: repo_name.clone(),
+                                    remote: name.to_string(),
+                                    url: url.to_string(),
+                                };
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield RepoCreateEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("Failed to setup remotes: {}", e),
+                        };
+                        // Non-fatal, continue
+                    }
+                }
+
+                yield RepoCreateEvent::LocalSetupComplete {
+                    org_name,
+                    repo_name,
+                    path: local_path,
+                };
+            }
+        }
+    }
+
+    /// Adopt an existing directory as a hyperforge-managed repository
+    #[hub_method(
+        description = "Adopt an existing directory as a hyperforge repository",
+        params(
+            repo_name = "Repository name",
+            path = "Path to the existing directory",
+            git_init = "Initialize as git repository if not already one",
+            scan_packages = "Automatically detect and configure packages",
+            description = "Repository description",
+            visibility = "Repository visibility: 'public' or 'private'",
+            forges = "Comma-separated list of forges (e.g., 'github,codeberg')"
+        )
+    )]
+    pub async fn adopt(
+        &self,
+        repo_name: String,
+        path: String,
+        git_init: Option<bool>,
+        scan_packages: Option<bool>,
+        description: Option<String>,
+        visibility: Option<String>,
+        forges: Option<String>,
+    ) -> impl Stream<Item = RepoAdoptEvent> + Send + 'static {
+        let storage = self.storage();
+        let org_name = self.org_name.clone();
+        let org_config = self.org_config.clone();
+        let should_git_init = git_init.unwrap_or(false);
+        let should_scan = scan_packages.unwrap_or(true);
+
+        stream! {
+            // Parse path
+            let repo_path = PathBuf::from(&path);
+
+            // Check if path exists
+            if !repo_path.exists() {
+                yield RepoAdoptEvent::Error {
+                    org_name: org_name.clone(),
+                    repo_name: Some(repo_name.clone()),
+                    message: format!("Path does not exist: {}", path),
+                };
+                return;
+            }
+
+            if !repo_path.is_dir() {
+                yield RepoAdoptEvent::Error {
+                    org_name: org_name.clone(),
+                    repo_name: Some(repo_name.clone()),
+                    message: format!("Path is not a directory: {}", path),
+                };
+                return;
+            }
+
+            yield RepoAdoptEvent::Started {
+                org_name: org_name.clone(),
+                repo_name: repo_name.clone(),
+                path: repo_path.clone(),
+            };
+
+            let git_dir = repo_path.join(".git");
+            let is_git_repo = git_dir.exists();
+
+            // Initialize git if requested and not already a repo
+            if should_git_init && !is_git_repo {
+                use tokio::process::Command;
+
+                let output = Command::new("git")
+                    .arg("init")
+                    .current_dir(&repo_path)
+                    .output()
+                    .await;
+
+                match output {
+                    Ok(out) if out.status.success() => {
+                        yield RepoAdoptEvent::GitInitialized {
+                            org_name: org_name.clone(),
+                            repo_name: repo_name.clone(),
+                            path: repo_path.clone(),
+                        };
+                    }
+                    Ok(out) => {
+                        yield RepoAdoptEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("git init failed: {}", String::from_utf8_lossy(&out.stderr)),
+                        };
+                        return;
+                    }
+                    Err(e) => {
+                        yield RepoAdoptEvent::Error {
+                            org_name: org_name.clone(),
+                            repo_name: Some(repo_name.clone()),
+                            message: format!("Failed to run git init: {}", e),
+                        };
+                        return;
+                    }
+                }
+            }
+
+            // Detect git remotes if it's a git repo
+            let mut detected_forges = Vec::new();
+            if is_git_repo || should_git_init {
+                use tokio::process::Command;
+
+                if let Ok(output) = Command::new("git")
+                    .args(["remote", "-v"])
+                    .current_dir(&repo_path)
+                    .output()
+                    .await
+                {
+                    if output.status.success() {
+                        let remotes = String::from_utf8_lossy(&output.stdout);
+                        for line in remotes.lines() {
+                            if line.contains("github.com") && !detected_forges.contains(&Forge::GitHub) {
+                                detected_forges.push(Forge::GitHub);
+                            } else if line.contains("codeberg.org") && !detected_forges.contains(&Forge::Codeberg) {
+                                detected_forges.push(Forge::Codeberg);
+                            }
+                        }
+
+                        if !detected_forges.is_empty() {
+                            yield RepoAdoptEvent::RemotesDetected {
+                                org_name: org_name.clone(),
+                                repo_name: repo_name.clone(),
+                                forges: detected_forges.clone(),
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Scan for packages if requested
+            let mut packages = Vec::new();
+            if should_scan {
+                use crate::types::{PackageConfig, PackageType};
+
+                // Check for Cargo.toml
+                if repo_path.join("Cargo.toml").exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(repo_path.join("Cargo.toml")).await {
+                        if let Ok(toml) = content.parse::<toml_edit::DocumentMut>() {
+                            if let Some(name) = toml.get("package")
+                                .and_then(|p: &toml_edit::Item| p.get("name"))
+                                .and_then(|n: &toml_edit::Item| n.as_str())
+                            {
+                                packages.push(PackageConfig {
+                                    name: name.to_string(),
+                                    package_type: PackageType::Crate,
+                                    path: PathBuf::from("."),
+                                    registry: None,
+                                    publish: true,
+                                    publish_command: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check for package.json
+                if repo_path.join("package.json").exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(repo_path.join("package.json")).await {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
+                                packages.push(PackageConfig {
+                                    name: name.to_string(),
+                                    package_type: PackageType::Npm,
+                                    path: PathBuf::from("."),
+                                    registry: None,
+                                    publish: true,
+                                    publish_command: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check for mix.exs
+                if repo_path.join("mix.exs").exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(repo_path.join("mix.exs")).await {
+                        // Simple regex to extract app name
+                        if let Ok(re) = regex::Regex::new(r#"app:\s*:(\w+)"#) {
+                            if let Some(caps) = re.captures(&content) {
+                                if let Some(name) = caps.get(1) {
+                                    packages.push(PackageConfig {
+                                        name: name.as_str().to_string(),
+                                        package_type: PackageType::Hex,
+                                        path: PathBuf::from("."),
+                                        registry: None,
+                                        publish: true,
+                                        publish_command: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check for pyproject.toml or setup.py
+                let has_pyproject = repo_path.join("pyproject.toml").exists();
+                let has_setup_py = repo_path.join("setup.py").exists();
+
+                if has_pyproject {
+                    if let Ok(content) = tokio::fs::read_to_string(repo_path.join("pyproject.toml")).await {
+                        if let Ok(toml) = content.parse::<toml_edit::DocumentMut>() {
+                            let name = toml.get("project")
+                                .and_then(|p: &toml_edit::Item| p.get("name"))
+                                .and_then(|n: &toml_edit::Item| n.as_str())
+                                .or_else(|| {
+                                    toml.get("tool")
+                                        .and_then(|t: &toml_edit::Item| t.get("poetry"))
+                                        .and_then(|p: &toml_edit::Item| p.get("name"))
+                                        .and_then(|n: &toml_edit::Item| n.as_str())
+                                });
+
+                            if let Some(n) = name {
+                                packages.push(PackageConfig {
+                                    name: n.to_string(),
+                                    package_type: PackageType::PyPi,
+                                    path: PathBuf::from("."),
+                                    registry: None,
+                                    publish: true,
+                                    publish_command: None,
+                                });
+                            }
+                        }
+                    }
+                } else if has_setup_py {
+                    if let Ok(content) = tokio::fs::read_to_string(repo_path.join("setup.py")).await {
+                        if let Ok(re) = regex::Regex::new(r#"name\s*=\s*["']([^"']+)["']"#) {
+                            if let Some(caps) = re.captures(&content) {
+                                if let Some(name) = caps.get(1) {
+                                    packages.push(PackageConfig {
+                                        name: name.as_str().to_string(),
+                                        package_type: PackageType::PyPi,
+                                        path: PathBuf::from("."),
+                                        registry: None,
+                                        publish: true,
+                                        publish_command: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !packages.is_empty() {
+                    yield RepoAdoptEvent::PackagesDetected {
+                        org_name: org_name.clone(),
+                        repo_name: repo_name.clone(),
+                        packages: packages.clone(),
+                    };
+                }
+            }
+
+            // Parse visibility
+            let vis = match visibility.as_deref() {
+                Some("private") => Some(Visibility::Private),
+                Some("public") => Some(Visibility::Public),
+                None => None,
+                Some(v) => {
+                    yield RepoAdoptEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Invalid visibility: {}", v),
+                    };
+                    return;
+                }
+            };
+
+            // Parse forges - use detected if not specified
+            let forge_list: Option<Vec<Forge>> = match forges {
+                Some(f) => {
+                    let parsed: Result<Vec<Forge>, _> = f
+                        .split(',')
+                        .map(|s| s.trim().parse())
+                        .collect();
+
+                    match parsed {
+                        Ok(list) => Some(list),
+                        Err(e) => {
+                            yield RepoAdoptEvent::Error {
+                                org_name: org_name.clone(),
+                                repo_name: Some(repo_name.clone()),
+                                message: e,
+                            };
+                            return;
+                        }
+                    }
+                }
+                None if !detected_forges.is_empty() => {
+                    Some(detected_forges)
+                }
+                None => {
+                    // Use org defaults
+                    Some(org_config.forges.all_forges())
+                }
+            };
+
+            // Create repo config
+            let config = RepoConfig {
+                description: description.clone(),
                 visibility: vis,
                 forges: forge_list,
                 protected: false,
                 delete: false,
                 synced: None,
                 discovered: None,
+                packages,
+                build: None,
             };
 
+            // Stage the repo
             match storage.stage_repo(repo_name.clone(), config).await {
                 Ok(()) => {
-                    yield RepoEvent::Staged {
-                        org_name,
-                        repo_name,
+                    yield RepoAdoptEvent::Complete {
+                        org_name: org_name.clone(),
+                        repo_name: repo_name.clone(),
+                        path: repo_path,
                     };
                 }
                 Err(e) => {
-                    yield RepoEvent::Error {
-                        org_name,
-                        repo_name: Some(repo_name),
-                        message: e.to_string(),
+                    yield RepoAdoptEvent::Error {
+                        org_name: org_name.clone(),
+                        repo_name: Some(repo_name.clone()),
+                        message: format!("Failed to adopt repo: {}", e),
                     };
                 }
             }
@@ -270,7 +772,7 @@ impl ReposActivation {
         repo_name: Option<String>,
         dry_run: Option<bool>,
         yes: Option<bool>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoSyncEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
@@ -284,7 +786,7 @@ impl ReposActivation {
             let global_config = match GlobalConfig::load(&paths).await {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoSyncEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: None,
                         message: format!("Failed to load config: {}", e),
@@ -297,7 +799,7 @@ impl ReposActivation {
             let repos_config = match storage.merge_staged().await {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoSyncEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: None,
                         message: e.to_string(),
@@ -320,7 +822,7 @@ impl ReposActivation {
             // Validate target exists if specified
             if let Some(ref target) = target_repo {
                 if repos_to_sync.is_empty() {
-                    yield RepoEvent::Error {
+                    yield RepoSyncEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(target.clone()),
                         message: format!("Repository not found: {}", target),
@@ -340,7 +842,7 @@ impl ReposActivation {
             // Emit warnings for skipped forges (except origin which is always synced)
             for forge in &all_forges {
                 if !synced_forges.contains(forge) && forge != origin_forge {
-                    yield RepoEvent::ForgeSkipped {
+                    yield RepoSyncEvent::ForgeSkipped {
                         org_name: org_name.clone(),
                         forge: forge.clone(),
                         reason: "sync: false in org config".to_string(),
@@ -354,7 +856,7 @@ impl ReposActivation {
                 effective_synced_forges.push(origin_forge.clone());
             }
 
-            yield RepoEvent::SyncStarted {
+            yield RepoSyncEvent::Started {
                 org_name: org_name.clone(),
                 repo_count,
             };
@@ -397,7 +899,7 @@ impl ReposActivation {
                             for remote_info in &added_remotes {
                                 // Format is "name=url"
                                 if let Some((name, url)) = remote_info.split_once('=') {
-                                    yield RepoEvent::RemoteAdded {
+                                    yield RepoSyncEvent::RemoteAdded {
                                         org_name: org_name.clone(),
                                         repo_name: repo_name.to_string(),
                                         remote: name.to_string(),
@@ -412,14 +914,14 @@ impl ReposActivation {
                                 .map(|f| f.to_string())
                                 .collect();
 
-                            yield RepoEvent::RemotesValidated {
+                            yield RepoSyncEvent::RemotesValidated {
                                 org_name: org_name.clone(),
                                 repo_name: repo_name.to_string(),
                                 remotes: all_remotes,
                             };
                         }
                         Err(e) => {
-                            yield RepoEvent::Error {
+                            yield RepoSyncEvent::Error {
                                 org_name: org_name.clone(),
                                 repo_name: Some(repo_name.to_string()),
                                 message: format!("Failed to setup git remotes: {}", e),
@@ -437,7 +939,7 @@ impl ReposActivation {
 
             // Select/create stack for this org
             if let Err(e) = bridge.select_stack(&org_name).await {
-                yield RepoEvent::Error {
+                yield RepoSyncEvent::Error {
                     org_name: org_name.clone(),
                     repo_name: None,
                     message: format!("Failed to select Pulumi stack: {}", e),
@@ -461,21 +963,21 @@ impl ReposActivation {
                 match event {
                     crate::events::PulumiEvent::PreviewStarted { .. } |
                     crate::events::PulumiEvent::UpStarted { .. } => {
-                        yield RepoEvent::SyncStarted {
+                        yield RepoSyncEvent::Started {
                             org_name: org_name.clone(),
                             repo_count: 0, // Unknown at this point
                         };
                     }
                     crate::events::PulumiEvent::ResourcePlanned { resource_name, .. } |
                     crate::events::PulumiEvent::ResourceApplied { resource_name, .. } => {
-                        yield RepoEvent::SyncProgress {
+                        yield RepoSyncEvent::Progress {
                             org_name: org_name.clone(),
                             repo_name: resource_name,
                             stage: "pulumi".into(),
                         };
                     }
                     crate::events::PulumiEvent::PreviewComplete { creates, .. } => {
-                        yield RepoEvent::SyncComplete {
+                        yield RepoSyncEvent::Complete {
                             org_name: org_name.clone(),
                             success: true,
                             synced_count: creates,
@@ -483,14 +985,14 @@ impl ReposActivation {
                     }
                     crate::events::PulumiEvent::UpComplete { success, creates, .. } => {
                         up_success = success;
-                        yield RepoEvent::SyncComplete {
+                        yield RepoSyncEvent::Complete {
                             org_name: org_name.clone(),
                             success,
                             synced_count: creates,
                         };
                     }
                     crate::events::PulumiEvent::Error { message } => {
-                        yield RepoEvent::Error {
+                        yield RepoSyncEvent::Error {
                             org_name: org_name.clone(),
                             repo_name: None,
                             message,
@@ -514,7 +1016,7 @@ impl ReposActivation {
                                     repo_output.github_id.clone(),
                                 ).await;
 
-                                yield RepoEvent::OutputsCaptured {
+                                yield RepoSyncEvent::OutputsCaptured {
                                     org_name: org_name.clone(),
                                     repo_name: repo_name.clone(),
                                     forge: Forge::GitHub,
@@ -531,7 +1033,7 @@ impl ReposActivation {
                                     repo_output.codeberg_id.clone(),
                                 ).await;
 
-                                yield RepoEvent::OutputsCaptured {
+                                yield RepoSyncEvent::OutputsCaptured {
                                     org_name: org_name.clone(),
                                     repo_name: repo_name.clone(),
                                     forge: Forge::Codeberg,
@@ -542,7 +1044,7 @@ impl ReposActivation {
                         }
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoSyncEvent::Error {
                             org_name: org_name.clone(),
                             repo_name: None,
                             message: format!("Failed to capture outputs: {}", e),
@@ -565,7 +1067,7 @@ impl ReposActivation {
         &self,
         repo_name: String,
         force: Option<bool>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoRemoveEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let force_delete = force.unwrap_or(false);
@@ -575,7 +1077,7 @@ impl ReposActivation {
             let repos = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoRemoveEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(repo_name.clone()),
                         message: e.to_string(),
@@ -587,7 +1089,7 @@ impl ReposActivation {
             // Check if repo exists and is protected
             if let Some(config) = repos.repos.get(&repo_name) {
                 if config.protected && !force_delete {
-                    yield RepoEvent::ProtectionError {
+                    yield RepoRemoveEvent::ProtectionError {
                         org_name,
                         repo_name,
                         message: "Repository is protected. Use --force true to delete.".into(),
@@ -599,13 +1101,13 @@ impl ReposActivation {
             // Proceed with deletion
             match storage.stage_deletion(repo_name.clone()).await {
                 Ok(()) => {
-                    yield RepoEvent::MarkedForDeletion {
+                    yield RepoRemoveEvent::MarkedForDeletion {
                         org_name,
                         repo_name,
                     };
                 }
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoRemoveEvent::Error {
                         org_name,
                         repo_name: Some(repo_name),
                         message: e.to_string(),
@@ -625,7 +1127,7 @@ impl ReposActivation {
     pub async fn refresh(
         &self,
         _force: Option<bool>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoRefreshEvent> + Send + 'static {
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
         let storage = self.storage();
@@ -633,7 +1135,7 @@ impl ReposActivation {
         stream! {
             // Org config comes from parent - no need to reload
 
-            yield RepoEvent::RefreshStarted {
+            yield RepoRefreshEvent::Started {
                 org_name: org_name.clone(),
                 forges: org_config.forges.all_forges(),
             };
@@ -653,17 +1155,15 @@ impl ReposActivation {
                 let token = match keychain.get(token_key).await {
                     Ok(Some(t)) => t,
                     Ok(None) => {
-                        yield RepoEvent::Error {
+                        yield RepoRefreshEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message: format!("No token configured for {}", forge),
                         };
                         continue;
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoRefreshEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message: e,
                         };
                         continue;
@@ -675,7 +1175,7 @@ impl ReposActivation {
 
                 match repos {
                     Ok(forge_repos) => {
-                        yield RepoEvent::RefreshProgress {
+                        yield RepoRefreshEvent::Progress {
                             org_name: org_name.clone(),
                             forge: forge.clone(),
                             repos_found: forge_repos.len(),
@@ -686,9 +1186,8 @@ impl ReposActivation {
                         }
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoRefreshEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message: format!("{} query failed: {}", forge, e),
                         };
                     }
@@ -699,9 +1198,8 @@ impl ReposActivation {
             let repos_config = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoRefreshEvent::Error {
                         org_name: org_name.clone(),
-                        repo_name: None,
                         message: e.to_string(),
                     };
                     return;
@@ -713,7 +1211,7 @@ impl ReposActivation {
             let matched = discovered_repos.intersection(&local_repo_names).count();
             let untracked = discovered_repos.difference(&local_repo_names).count();
 
-            yield RepoEvent::RefreshComplete {
+            yield RepoRefreshEvent::Complete {
                 org_name,
                 discovered: discovered_repos.len(),
                 matched,
@@ -732,7 +1230,7 @@ impl ReposActivation {
     pub async fn diff(
         &self,
         refresh: Option<bool>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoDiffEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
