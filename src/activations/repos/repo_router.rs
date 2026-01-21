@@ -10,10 +10,10 @@ use hub_core::plexus::{
 };
 use hub_macro::hub_methods;
 
-use crate::bridge::{GitRemoteBridge, PulumiBridge, create_registry, create_secret_store};
+use crate::bridge::{create_registry, create_secret_store};
 use crate::storage::{HyperforgePaths, OrgStorage, GlobalConfig, OrgConfig};
-use crate::events::{RepoEvent, PackageEvent};
-use crate::types::{RepoDetails, PackageSummary, VersionBump};
+use crate::events::PackageEvent;
+use crate::types::{PackageSummary, VersionBump};
 
 /// Child router for a specific repository (e.g., org.hypermemetic.repos.substrate)
 /// Receives org-level configuration from parent ReposActivation.
@@ -43,6 +43,8 @@ impl RepoChildRouter {
 )]
 impl RepoChildRouter {
     /// Show repository details
+    /// Note: Commented out - RepoEvent has been refactored into specific event types
+    /*
     #[hub_method(description = "Show repository details")]
     pub async fn show(&self) -> impl Stream<Item = RepoEvent> + Send + 'static {
         let storage = self.storage();
@@ -82,8 +84,11 @@ impl RepoChildRouter {
             }
         }
     }
+    */
 
     /// Sync repository to forges
+    /// Note: Commented out - RepoEvent has been refactored into specific event types
+    /*
     #[hub_method(
         description = "Sync repository to forges",
         params(
@@ -273,6 +278,7 @@ impl RepoChildRouter {
             }
         }
     }
+    */
 
     /// List packages configured for this repository
     #[hub_method(description = "List packages configured for this repository")]

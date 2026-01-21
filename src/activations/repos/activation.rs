@@ -163,7 +163,6 @@ impl ReposActivation {
                 Err(e) => {
                     yield RepoListEvent::Error {
                         org_name,
-                        repo_name: None,
                         message: e.to_string(),
                     };
                 }
@@ -894,30 +893,12 @@ impl ReposActivation {
 
                     // Validate/setup remotes
                     match git_bridge.setup_forge_remotes(forges, repo_name).await {
-                        Ok(added_remotes) => {
-                            // Emit events for any remotes that were added
-                            for remote_info in &added_remotes {
-                                // Format is "name=url"
-                                if let Some((name, url)) = remote_info.split_once('=') {
-                                    yield RepoSyncEvent::RemoteAdded {
-                                        org_name: org_name.clone(),
-                                        repo_name: repo_name.to_string(),
-                                        remote: name.to_string(),
-                                        url: url.to_string(),
-                                    };
-                                }
-                            }
-
-                            // Always emit validation event with all configured remotes
-                            let all_remotes: Vec<String> = forges
-                                .iter()
-                                .map(|f| f.to_string())
-                                .collect();
-
-                            yield RepoSyncEvent::RemotesValidated {
+                        Ok(_added_remotes) => {
+                            // Remotes configured successfully - emit progress event
+                            yield RepoSyncEvent::Progress {
                                 org_name: org_name.clone(),
                                 repo_name: repo_name.to_string(),
-                                remotes: all_remotes,
+                                stage: "remotes validated".to_string(),
                             };
                         }
                         Err(e) => {
@@ -1246,9 +1227,8 @@ impl ReposActivation {
             let mut repos = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoDiffEvent::Error {
                         org_name: org_name.clone(),
-                        repo_name: None,
                         message: e.to_string(),
                     };
                     return;
@@ -1273,20 +1253,8 @@ impl ReposActivation {
             // Org config comes from parent - no need to reload
             // Determine which forges should be synced vs skipped
             // Origin forge is always synced regardless of the sync flag
-            let all_forges = org_config.forges.all_forges();
             let synced_forges_list = org_config.forges.synced_forges();
             let origin_forge = &org_config.origin;
-
-            // Emit warnings for skipped forges (except origin which is always synced)
-            for forge in &all_forges {
-                if !synced_forges_list.contains(forge) && forge != origin_forge {
-                    yield RepoEvent::ForgeSkipped {
-                        org_name: org_name.clone(),
-                        forge: forge.clone(),
-                        reason: "sync: false in org config (excluded from diff)".to_string(),
-                    };
-                }
-            }
 
             // Calculate effective synced forges set (synced + origin)
             let mut effective_synced_set: HashSet<Forge> = synced_forges_list.into_iter().collect();
@@ -1359,7 +1327,7 @@ impl ReposActivation {
                     ])
                 };
 
-                yield RepoEvent::RepoDiff {
+                yield RepoDiffEvent::RepoDiff {
                     org_name: org_name.clone(),
                     repo_name: name.clone(),
                     status,
@@ -1372,7 +1340,7 @@ impl ReposActivation {
             // and users can run refresh() to populate _discovered state.
             let untracked = 0;
 
-            yield RepoEvent::DiffSummary {
+            yield RepoDiffEvent::Summary {
                 org_name,
                 to_create,
                 to_update,
@@ -1395,7 +1363,7 @@ impl ReposActivation {
         &self,
         dry_run: Option<bool>,
         yes: Option<bool>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoConvergeEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
@@ -1412,7 +1380,7 @@ impl ReposActivation {
                 "verify".to_string(),
             ];
 
-            yield RepoEvent::ConvergeStarted {
+            yield RepoConvergeEvent::Started {
                 org_name: org_name.clone(),
                 phases: phases.clone(),
             };
@@ -1420,7 +1388,7 @@ impl ReposActivation {
             // ============================================================
             // Phase 1: REFRESH - Query forges for current state
             // ============================================================
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "refresh".into(),
                 status: "started".into(),
@@ -1442,17 +1410,15 @@ impl ReposActivation {
                 let token = match keychain.get(token_key).await {
                     Ok(Some(t)) => t,
                     Ok(None) => {
-                        yield RepoEvent::Error {
+                        yield RepoConvergeEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message: format!("No token configured for {}", forge),
                         };
                         continue;
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoConvergeEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message: e,
                         };
                         continue;
@@ -1469,16 +1435,15 @@ impl ReposActivation {
                         }
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoConvergeEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message: format!("{} query failed: {}", forge, e),
                         };
                     }
                 }
             }
 
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "refresh".into(),
                 status: format!("discovered {} repos", discovered_repos.len()),
@@ -1487,7 +1452,7 @@ impl ReposActivation {
             // ============================================================
             // Phase 2: DIFF - Compare local vs remote
             // ============================================================
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "diff".into(),
                 status: "started".into(),
@@ -1497,9 +1462,8 @@ impl ReposActivation {
             let repos_config = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoConvergeEvent::Error {
                         org_name: org_name.clone(),
-                        repo_name: None,
                         message: e.to_string(),
                     };
                     return;
@@ -1510,9 +1474,8 @@ impl ReposActivation {
             let staged_config = match storage.load_staged().await {
                 Ok(s) => s,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoConvergeEvent::Error {
                         org_name: org_name.clone(),
-                        repo_name: None,
                         message: e.to_string(),
                     };
                     return;
@@ -1578,7 +1541,7 @@ impl ReposActivation {
                 }
             }
 
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "diff".into(),
                 status: format!("create={}, update={}, delete={}", to_create, to_update, to_delete),
@@ -1586,7 +1549,7 @@ impl ReposActivation {
 
             // If nothing to do, we're converged
             if to_create == 0 && to_update == 0 && to_delete == 0 {
-                yield RepoEvent::ConvergeComplete {
+                yield RepoConvergeEvent::Complete {
                     org_name,
                     success: true,
                     changes_applied: 0,
@@ -1602,13 +1565,13 @@ impl ReposActivation {
             }
 
             if is_dry_run {
-                yield RepoEvent::ConvergePhase {
+                yield RepoConvergeEvent::Phase {
                     org_name: org_name.clone(),
                     phase: "apply".into(),
                     status: "skipped (dry run)".into(),
                 };
 
-                yield RepoEvent::ConvergeComplete {
+                yield RepoConvergeEvent::Complete {
                     org_name,
                     success: true,
                     changes_applied: 0,
@@ -1626,7 +1589,7 @@ impl ReposActivation {
             // ============================================================
             // Phase 3: APPLY - Run Pulumi to make changes
             // ============================================================
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "apply".into(),
                 status: "started".into(),
@@ -1634,9 +1597,8 @@ impl ReposActivation {
 
             // Merge staged into committed
             if let Err(e) = storage.merge_staged().await {
-                yield RepoEvent::Error {
+                yield RepoConvergeEvent::Error {
                     org_name: org_name.clone(),
-                    repo_name: None,
                     message: e.to_string(),
                 };
                 return;
@@ -1646,9 +1608,8 @@ impl ReposActivation {
 
             // Select/create stack for this org
             if let Err(e) = bridge.select_stack(&org_name).await {
-                yield RepoEvent::Error {
+                yield RepoConvergeEvent::Error {
                     org_name: org_name.clone(),
-                    repo_name: None,
                     message: format!("Failed to select Pulumi stack: {}", e),
                 };
                 return;
@@ -1670,24 +1631,22 @@ impl ReposActivation {
                         changes_applied = creates + updates + deletes;
 
                         if !success {
-                            yield RepoEvent::Error {
+                            yield RepoConvergeEvent::Error {
                                 org_name: org_name.clone(),
-                                repo_name: None,
                                 message: "Pulumi apply failed".into(),
                             };
                             return;
                         }
 
-                        yield RepoEvent::ConvergePhase {
+                        yield RepoConvergeEvent::Phase {
                             org_name: org_name.clone(),
                             phase: "apply".into(),
                             status: format!("applied {} changes", changes_applied),
                         };
                     }
                     PulumiEvent::Error { message } => {
-                        yield RepoEvent::Error {
+                        yield RepoConvergeEvent::Error {
                             org_name: org_name.clone(),
-                            repo_name: None,
                             message,
                         };
                         return;
@@ -1699,7 +1658,7 @@ impl ReposActivation {
             // ============================================================
             // Phase 4: CAPTURE - Store outputs in local state
             // ============================================================
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "capture".into(),
                 status: "started".into(),
@@ -1726,16 +1685,15 @@ impl ReposActivation {
                         }
                     }
 
-                    yield RepoEvent::ConvergePhase {
+                    yield RepoConvergeEvent::Phase {
                         org_name: org_name.clone(),
                         phase: "capture".into(),
                         status: "outputs captured".into(),
                     };
                 }
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoConvergeEvent::Error {
                         org_name: org_name.clone(),
-                        repo_name: None,
                         message: format!("Capture failed: {}", e),
                     };
                     // Continue to verify phase even if capture failed
@@ -1745,7 +1703,7 @@ impl ReposActivation {
             // ============================================================
             // Phase 5: VERIFY - Re-diff to confirm convergence
             // ============================================================
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "verify".into(),
                 status: "started".into(),
@@ -1755,13 +1713,12 @@ impl ReposActivation {
             let final_repos = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoConvergeEvent::Error {
                         org_name: org_name.clone(),
-                        repo_name: None,
                         message: format!("Failed to verify: {}", e),
                     };
                     // Return with drift detected since we can't verify
-                    yield RepoEvent::ConvergeComplete {
+                    yield RepoConvergeEvent::Complete {
                         org_name,
                         success: false,
                         changes_applied,
@@ -1817,7 +1774,7 @@ impl ReposActivation {
 
             let drift_detected = verify_create > 0 || verify_update > 0 || verify_delete > 0;
 
-            yield RepoEvent::ConvergePhase {
+            yield RepoConvergeEvent::Phase {
                 org_name: org_name.clone(),
                 phase: "verify".into(),
                 status: if drift_detected {
@@ -1830,7 +1787,7 @@ impl ReposActivation {
             // ============================================================
             // Complete
             // ============================================================
-            yield RepoEvent::ConvergeComplete {
+            yield RepoConvergeEvent::Complete {
                 org_name,
                 success: !drift_detected,
                 changes_applied,
@@ -1857,7 +1814,7 @@ impl ReposActivation {
         &self,
         repo_name: String,
         target: Option<String>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoCloneEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
@@ -1869,7 +1826,7 @@ impl ReposActivation {
             let repos = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoCloneEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(repo_name.clone()),
                         message: e.to_string(),
@@ -1882,7 +1839,7 @@ impl ReposActivation {
             let repo_config = match repos.repos.get(&repo_name) {
                 Some(cfg) => cfg.clone(),
                 None => {
-                    yield RepoEvent::Error {
+                    yield RepoCloneEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(repo_name.clone()),
                         message: format!("Repository not found in config: {}", repo_name),
@@ -1899,7 +1856,7 @@ impl ReposActivation {
                     .join(&repo_name),
             };
 
-            yield RepoEvent::CloneStarted {
+            yield RepoCloneEvent::Started {
                 org_name: org_name.clone(),
                 repo_name: repo_name.clone(),
                 target_path: target_path.clone(),
@@ -1913,7 +1870,7 @@ impl ReposActivation {
             let origin_forge = &org_config.origin;
             let origin_url = org_config.origin_url(&org_name, &repo_name);
 
-            yield RepoEvent::CloneProgress {
+            yield RepoCloneEvent::Progress {
                 org_name: org_name.clone(),
                 repo_name: repo_name.clone(),
                 forge: origin_forge.clone(),
@@ -1928,7 +1885,7 @@ impl ReposActivation {
 
             match clone_output {
                 Ok(output) if output.status.success() => {
-                    yield RepoEvent::CloneProgress {
+                    yield RepoCloneEvent::Progress {
                         org_name: org_name.clone(),
                         repo_name: repo_name.clone(),
                         forge: origin_forge.clone(),
@@ -1937,7 +1894,7 @@ impl ReposActivation {
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    yield RepoEvent::Error {
+                    yield RepoCloneEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(repo_name.clone()),
                         message: format!("git clone failed: {}", stderr),
@@ -1945,7 +1902,7 @@ impl ReposActivation {
                     return;
                 }
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoCloneEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: Some(repo_name.clone()),
                         message: format!("Failed to run git: {}", e),
@@ -1965,7 +1922,7 @@ impl ReposActivation {
                 let forge_name = forge.to_string().to_lowercase();
                 let remote_url = org_config.ssh_url(forge, &org_name, &repo_name);
 
-                yield RepoEvent::CloneProgress {
+                yield RepoCloneEvent::Progress {
                     org_name: org_name.clone(),
                     repo_name: repo_name.clone(),
                     forge: forge.clone(),
@@ -1981,7 +1938,7 @@ impl ReposActivation {
                 match add_remote {
                     Ok(output) if output.status.success() => {
                         remotes.push(forge_name.clone());
-                        yield RepoEvent::CloneRemoteAdded {
+                        yield RepoCloneEvent::RemoteAdded {
                             org_name: org_name.clone(),
                             repo_name: repo_name.clone(),
                             remote_name: forge_name,
@@ -1991,7 +1948,7 @@ impl ReposActivation {
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         // Non-fatal: remote might already exist
-                        yield RepoEvent::CloneProgress {
+                        yield RepoCloneEvent::Progress {
                             org_name: org_name.clone(),
                             repo_name: repo_name.clone(),
                             forge: forge.clone(),
@@ -1999,7 +1956,7 @@ impl ReposActivation {
                         };
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoCloneEvent::Error {
                             org_name: org_name.clone(),
                             repo_name: Some(repo_name.clone()),
                             message: format!("Failed to add remote: {}", e),
@@ -2009,7 +1966,7 @@ impl ReposActivation {
             }
 
             // Fetch all remotes
-            yield RepoEvent::CloneProgress {
+            yield RepoCloneEvent::Progress {
                 org_name: org_name.clone(),
                 repo_name: repo_name.clone(),
                 forge: origin_forge.clone(),
@@ -2086,7 +2043,7 @@ impl ReposActivation {
                 }
             }
 
-            yield RepoEvent::RemoteSyncStatus {
+            yield RepoCloneEvent::RemoteSyncStatus {
                 org_name: org_name.clone(),
                 repo_name: repo_name.clone(),
                 branch: default_branch,
@@ -2094,7 +2051,7 @@ impl ReposActivation {
                 details: sync_details,
             };
 
-            yield RepoEvent::CloneComplete {
+            yield RepoCloneEvent::Complete {
                 org_name,
                 repo_name,
                 target_path,
@@ -2113,7 +2070,7 @@ impl ReposActivation {
     pub async fn clone_all(
         &self,
         target: Option<String>,
-    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+    ) -> impl Stream<Item = RepoCloneEvent> + Send + 'static {
         let storage = self.storage();
         let org_name = self.org_name.clone();
         let org_config = self.org_config.clone();
@@ -2130,7 +2087,7 @@ impl ReposActivation {
             // Ensure target directory exists
             if !target_dir.exists() {
                 if let Err(e) = std::fs::create_dir_all(&target_dir) {
-                    yield RepoEvent::Error {
+                    yield RepoCloneEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: None,
                         message: format!("Failed to create target directory: {}", e),
@@ -2143,7 +2100,7 @@ impl ReposActivation {
             let repos = match storage.load_repos().await {
                 Ok(r) => r,
                 Err(e) => {
-                    yield RepoEvent::Error {
+                    yield RepoCloneEvent::Error {
                         org_name: org_name.clone(),
                         repo_name: None,
                         message: e.to_string(),
@@ -2164,7 +2121,7 @@ impl ReposActivation {
 
                 // Skip if already exists
                 if repo_path.exists() {
-                    yield RepoEvent::CloneProgress {
+                    yield RepoCloneEvent::Progress {
                         org_name: org_name.clone(),
                         repo_name: repo_name.clone(),
                         forge: origin_forge.clone(),
@@ -2173,7 +2130,7 @@ impl ReposActivation {
                     continue;
                 }
 
-                yield RepoEvent::CloneStarted {
+                yield RepoCloneEvent::Started {
                     org_name: org_name.clone(),
                     repo_name: repo_name.clone(),
                     target_path: repo_path.clone(),
@@ -2186,7 +2143,7 @@ impl ReposActivation {
 
                 let origin_url = org_config.origin_url(&org_name, repo_name);
 
-                yield RepoEvent::CloneProgress {
+                yield RepoCloneEvent::Progress {
                     org_name: org_name.clone(),
                     repo_name: repo_name.clone(),
                     forge: origin_forge.clone(),
@@ -2201,7 +2158,7 @@ impl ReposActivation {
 
                 match clone_output {
                     Ok(output) if output.status.success() => {
-                        yield RepoEvent::CloneProgress {
+                        yield RepoCloneEvent::Progress {
                             org_name: org_name.clone(),
                             repo_name: repo_name.clone(),
                             forge: origin_forge.clone(),
@@ -2210,7 +2167,7 @@ impl ReposActivation {
                     }
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
-                        yield RepoEvent::Error {
+                        yield RepoCloneEvent::Error {
                             org_name: org_name.clone(),
                             repo_name: Some(repo_name.clone()),
                             message: format!("git clone failed: {}", stderr),
@@ -2218,7 +2175,7 @@ impl ReposActivation {
                         continue; // Skip to next repo
                     }
                     Err(e) => {
-                        yield RepoEvent::Error {
+                        yield RepoCloneEvent::Error {
                             org_name: org_name.clone(),
                             repo_name: Some(repo_name.clone()),
                             message: format!("Failed to run git: {}", e),
@@ -2247,7 +2204,7 @@ impl ReposActivation {
                     if let Ok(output) = add_remote {
                         if output.status.success() {
                             remotes.push(forge_name.clone());
-                            yield RepoEvent::CloneRemoteAdded {
+                            yield RepoCloneEvent::RemoteAdded {
                                 org_name: org_name.clone(),
                                 repo_name: repo_name.clone(),
                                 remote_name: forge_name,
@@ -2264,7 +2221,7 @@ impl ReposActivation {
                     .output()
                     .await;
 
-                yield RepoEvent::CloneComplete {
+                yield RepoCloneEvent::Complete {
                     org_name: org_name.clone(),
                     repo_name: repo_name.clone(),
                     target_path: repo_path,
