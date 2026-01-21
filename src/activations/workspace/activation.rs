@@ -197,6 +197,8 @@ impl WorkspaceActivation {
                             delete: false,
                             synced: None,
                             discovered: None,
+                            packages: vec![],
+                            build: None,
                         };
 
                         match storage.stage_repo(repo_name.clone(), repo_config).await {

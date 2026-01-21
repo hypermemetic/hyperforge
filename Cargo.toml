@@ -36,7 +36,13 @@ jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json"] }
 dirs = "6.0.0"
+regex = "1.12.2"
+toml_edit = "0.22"
 
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+[features]
+default = []
+test-support = []  # Enables test utilities like MockForgeClient

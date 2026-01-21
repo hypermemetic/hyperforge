@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
-use super::{Forge, Visibility};
+use super::{Forge, Visibility, PackageConfig, BuildConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Repo {
@@ -49,6 +49,14 @@ pub struct RepoConfig {
     pub protected: bool,
     #[serde(default, rename = "_delete")]
     pub delete: bool,
+
+    /// Packages contained in this repository
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<PackageConfig>,
+
+    /// Build configuration for this repository
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildConfig>,
 
     // System-managed state (prefixed with _)
     #[serde(default, rename = "_synced", skip_serializing_if = "Option::is_none")]
