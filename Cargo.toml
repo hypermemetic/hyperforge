@@ -1,17 +1,17 @@
 [package]
 name = "hyperforge"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
-description = "Multi-forge infrastructure management hub"
+description = "Multi-forge repository management"
 license = "MIT"
 
 [dependencies]
-# Substrate integration
+# Hub framework integration
 hub-core = { path = "../hub-core" }
 hub-macro = { path = "../hub-macro" }
 
-# Async runtime
-tokio = { version = "1", features = ["full", "process"] }
+# Async
+tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 async-stream = "0.3"
 futures = "0.3"
@@ -19,30 +19,18 @@ futures = "0.3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
-
-# Schema generation (match hub-core version)
-schemars = { version = "1.1", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.22"  # Preserve formatting when editing
 
 # Error handling
-thiserror = "1"
 anyhow = "1"
+thiserror = "1"
 
-# Utilities
-tracing = "0.1"
-directories = "5"
-uuid = { version = "1", features = ["v4", "v5"] }
-jsonrpsee = { version = "0.26", features = ["server", "macros"] }
-chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
-dirs = "6.0.0"
-regex = "1.12.2"
-toml_edit = "0.22"
+# Git operations
+regex = "1"
+
+# CLI (if needed for testing)
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3"
-
-[features]
-default = []
-test-support = []  # Enables test utilities like MockForgeClient
