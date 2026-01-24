@@ -1,13 +1,28 @@
-pub mod forge;
-pub mod org;
-pub mod package;
-pub mod repo;
-pub mod secret;
-pub mod workspace;
+//! Core types for hyperforge
 
-pub use forge::*;
-pub use org::*;
-pub use package::*;
-pub use repo::*;
-pub use secret::*;
-pub use workspace::*;
+use serde::{Deserialize, Serialize};
+
+/// Supported git forges
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Forge {
+    GitHub,
+    Codeberg,
+    GitLab,
+}
+
+/// Repository visibility
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+/// Version bump type for package publishing
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionBump {
+    Patch,
+    Minor,
+    Major,
+}
