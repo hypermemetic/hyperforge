@@ -5,10 +5,19 @@ edition = "2021"
 description = "Multi-forge repository management"
 license = "MIT"
 
+[lib]
+name = "hyperforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyperforge"
+path = "src/bin/hyperforge.rs"
+
 [dependencies]
 # Hub framework integration
 hub-core = { path = "../hub-core" }
 hub-macro = { path = "../hub-macro" }
+hub-transport = { path = "../hub-transport" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -22,6 +31,13 @@ serde_json = "1"
 toml = "0.8"
 toml_edit = "0.22"  # Preserve formatting when editing
 
+# Schema generation
+schemars = { version = "1.1", features = ["derive"] }
+
+# Core types
+uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
 # Error handling
 anyhow = "1"
 thiserror = "1"
@@ -29,7 +45,14 @@ thiserror = "1"
 # Git operations
 regex = "1"
 
-# CLI (if needed for testing)
+# JSON-RPC (required by hub-macro)
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CLI
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
