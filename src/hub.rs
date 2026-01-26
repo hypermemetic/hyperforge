@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use crate::adapters::{ForgePort, LocalForge};
+use crate::adapters::{ForgePort, LocalForge, GitHubAdapter, CodebergAdapter, GitLabAdapter};
+use crate::auth::KeychainAuthProvider;
 use crate::services::SymmetricSyncService;
 use crate::types::{Forge, Repo, Visibility};
 
@@ -341,6 +342,490 @@ impl HyperforgeHub {
                 Err(e) => {
                     yield HyperforgeEvent::Error {
                         message: format!("Failed to create repo: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Update an existing repository
+    #[hub_method(
+        description = "Update repository configuration",
+        params(
+            org = "Organization name",
+            name = "Repository name",
+            description = "New repository description (optional)",
+            visibility = "New visibility: public or private (optional)"
+        )
+    )]
+    pub async fn repos_update(
+        &self,
+        org: String,
+        name: String,
+        description: Option<String>,
+        visibility: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+
+        stream! {
+            let local = hub.get_local_forge(&org).await;
+
+            // Get existing repo
+            let mut repo = match local.get_repo(&org, &name).await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to get repo: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Update fields
+            if let Some(desc) = description {
+                repo.description = Some(desc);
+            }
+
+            if let Some(vis) = visibility {
+                repo.visibility = match vis.to_lowercase().as_str() {
+                    "public" => Visibility::Public,
+                    "private" => Visibility::Private,
+                    _ => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Invalid visibility: {}. Must be public or private", vis),
+                        };
+                        return;
+                    }
+                };
+            }
+
+            match local.update_repo(&org, &repo).await {
+                Ok(_) => {
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save repos.yaml: {}", e),
+                        };
+                        return;
+                    }
+
+                    yield HyperforgeEvent::Info {
+                        message: format!("Updated repository: {}", repo.name),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to update repo: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Delete a repository
+    #[hub_method(
+        description = "Delete a repository from local configuration",
+        params(
+            org = "Organization name",
+            name = "Repository name"
+        )
+    )]
+    pub async fn repos_delete(
+        &self,
+        org: String,
+        name: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+
+        stream! {
+            let local = hub.get_local_forge(&org).await;
+
+            match local.delete_repo(&org, &name).await {
+                Ok(_) => {
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save repos.yaml: {}", e),
+                        };
+                        return;
+                    }
+
+                    yield HyperforgeEvent::Info {
+                        message: format!("Deleted repository: {}", name),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to delete repo: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Import repositories from a remote forge
+    #[hub_method(
+        description = "Import repository configurations from a remote forge (GitHub, Codeberg, GitLab)",
+        params(
+            org = "Organization name",
+            forge = "Source forge: github, codeberg, or gitlab"
+        )
+    )]
+    pub async fn repos_import(
+        &self,
+        org: String,
+        forge: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+
+        stream! {
+            // Parse forge
+            let source_forge = match forge.to_lowercase().as_str() {
+                "github" => Forge::GitHub,
+                "codeberg" => Forge::Codeberg,
+                "gitlab" => Forge::GitLab,
+                _ => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                    };
+                    return;
+                }
+            };
+
+            // Get forge adapter
+            let auth = Arc::new(KeychainAuthProvider::new(org.clone()));
+            let adapter: Arc<dyn ForgePort> = match source_forge {
+                Forge::GitHub => {
+                    match GitHubAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create GitHub adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Forge::Codeberg => {
+                    match CodebergAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create Codeberg adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Forge::GitLab => {
+                    match GitLabAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create GitLab adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!("Fetching repositories from {} for {}...", forge, org),
+            };
+
+            // List repos from remote forge
+            let repos = match adapter.list_repos(&org).await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to list repos from {}: {}", forge, e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!("Found {} repositories", repos.len()),
+            };
+
+            // Get local forge
+            let local = hub.get_local_forge(&org).await;
+
+            // Import each repo
+            let mut imported = 0;
+            let mut skipped = 0;
+            let mut errors = 0;
+
+            for repo in repos {
+                // Check if already exists
+                let exists = match local.repo_exists(&org, &repo.name).await {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        errors += 1;
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to check if {} exists: {}", repo.name, e),
+                        };
+                        continue;
+                    }
+                };
+
+                if exists {
+                    skipped += 1;
+                    continue;
+                }
+
+                // Create in local forge
+                match local.create_repo(&org, &repo).await {
+                    Ok(_) => {
+                        imported += 1;
+                        yield HyperforgeEvent::Repo {
+                            name: repo.name.clone(),
+                            description: repo.description.clone(),
+                            visibility: format!("{:?}", repo.visibility).to_lowercase(),
+                            origin: format!("{:?}", repo.origin).to_lowercase(),
+                            mirrors: repo.mirrors.iter()
+                                .map(|f| format!("{:?}", f).to_lowercase())
+                                .collect(),
+                            protected: repo.protected,
+                        };
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to import {}: {}", repo.name, e),
+                        };
+                    }
+                }
+            }
+
+            // Save to YAML
+            if let Err(e) = local.save_to_yaml().await {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to save repos.yaml: {}", e),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Import complete: {} imported, {} skipped (already exist), {} errors",
+                    imported, skipped, errors
+                ),
+            };
+        }
+    }
+
+    /// Compute sync diff between local and a remote forge
+    #[hub_method(
+        description = "Compute diff between local configuration and a remote forge",
+        params(
+            org = "Organization name",
+            forge = "Target forge: github, codeberg, or gitlab"
+        )
+    )]
+    pub async fn workspace_diff(
+        &self,
+        org: String,
+        forge: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+        let sync_service = self.sync_service.clone();
+
+        stream! {
+            // Parse forge
+            let target_forge = match forge.to_lowercase().as_str() {
+                "github" => Forge::GitHub,
+                "codeberg" => Forge::Codeberg,
+                "gitlab" => Forge::GitLab,
+                _ => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                    };
+                    return;
+                }
+            };
+
+            // Get forge adapter
+            let auth = Arc::new(KeychainAuthProvider::new(org.clone()));
+            let adapter: Arc<dyn ForgePort> = match target_forge {
+                Forge::GitHub => {
+                    match GitHubAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create GitHub adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Forge::Codeberg => {
+                    match CodebergAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create Codeberg adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Forge::GitLab => {
+                    match GitLabAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create GitLab adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Get local forge
+            let local = hub.get_local_forge(&org).await;
+
+            yield HyperforgeEvent::Info {
+                message: format!("Computing diff with {}...", forge),
+            };
+
+            // Compute diff
+            match sync_service.diff(local, adapter, &org).await {
+                Ok(diff) => {
+                    // Yield summary
+                    yield HyperforgeEvent::SyncSummary {
+                        forge: forge.clone(),
+                        total: diff.ops.len(),
+                        to_create: diff.to_create().len(),
+                        to_update: diff.to_update().len(),
+                        to_delete: diff.to_delete().len(),
+                        in_sync: diff.in_sync().len(),
+                    };
+
+                    // Yield individual operations
+                    for op in diff.ops {
+                        yield HyperforgeEvent::SyncOp {
+                            repo_name: op.repo.name.clone(),
+                            operation: format!("{:?}", op.op).to_lowercase(),
+                            forge: forge.clone(),
+                        };
+                    }
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Diff failed: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Sync local configuration to a remote forge
+    #[hub_method(
+        description = "Sync repositories from local configuration to a remote forge",
+        params(
+            org = "Organization name",
+            forge = "Target forge: github, codeberg, or gitlab",
+            dry_run = "Preview changes without applying them (optional, default: false)"
+        )
+    )]
+    pub async fn workspace_sync(
+        &self,
+        org: String,
+        forge: String,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+        let sync_service = self.sync_service.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            // Parse forge
+            let target_forge = match forge.to_lowercase().as_str() {
+                "github" => Forge::GitHub,
+                "codeberg" => Forge::Codeberg,
+                "gitlab" => Forge::GitLab,
+                _ => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                    };
+                    return;
+                }
+            };
+
+            // Get forge adapter
+            let auth = Arc::new(KeychainAuthProvider::new(org.clone()));
+            let adapter: Arc<dyn ForgePort> = match target_forge {
+                Forge::GitHub => {
+                    match GitHubAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create GitHub adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Forge::Codeberg => {
+                    match CodebergAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create Codeberg adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Forge::GitLab => {
+                    match GitLabAdapter::new(auth) {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Failed to create GitLab adapter: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Get local forge
+            let local = hub.get_local_forge(&org).await;
+
+            if is_dry_run {
+                yield HyperforgeEvent::Info {
+                    message: format!("[DRY RUN] Computing sync operations for {}...", forge),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("Syncing to {}...", forge),
+                };
+            }
+
+            // Execute sync
+            match sync_service.sync(local, adapter, &org, is_dry_run).await {
+                Ok(diff) => {
+                    let created = diff.to_create().len();
+                    let updated = diff.to_update().len();
+                    let deleted = diff.to_delete().len();
+                    let in_sync = diff.in_sync().len();
+
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "{} sync complete: {} created, {} updated, {} deleted, {} in sync",
+                            if is_dry_run { "[DRY RUN]" } else { "" },
+                            created,
+                            updated,
+                            deleted,
+                            in_sync
+                        ),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Sync failed: {}", e),
                     };
                 }
             }
