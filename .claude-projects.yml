@@ -1,7 +1,9 @@
 version: "1"
 projects:
-  hyperforge-lforge2:
-    path: ./
+  hyperforge:
+    path: ../hyperforge
+    branch: feat/lforge2-redesign
+    main: true
   hub-core:
     path: ../hub-core
   hub-macro:
