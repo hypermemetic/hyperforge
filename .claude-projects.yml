@@ -1,0 +1,10 @@
+version: "1"
+projects:
+  hyperforge-lforge2:
+    path: ./
+  hub-core:
+    path: ../hub-core
+  hub-macro:
+    path: ../hub-macro
+  hub-transport:
+    path: ../hub-transport
