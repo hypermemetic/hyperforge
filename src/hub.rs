@@ -4,7 +4,9 @@ use async_stream::stream;
 use futures::Stream;
 use hub_macro::hub_methods;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use crate::adapters::{ForgePort, LocalForge};
 use crate::services::SymmetricSyncService;
@@ -23,6 +25,15 @@ pub enum HyperforgeEvent {
     Info { message: String },
     /// Error message
     Error { message: String },
+    /// Repository information
+    Repo {
+        name: String,
+        description: Option<String>,
+        visibility: String,
+        origin: String,
+        mirrors: Vec<String>,
+        protected: bool,
+    },
     /// Sync diff result - repo operation
     SyncOp {
         repo_name: String,
@@ -44,14 +55,51 @@ pub enum HyperforgeEvent {
 #[derive(Clone)]
 pub struct HyperforgeHub {
     sync_service: Arc<SymmetricSyncService>,
+    /// Cached LocalForge instances per org
+    local_forges: Arc<RwLock<HashMap<String, Arc<LocalForge>>>>,
+    /// Base config directory
+    config_dir: PathBuf,
 }
 
 impl HyperforgeHub {
     /// Create a new HyperforgeHub instance
     pub fn new() -> Self {
+        let config_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config")
+            .join("hyperforge");
+
         Self {
             sync_service: Arc::new(SymmetricSyncService::new()),
+            local_forges: Arc::new(RwLock::new(HashMap::new())),
+            config_dir,
         }
+    }
+
+    /// Get or create LocalForge for an org with file persistence
+    async fn get_local_forge(&self, org: &str) -> Arc<LocalForge> {
+        // Try to get existing
+        {
+            let forges = self.local_forges.read().unwrap();
+            if let Some(forge) = forges.get(org) {
+                return forge.clone();
+            }
+        }
+
+        // Create new with persistence
+        let yaml_path = self.config_dir.join("orgs").join(org).join("repos.yaml");
+        let forge = Arc::new(LocalForge::with_config_path(org, yaml_path));
+
+        // Try to load existing state
+        let _ = forge.load_from_yaml().await;
+
+        // Cache it
+        {
+            let mut forges = self.local_forges.write().unwrap();
+            forges.insert(org.to_string(), forge.clone());
+        }
+
+        forge
     }
 }
 
@@ -147,6 +195,152 @@ impl HyperforgeHub {
                 Err(e) => {
                     yield HyperforgeEvent::Error {
                         message: format!("Diff failed: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// List repositories for an organization (from LocalForge)
+    #[hub_method(
+        description = "List all repositories in the local forge for an organization",
+        params(org = "Organization name")
+    )]
+    pub async fn repos_list(
+        &self,
+        org: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+
+        stream! {
+            let local = hub.get_local_forge(&org).await;
+
+            match local.list_repos(&org).await {
+                Ok(repos) => {
+                    for repo in repos {
+                        yield HyperforgeEvent::Repo {
+                            name: repo.name.clone(),
+                            description: repo.description.clone(),
+                            visibility: format!("{:?}", repo.visibility).to_lowercase(),
+                            origin: format!("{:?}", repo.origin).to_lowercase(),
+                            mirrors: repo.mirrors.iter()
+                                .map(|f| format!("{:?}", f).to_lowercase())
+                                .collect(),
+                            protected: repo.protected,
+                        };
+                    }
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to list repos: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Create a new repository in LocalForge
+    #[hub_method(
+        description = "Create a new repository configuration",
+        params(
+            org = "Organization name",
+            name = "Repository name",
+            description = "Repository description (optional)",
+            visibility = "Repository visibility: public or private",
+            origin = "Origin forge: github, codeberg, or gitlab",
+            mirrors = "Mirror forges (optional, comma-separated)"
+        )
+    )]
+    pub async fn repos_create(
+        &self,
+        org: String,
+        name: String,
+        description: Option<String>,
+        visibility: String,
+        origin: String,
+        mirrors: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+
+        stream! {
+            // Parse forge from string
+            let origin_forge = match origin.to_lowercase().as_str() {
+                "github" => Forge::GitHub,
+                "codeberg" => Forge::Codeberg,
+                "gitlab" => Forge::GitLab,
+                _ => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid origin forge: {}. Must be github, codeberg, or gitlab", origin),
+                    };
+                    return;
+                }
+            };
+
+            // Parse visibility
+            let vis = match visibility.to_lowercase().as_str() {
+                "public" => Visibility::Public,
+                "private" => Visibility::Private,
+                _ => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid visibility: {}. Must be public or private", visibility),
+                    };
+                    return;
+                }
+            };
+
+            // Parse mirrors
+            let mirror_forges: Vec<Forge> = if let Some(m) = mirrors {
+                m.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| match s.to_lowercase().as_str() {
+                        "github" => Some(Forge::GitHub),
+                        "codeberg" => Some(Forge::Codeberg),
+                        "gitlab" => Some(Forge::GitLab),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Build repo
+            let mut repo = Repo::new(name, origin_forge).with_visibility(vis);
+            if let Some(desc) = description {
+                repo = repo.with_description(desc);
+            }
+            repo = repo.with_mirrors(mirror_forges);
+
+            // Get or create LocalForge with persistence
+            let local = hub.get_local_forge(&org).await;
+
+            match local.create_repo(&org, &repo).await {
+                Ok(_) => {
+                    // Save to YAML
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save repos.yaml: {}", e),
+                        };
+                        return;
+                    }
+
+                    yield HyperforgeEvent::Info {
+                        message: format!("Created repository: {}", repo.name),
+                    };
+                    yield HyperforgeEvent::Repo {
+                        name: repo.name.clone(),
+                        description: repo.description.clone(),
+                        visibility: format!("{:?}", repo.visibility).to_lowercase(),
+                        origin: format!("{:?}", repo.origin).to_lowercase(),
+                        mirrors: repo.mirrors.iter()
+                            .map(|f| format!("{:?}", f).to_lowercase())
+                            .collect(),
+                        protected: repo.protected,
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create repo: {}", e),
                     };
                 }
             }
