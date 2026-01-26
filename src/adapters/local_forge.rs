@@ -114,14 +114,18 @@ impl LocalForge {
         let path = self.config_path.as_ref()
             .ok_or_else(|| ForgeError::ApiError("No config path set".to_string()))?;
 
-        let repos = self.repos.read().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        // Clone data while holding lock, then release before async operations
+        let yaml_repos = {
+            let repos = self.repos.read().map_err(|e| {
+                ForgeError::ApiError(format!("Lock poisoned: {}", e))
+            })?;
 
-        let mut yaml_repos = HashMap::new();
-        for (name, repo) in repos.iter() {
-            yaml_repos.insert(name.clone(), repo.clone());
-        }
+            let mut map = HashMap::new();
+            for (name, repo) in repos.iter() {
+                map.insert(name.clone(), repo.clone());
+            }
+            map
+        }; // Lock is dropped here
 
         let config = ReposYaml {
             repos: yaml_repos,

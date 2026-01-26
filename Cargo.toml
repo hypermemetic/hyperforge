@@ -56,5 +56,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Utilities
+dirs = "5"
+
 [dev-dependencies]
 tempfile = "3"
