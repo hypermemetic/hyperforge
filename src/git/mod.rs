@@ -87,6 +87,21 @@ impl Git {
         Ok(())
     }
 
+    /// Clone a git repository
+    pub fn clone(url: &str, target_path: &str) -> GitResult<()> {
+        let output = Command::new("git")
+            .args(["clone", url, target_path])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// List all remotes with their URLs
     pub fn list_remotes(path: &Path) -> GitResult<Vec<RemoteInfo>> {
         Self::ensure_repo(path)?;
