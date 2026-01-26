@@ -206,12 +206,12 @@ impl SymmetricSyncService {
 
     /// Sync repos with origin-first logic
     ///
-    /// For each repo in source:
-    /// 1. Ensure it exists on its origin forge
-    /// 2. Mirror to configured mirror forges
+    /// For each forge, syncs only the repos that belong on that forge:
+    /// - Repos where origin == forge
+    /// - Repos where mirrors includes forge
     ///
-    /// This is used for workspace sync where we have a LocalForge and want to
-    /// push to multiple remote forges based on each repo's origin/mirrors config.
+    /// This respects the origin/mirror configuration and prevents syncing
+    /// all repos to all forges.
     pub async fn sync_with_origins(
         &self,
         source: Arc<dyn ForgePort>,
@@ -219,29 +219,48 @@ impl SymmetricSyncService {
         org: &str,
         dry_run: bool,
     ) -> ForgeResult<Vec<SyncDiff>> {
-        let repos = source.list_repos(org).await?;
+        use crate::adapters::LocalForge;
+        use crate::types::Forge;
+
+        let all_repos = source.list_repos(org).await?;
         let mut diffs = Vec::new();
 
-        for repo in repos {
-            // Sync to origin first
-            let origin_name = format!("{:?}", repo.origin).to_lowercase();
-            if let Some(origin_forge) = forges.get(&origin_name) {
-                let diff = self
-                    .sync(source.clone(), origin_forge.clone(), org, dry_run)
-                    .await?;
-                diffs.push(diff);
+        // For each forge, filter repos that belong on it
+        for (forge_name, forge_adapter) in forges {
+            let forge_type = match forge_name.to_lowercase().as_str() {
+                "github" => Forge::GitHub,
+                "codeberg" => Forge::Codeberg,
+                "gitlab" => Forge::GitLab,
+                _ => continue, // Skip unknown forges
+            };
+
+            // Filter repos that should be on this forge
+            let repos_for_forge: Vec<_> = all_repos
+                .iter()
+                .filter(|r| {
+                    r.origin == forge_type || r.mirrors.contains(&forge_type)
+                })
+                .cloned()
+                .collect();
+
+            if repos_for_forge.is_empty() {
+                continue; // No repos for this forge
             }
 
-            // Then sync to mirrors
-            for mirror in &repo.mirrors {
-                let mirror_name = format!("{:?}", mirror).to_lowercase();
-                if let Some(mirror_forge) = forges.get(&mirror_name) {
-                    let diff = self
-                        .sync(source.clone(), mirror_forge.clone(), org, dry_run)
-                        .await?;
-                    diffs.push(diff);
+            // Create temporary LocalForge with only these repos
+            let filtered_local = Arc::new(LocalForge::new(org));
+            for repo in repos_for_forge {
+                if let Err(e) = filtered_local.create_repo(org, &repo).await {
+                    // Log error but continue with other repos
+                    eprintln!("Failed to add repo {} to filtered forge: {}", repo.name, e);
                 }
             }
+
+            // Sync filtered repos to this forge
+            let diff = self
+                .sync(filtered_local, forge_adapter, org, dry_run)
+                .await?;
+            diffs.push(diff);
         }
 
         Ok(diffs)
@@ -413,5 +432,121 @@ mod tests {
         let repo1 = Repo::new("test", Forge::GitHub).with_description("Same");
         let repo2 = Repo::new("test", Forge::GitHub).with_description("Same");
         assert!(!repos_differ(&repo1, &repo2));
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_origins_filters_by_forge() {
+        let service = SymmetricSyncService::new();
+
+        // Create source with 3 repos:
+        // - repo1: origin=github, no mirrors
+        // - repo2: origin=codeberg, no mirrors
+        // - repo3: origin=github, mirrors=[codeberg]
+        let source = Arc::new(LocalForge::new("testorg"));
+
+        let repo1 = Repo::new("github-only", Forge::GitHub);
+        let repo2 = Repo::new("codeberg-only", Forge::Codeberg);
+        let repo3 = Repo::new("github-mirrored", Forge::GitHub)
+            .with_mirror(Forge::Codeberg);
+
+        source.create_repo("testorg", &repo1).await.unwrap();
+        source.create_repo("testorg", &repo2).await.unwrap();
+        source.create_repo("testorg", &repo3).await.unwrap();
+
+        // Create target forges
+        let github_target = Arc::new(LocalForge::new("testorg"));
+        let codeberg_target = Arc::new(LocalForge::new("testorg"));
+
+        let mut forges: std::collections::HashMap<String, Arc<dyn ForgePort>> = std::collections::HashMap::new();
+        forges.insert("github".to_string(), github_target.clone());
+        forges.insert("codeberg".to_string(), codeberg_target.clone());
+
+        // Sync with origins
+        let diffs = service
+            .sync_with_origins(source, forges, "testorg", false)
+            .await
+            .unwrap();
+
+        // Should have 2 diffs (one per forge)
+        assert_eq!(diffs.len(), 2);
+
+        // GitHub should have repo1 and repo3
+        let github_repos = github_target.list_repos("testorg").await.unwrap();
+        assert_eq!(github_repos.len(), 2);
+        let github_names: Vec<_> = github_repos.iter().map(|r| r.name.as_str()).collect();
+        assert!(github_names.contains(&"github-only"));
+        assert!(github_names.contains(&"github-mirrored"));
+
+        // Codeberg should have repo2 and repo3
+        let codeberg_repos = codeberg_target.list_repos("testorg").await.unwrap();
+        assert_eq!(codeberg_repos.len(), 2);
+        let codeberg_names: Vec<_> = codeberg_repos.iter().map(|r| r.name.as_str()).collect();
+        assert!(codeberg_names.contains(&"codeberg-only"));
+        assert!(codeberg_names.contains(&"github-mirrored"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_origins_respects_mirrors() {
+        let service = SymmetricSyncService::new();
+
+        // Repo with origin=github, mirrors=[codeberg, gitlab]
+        let source = Arc::new(LocalForge::new("testorg"));
+        let repo = Repo::new("multi-mirror", Forge::GitHub)
+            .with_mirrors(vec![Forge::Codeberg, Forge::GitLab]);
+        source.create_repo("testorg", &repo).await.unwrap();
+
+        let github_target = Arc::new(LocalForge::new("testorg"));
+        let codeberg_target = Arc::new(LocalForge::new("testorg"));
+        let gitlab_target = Arc::new(LocalForge::new("testorg"));
+
+        let mut forges: std::collections::HashMap<String, Arc<dyn ForgePort>> = std::collections::HashMap::new();
+        forges.insert("github".to_string(), github_target.clone());
+        forges.insert("codeberg".to_string(), codeberg_target.clone());
+        forges.insert("gitlab".to_string(), gitlab_target.clone());
+
+        service
+            .sync_with_origins(source, forges, "testorg", false)
+            .await
+            .unwrap();
+
+        // Repo should exist on all three forges
+        assert_eq!(github_target.list_repos("testorg").await.unwrap().len(), 1);
+        assert_eq!(codeberg_target.list_repos("testorg").await.unwrap().len(), 1);
+        assert_eq!(gitlab_target.list_repos("testorg").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_origins_no_cross_contamination() {
+        let service = SymmetricSyncService::new();
+
+        // Two repos with different origins, no mirroring
+        let source = Arc::new(LocalForge::new("testorg"));
+        let repo1 = Repo::new("github-repo", Forge::GitHub);
+        let repo2 = Repo::new("codeberg-repo", Forge::Codeberg);
+
+        source.create_repo("testorg", &repo1).await.unwrap();
+        source.create_repo("testorg", &repo2).await.unwrap();
+
+        let github_target = Arc::new(LocalForge::new("testorg"));
+        let codeberg_target = Arc::new(LocalForge::new("testorg"));
+
+        let mut forges: std::collections::HashMap<String, Arc<dyn ForgePort>> = std::collections::HashMap::new();
+        forges.insert("github".to_string(), github_target.clone());
+        forges.insert("codeberg".to_string(), codeberg_target.clone());
+
+        service
+            .sync_with_origins(source, forges, "testorg", false)
+            .await
+            .unwrap();
+
+        // GitHub should ONLY have github-repo
+        let github_repos = github_target.list_repos("testorg").await.unwrap();
+        assert_eq!(github_repos.len(), 1);
+        assert_eq!(github_repos[0].name, "github-repo");
+
+        // Codeberg should ONLY have codeberg-repo
+        let codeberg_repos = codeberg_target.list_repos("testorg").await.unwrap();
+        assert_eq!(codeberg_repos.len(), 1);
+        assert_eq!(codeberg_repos[0].name, "codeberg-repo");
     }
 }
