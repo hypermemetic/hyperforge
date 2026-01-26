@@ -41,26 +41,76 @@ if ! "$CLAUDE_CONTAINER" --git-session "$SESSION_NAME" --no-run; then
     exit 1
 fi
 
-# Step 2: Copy current session transcript into the container's state volume
+# Step 2: Start container briefly to create volumes, then copy session data
 if [[ -f "$CURRENT_SESSION_DIR/$CURRENT_SESSION_ID.jsonl" ]]; then
     echo ""
-    echo "Step 2: Importing current session transcript..."
+    echo "Step 2: Creating state volume and importing session..."
 
-    # Create the projects directory structure in the container state
-    # The container expects: /home/developer/.claude/projects/<project-path>/
-    CONTAINER_PROJECT_DIR="/home/developer/.claude/projects/-workspace-hyperforge-lforge2"
+    # Container paths
+    CONTAINER_PROJECT_DIR="/home/developer/.claude/projects/-workspace-hyperforge"
+    CONTAINER_TRANSCRIPT="$CONTAINER_PROJECT_DIR/$CURRENT_SESSION_ID.jsonl"
+
+    # Create state volume and project directory
+    echo "  Creating state volume..."
+    docker run --rm \
+        -v "claude-state-${SESSION_NAME}:/home/developer/.claude" \
+        ghcr.io/hypermemetic/claude-container:latest \
+        mkdir -p "$CONTAINER_PROJECT_DIR" 2>/dev/null || true
 
     # Copy the session transcript
     echo "  Copying transcript: $CURRENT_SESSION_ID.jsonl"
-    "$CLAUDE_CONTAINER_CP" "$CURRENT_SESSION_DIR/$CURRENT_SESSION_ID.jsonl" \
-        "$SESSION_NAME:/home/developer/.claude/projects/-workspace-hyperforge-lforge2/$CURRENT_SESSION_ID.jsonl"
-
-    # Copy sessions-index.json if it exists
-    if [[ -f "$CURRENT_SESSION_DIR/sessions-index.json" ]]; then
-        echo "  Copying sessions-index.json"
-        "$CLAUDE_CONTAINER_CP" "$CURRENT_SESSION_DIR/sessions-index.json" \
-            "$SESSION_NAME:/home/developer/.claude/projects/-workspace-hyperforge-lforge2/sessions-index.json"
+    if "$CLAUDE_CONTAINER_CP" "$CURRENT_SESSION_DIR/$CURRENT_SESSION_ID.jsonl" \
+        "$SESSION_NAME:$CONTAINER_TRANSCRIPT" 2>/dev/null; then
+        echo "  ✓ Transcript copied"
+    else
+        echo "  ✗ Failed to copy transcript"
     fi
+
+    # Rewrite host paths to container paths in the transcript
+    HOST_PATH="/Users/shmendez/dev/controlflow/hypermemetic/hyperforge-lforge2"
+    CONTAINER_PATH="/workspace/hyperforge"
+    echo "  Rewriting paths: $HOST_PATH -> $CONTAINER_PATH"
+    docker run --rm \
+        -v "claude-state-${SESSION_NAME}:/home/developer/.claude" \
+        ghcr.io/hypermemetic/claude-container:latest \
+        sed -i "s|$HOST_PATH|$CONTAINER_PATH|g" "$CONTAINER_TRANSCRIPT" 2>/dev/null && \
+        echo "  ✓ Paths rewritten" || echo "  ✗ Failed to rewrite paths"
+
+    # Generate sessions-index.json with proper container paths
+    echo "  Generating sessions-index.json..."
+    TEMP_INDEX=$(mktemp)
+    NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+    MTIME=$(date +%s)000
+
+    cat > "$TEMP_INDEX" << EOF
+{
+  "version": 1,
+  "entries": [
+    {
+      "sessionId": "$CURRENT_SESSION_ID",
+      "fullPath": "$CONTAINER_TRANSCRIPT",
+      "fileMtime": $MTIME,
+      "firstPrompt": "Imported session from host",
+      "summary": "Hyperforge LFORGE2 Development Session",
+      "messageCount": 100,
+      "created": "$NOW",
+      "modified": "$NOW",
+      "gitBranch": "feat/lforge2-redesign",
+      "projectPath": "/workspace/hyperforge",
+      "isSidechain": false
+    }
+  ],
+  "originalPath": "/workspace/hyperforge"
+}
+EOF
+
+    if "$CLAUDE_CONTAINER_CP" "$TEMP_INDEX" \
+        "$SESSION_NAME:$CONTAINER_PROJECT_DIR/sessions-index.json" 2>/dev/null; then
+        echo "  ✓ sessions-index.json created"
+    else
+        echo "  ✗ Failed to create sessions-index.json"
+    fi
+    rm -f "$TEMP_INDEX"
 
     echo "  Session data imported!"
 else
@@ -78,7 +128,7 @@ echo "Or without continuing previous conversation:"
 echo "  $CLAUDE_CONTAINER --git-session $SESSION_NAME"
 echo ""
 echo "Inside container, workspace layout:"
-echo "  /workspace/hyperforge-lforge2/  (main project)"
+echo "  /workspace/hyperforge/          (main project, on feat/lforge2-redesign branch)"
 echo "  /workspace/hub-core/            (dependency)"
 echo "  /workspace/hub-macro/           (dependency)"
 echo "  /workspace/hub-transport/       (dependency)"
