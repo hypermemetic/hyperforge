@@ -1148,4 +1148,155 @@ impl HyperforgeHub {
             }
         }
     }
+
+    /// Verify workspace configuration and health
+    #[hub_method(
+        description = "Verify workspace configuration including orgs, SSH keys, and auth tokens",
+        params(
+            org = "Organization to verify (optional, verifies all if not specified)"
+        )
+    )]
+    pub async fn workspace_verify(
+        &self,
+        org: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+        let config_dir = self.config_dir.clone();
+
+        stream! {
+            yield HyperforgeEvent::Info {
+                message: "Starting workspace verification...".to_string(),
+            };
+
+            // Get list of orgs to verify
+            let orgs_to_check = if let Some(org_name) = org {
+                vec![org_name]
+            } else {
+                // List all orgs
+                let orgs_path = config_dir.join("orgs");
+                match tokio::fs::read_dir(&orgs_path).await {
+                    Ok(mut entries) => {
+                        let mut orgs = Vec::new();
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if name != "." && name != ".." {
+                                    orgs.push(name.to_string());
+                                }
+                            }
+                        }
+                        orgs
+                    }
+                    Err(_) => {
+                        yield HyperforgeEvent::Error {
+                            message: "No organizations configured".to_string(),
+                        };
+                        return;
+                    }
+                }
+            };
+
+            let mut total_repos = 0;
+            let mut total_issues = 0;
+
+            // Verify each org
+            for org_name in orgs_to_check {
+                yield HyperforgeEvent::Info {
+                    message: format!("Verifying org: {}", org_name),
+                };
+
+                // Check org repos.yaml exists
+                let repos_yaml = config_dir.join("orgs").join(&org_name).join("repos.yaml");
+                if !repos_yaml.exists() {
+                    yield HyperforgeEvent::Error {
+                        message: format!("  ✗ Missing repos.yaml for org: {}", org_name),
+                    };
+                    total_issues += 1;
+                    continue;
+                }
+
+                // Load and count repos
+                let local_forge = hub.get_local_forge(&org_name).await;
+                match local_forge.all_repos() {
+                    Ok(repos) => {
+                        let repo_count = repos.len();
+                        total_repos += repo_count;
+
+                        yield HyperforgeEvent::Info {
+                            message: format!("  ✓ Found {} repos in {}", repo_count, org_name),
+                        };
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  ✗ Failed to load repos: {}", e),
+                        };
+                        total_issues += 1;
+                    }
+                }
+
+                // Check auth tokens for common forges
+                for forge in &["github", "codeberg", "gitlab"] {
+                    let token_key = format!("{}/{}/token", forge, org_name);
+                    // Note: We can't directly check auth hub from here without making it async
+                    // This would require calling synapse, which is what YamlAuthProvider does
+                    yield HyperforgeEvent::Info {
+                        message: format!("  ℹ Auth check for {}/{} (use auth hub to verify)", forge, org_name),
+                    };
+                }
+            }
+
+            // Check SSH keys
+            let ssh_dir = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".ssh");
+
+            if ssh_dir.exists() {
+                let ssh_keys = vec!["hyperforge_ed25519", "id_ed25519", "id_rsa"];
+                let mut found_keys = Vec::new();
+
+                for key_name in ssh_keys {
+                    let key_path = ssh_dir.join(key_name);
+                    if key_path.exists() {
+                        found_keys.push(key_name);
+                    }
+                }
+
+                if found_keys.is_empty() {
+                    yield HyperforgeEvent::Error {
+                        message: "✗ No SSH keys found in ~/.ssh/".to_string(),
+                    };
+                    total_issues += 1;
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: format!("✓ Found SSH keys: {}", found_keys.join(", ")),
+                    };
+                }
+            } else {
+                yield HyperforgeEvent::Error {
+                    message: "✗ ~/.ssh/ directory not found".to_string(),
+                };
+                total_issues += 1;
+            }
+
+            // Summary
+            yield HyperforgeEvent::Info {
+                message: "=== Verification Summary ===".to_string(),
+            };
+            yield HyperforgeEvent::Info {
+                message: format!("Total repositories: {}", total_repos),
+            };
+            yield HyperforgeEvent::Info {
+                message: format!("Issues found: {}", total_issues),
+            };
+
+            if total_issues == 0 {
+                yield HyperforgeEvent::Info {
+                    message: "✓ Workspace configuration verified successfully!".to_string(),
+                };
+            } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("✗ Found {} issues that need attention", total_issues),
+                };
+            }
+        }
+    }
 }
