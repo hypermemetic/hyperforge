@@ -50,13 +50,14 @@ async fn main() -> anyhow::Result<()> {
     info!("Auth hub initialized");
 
     // Create auth hub with unique namespace
+    // Note: Using "secrets" as DynamicHub namespace to avoid confusion with "auth" activation
     let auth = Arc::new(
-        DynamicHub::new("auth")
+        DynamicHub::new("secrets")
             .register(auth_hub)
     );
 
     info!("Auth hub started");
-    info!("  Namespace: auth");
+    info!("  Namespace: secrets");
     info!("  Activation: auth");
     info!("  Version: 1.0.0");
     info!("  Description: Simple secret management");
@@ -74,9 +75,9 @@ async fn main() -> anyhow::Result<()> {
     info!("  WebSocket: ws://127.0.0.1:{}", args.port);
     info!("");
     info!("Usage:");
-    info!("  synapse -P {} auth auth set_secret --path <PATH> --value <VALUE>", args.port);
-    info!("  synapse -P {} auth auth get_secret --path <PATH>", args.port);
-    info!("  synapse -P {} auth auth list_secrets --prefix <PREFIX>", args.port);
+    info!("  synapse -P {} secrets auth set_secret --secret-key <KEY> --value <VALUE>", args.port);
+    info!("  synapse -P {} secrets auth get_secret --secret-key <KEY>", args.port);
+    info!("  synapse -P {} secrets auth list_secrets --prefix <PREFIX>", args.port);
     info!("");
 
     // Start the transport server

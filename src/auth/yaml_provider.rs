@@ -50,15 +50,15 @@ impl YamlAuthProvider {
 impl AuthProvider for YamlAuthProvider {
     async fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
         // Call auth hub via synapse (uses PATH to find synapse binary)
-        // synapse -P 4445 auth auth get_secret --path <key> --raw
+        // synapse -P 4445 secrets auth get_secret --secret_key <key> --raw
         let output = Command::new("synapse")
             .args(&[
                 "-P",
                 &self.auth_port.to_string(),
-                "auth",
+                "secrets",
                 "auth",
                 "get_secret",
-                "--path",
+                "--secret_key",
                 key,
                 "--raw",
             ])

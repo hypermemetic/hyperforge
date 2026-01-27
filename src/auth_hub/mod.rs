@@ -81,17 +81,17 @@ impl AuthHub {
     #[hub_method(
         description = "Get a secret by path",
         params(
-            path = "Secret path (e.g., 'github/alice/token')"
+            secret_key = "Secret key (e.g., 'github/alice/token')"
         )
     )]
     pub async fn get_secret(
         &self,
-        path: String,
+        secret_key: String,
     ) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let storage = self.storage.clone();
 
         stream! {
-            let secret_path = SecretPath::new(path);
+            let secret_path = SecretPath::new(secret_key);
 
             match storage.get(&secret_path) {
                 Ok(secret) => {
@@ -115,24 +115,24 @@ impl AuthHub {
     #[hub_method(
         description = "Set a secret value",
         params(
-            path = "Secret path (e.g., 'github/alice/token')",
+            secret_key = "Secret key (e.g., 'github/alice/token')",
             value = "Secret value"
         )
     )]
     pub async fn set_secret(
         &self,
-        path: String,
+        secret_key: String,
         value: String,
     ) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let storage = self.storage.clone();
 
         stream! {
-            let secret = Secret::new(path.clone(), value);
+            let secret = Secret::new(secret_key.clone(), value);
 
             match storage.set(secret).await {
                 Ok(_) => {
                     yield AuthEvent::Success {
-                        message: format!("Secret set: {}", path),
+                        message: format!("Secret set: {}", secret_key),
                     };
                 }
                 Err(e) => {
@@ -181,22 +181,22 @@ impl AuthHub {
     #[hub_method(
         description = "Delete a secret",
         params(
-            path = "Secret path to delete"
+            secret_key = "Secret key to delete"
         )
     )]
     pub async fn delete_secret(
         &self,
-        path: String,
+        secret_key: String,
     ) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let storage = self.storage.clone();
 
         stream! {
-            let secret_path = SecretPath::new(path.clone());
+            let secret_path = SecretPath::new(secret_key.clone());
 
             match storage.delete(&secret_path).await {
                 Ok(_) => {
                     yield AuthEvent::Success {
-                        message: format!("Secret deleted: {}", path),
+                        message: format!("Secret deleted: {}", secret_key),
                     };
                 }
                 Err(e) => {

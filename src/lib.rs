@@ -20,6 +20,7 @@ pub use hub_core::serde_helpers;
 
 // Re-exports for convenience
 pub use adapters::{ForgePort, LocalForge};
+pub use auth_hub::{AuthEvent, AuthHub};
 pub use config::HyperforgeConfig;
 pub use hub::{HyperforgeEvent, HyperforgeHub};
 pub use services::{SymmetricSyncService, SyncDiff, SyncOp};
