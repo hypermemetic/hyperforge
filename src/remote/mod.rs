@@ -7,13 +7,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::adapters::{ForgePort, GitHubAdapter, CodebergAdapter, GitLabAdapter};
-use crate::auth::KeychainAuthProvider;
+use crate::auth::YamlAuthProvider;
 use crate::types::{Forge, Repo};
 use crate::git::Git;
 
 /// Get forge adapter for a given forge type
 fn get_forge_adapter(forge: &Forge, org: &str) -> Result<Arc<dyn ForgePort>> {
-    let auth = Arc::new(KeychainAuthProvider::new(org.to_string()));
+    let auth = Arc::new(YamlAuthProvider::new()?);
 
     let adapter: Arc<dyn ForgePort> = match forge {
         Forge::GitHub => Arc::new(GitHubAdapter::new(auth)?),

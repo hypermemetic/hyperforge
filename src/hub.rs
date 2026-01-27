@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::adapters::{ForgePort, LocalForge, GitHubAdapter, CodebergAdapter, GitLabAdapter};
-use crate::auth::KeychainAuthProvider;
+use crate::auth::YamlAuthProvider;
 use crate::commands::{init, status, push};
 use crate::services::SymmetricSyncService;
 use crate::types::{Forge, Repo, Visibility};
@@ -492,7 +492,15 @@ impl HyperforgeHub {
             };
 
             // Get forge adapter
-            let auth = Arc::new(KeychainAuthProvider::new(org.clone()));
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
             let adapter: Arc<dyn ForgePort> = match source_forge {
                 Forge::GitHub => {
                     match GitHubAdapter::new(auth) {
@@ -646,7 +654,15 @@ impl HyperforgeHub {
             };
 
             // Get forge adapter
-            let auth = Arc::new(KeychainAuthProvider::new(org.clone()));
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
             let adapter: Arc<dyn ForgePort> = match target_forge {
                 Forge::GitHub => {
                     match GitHubAdapter::new(auth) {
@@ -755,7 +771,15 @@ impl HyperforgeHub {
             };
 
             // Get forge adapter
-            let auth = Arc::new(KeychainAuthProvider::new(org.clone()));
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
             let adapter: Arc<dyn ForgePort> = match target_forge {
                 Forge::GitHub => {
                     match GitHubAdapter::new(auth) {
