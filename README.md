@@ -306,3 +306,5 @@ AGPL-3.0-only
 - **hub-transport**: Transport layer (WebSocket, stdio, MCP HTTP)
 - **hub-macro**: Procedural macros for activation generation
 - **synapse**: CLI client for hub-based systems
+
+<!-- test -->
