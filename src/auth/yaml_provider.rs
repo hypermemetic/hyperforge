@@ -28,7 +28,6 @@ enum AuthEvent {
 /// RPC-based auth provider that calls auth hub via synapse
 pub struct YamlAuthProvider {
     auth_port: u16,
-    synapse_path: String,
 }
 
 impl YamlAuthProvider {
@@ -36,7 +35,6 @@ impl YamlAuthProvider {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             auth_port: 4445,
-            synapse_path: "/workspace/synapse/dist-newstyle/build/aarch64-linux/ghc-9.6.7/hub-synapse-0.2.0.0/x/synapse/build/synapse/synapse".to_string(),
         })
     }
 
@@ -44,7 +42,6 @@ impl YamlAuthProvider {
     pub fn with_port(port: u16) -> anyhow::Result<Self> {
         Ok(Self {
             auth_port: port,
-            synapse_path: "/workspace/synapse/dist-newstyle/build/aarch64-linux/ghc-9.6.7/hub-synapse-0.2.0.0/x/synapse/build/synapse/synapse".to_string(),
         })
     }
 }
@@ -52,9 +49,9 @@ impl YamlAuthProvider {
 #[async_trait]
 impl AuthProvider for YamlAuthProvider {
     async fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
-        // Call auth hub via synapse
+        // Call auth hub via synapse (uses PATH to find synapse binary)
         // synapse -P 4445 auth auth get_secret --path <key> --raw
-        let output = Command::new(&self.synapse_path)
+        let output = Command::new("synapse")
             .args(&[
                 "-P",
                 &self.auth_port.to_string(),
