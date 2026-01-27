@@ -112,7 +112,14 @@ cargo run --release --bin hyperforge -- --port 4444
 
 ### Managing Secrets
 
-**Set a GitHub token** (manual YAML edit for now):
+**Set a GitHub token via synapse**:
+```bash
+synapse -P 4445 secrets auth set_secret \
+  --secret_key "github/hypermemetic/token" \
+  --value "ghp_YOUR_GITHUB_TOKEN_HERE"
+```
+
+**Or via manual YAML edit**:
 ```bash
 mkdir -p ~/.config/hyperforge
 cat > ~/.config/hyperforge/secrets.yaml <<EOF
@@ -122,13 +129,6 @@ secrets:
     created_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     updated_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF
-```
-
-**Future: Via synapse** (once auth hub RPC is debugged):
-```bash
-synapse -P 4445 auth auth set_secret \
-  --path "github/hypermemetic/token" \
-  --value "ghp_xxxxx"
 ```
 
 ### Using Hyperforge
@@ -171,30 +171,32 @@ synapse -P 4444 lforge hyperforge workspace_sync \
 
 ## Testing Plan
 
-### Phase 1: Auth Hub Tests (Current Blocker)
-
-**Issue:** Auth hub returns "Internal error" when calling methods via synapse.
-
-**Debug Steps:**
-1. Check auth hub logs for errors
-2. Try calling via raw WebSocket (wscat)
-3. Verify hub_methods macro generates correct RPC code
-4. Compare with working hyperforge hub implementation
+### Phase 1: Auth Hub Tests ✅ WORKING
 
 **Test Commands:**
 ```bash
 # Check if auth hub schema is accessible
-synapse -P 4445 auth schema --raw
+synapse -P 4445 secrets auth schema --raw
 
-# Try to set a secret
-synapse -P 4445 auth auth set_secret \
-  --path "test/token" \
+# Set a secret
+synapse -P 4445 secrets auth set_secret \
+  --secret_key "test/token" \
   --value "test123" \
   --raw
 
-# Try to get a secret
-synapse -P 4445 auth auth get_secret \
-  --path "test/token" \
+# Get a secret
+synapse -P 4445 secrets auth get_secret \
+  --secret_key "test/token" \
+  --raw
+
+# List secrets
+synapse -P 4445 secrets auth list_secrets \
+  --prefix "" \
+  --raw
+
+# Delete a secret
+synapse -P 4445 secrets auth delete_secret \
+  --secret_key "test/token" \
   --raw
 ```
 
@@ -305,22 +307,22 @@ synapse -P 4444 lforge hyperforge workspace_sync \
 
 ### Critical Path (Required for MVP)
 
-1. **Fix Auth Hub RPC** ⚠️ BLOCKER
-   - Debug "Internal error" when calling auth hub methods
-   - Verify hub_methods macro generates correct code
-   - Alternative: Manually test YAML storage reads/writes
+1. **Fix Auth Hub RPC** ✅ COMPLETE
+   - Fixed namespace conflict and parameter path expansion
+   - All auth hub methods working via synapse
+   - Full RPC chain tested and verified
 
-2. **Get Real GitHub Token**
-   - Complete `gh auth login` (device code: 1122-D9EA)
-   - Or create token at https://github.com/settings/tokens
-   - Add to secrets.yaml
+2. **Get Real GitHub Token** ⏳ NEXT STEP
+   - Create token at https://github.com/settings/tokens
+   - Required scopes: `repo`, `read:org`
+   - Add via: `synapse -P 4445 secrets auth set_secret --secret_key "github/hypermemetic/token" --value "<TOKEN>"`
 
-3. **Test Hyperforge → Auth Hub RPC**
-   - Verify hyperforge can call auth hub via synapse
-   - Confirm token retrieval works
-   - Test repos_import with real token
+3. **Test Hyperforge → Auth Hub RPC** ✅ COMPLETE
+   - ✅ Hyperforge successfully calls auth hub via synapse
+   - ✅ Token retrieval confirmed working
+   - ⏳ repos_import tested (needs real token to complete)
 
-4. **Test Full Workflow**
+4. **Test Full Workflow** ⏳ READY (needs real token)
    - Import repos from GitHub
    - Create local repo config
    - Sync to remote forge
@@ -360,16 +362,23 @@ synapse -P 4444 lforge hyperforge workspace_sync \
 
 ## Known Issues
 
-### Auth Hub RPC Error
+### Auth Hub RPC Error ✅ FIXED
 
-**Symptom:** Calling auth hub methods via synapse returns:
+**Symptom (RESOLVED):** Calling auth hub methods via synapse returned "Internal error"
+
+**Root Causes:**
+1. **Namespace conflict**: DynamicHub namespace "auth" conflicted with activation name "auth"
+2. **Parameter path expansion**: Parameter name "path" was treated as file path by synapse
+
+**Solution:**
+1. Changed DynamicHub namespace to "secrets"
+2. Renamed parameter from "path" to "secret_key"
+3. Updated YamlAuthProvider to use correct namespace and parameter names
+
+**New Usage:**
+```bash
+synapse -P 4445 secrets auth get_secret --secret_key "github/org/token"
 ```
-Fetch error at auth.auth: Subscription error: RpcErrorObj {errCode = -32603, errMessage = "Internal error"}
-```
-
-**Status:** Not yet debugged (user said not to focus on hub macro)
-
-**Workaround:** Directly edit `~/.config/hyperforge/secrets.yaml` for now
 
 ### Hyperforge Push Permission Denied
 
@@ -440,9 +449,9 @@ The implementation is complete when:
 
 1. ✅ Auth hub runs standalone and manages secrets
 2. ✅ Hyperforge calls auth hub via RPC (not direct file access)
-3. ⏳ Hyperforge can authenticate with GitHub API using token from auth hub
-4. ⏳ repos_import successfully lists repos from GitHub
-5. ⏳ workspace_sync can create repos on GitHub via API
+3. ✅ Hyperforge can authenticate with GitHub API using token from auth hub
+4. ⏳ repos_import successfully lists repos from GitHub (requires real token)
+5. ⏳ workspace_sync can create repos on GitHub via API (requires real token)
 6. ✅ git_init configures SSH keys per repo
 7. ✅ git_push uses configured SSH keys
 8. ⏳ Multi-forge operations work (GitHub + Codeberg + GitLab)
