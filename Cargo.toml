@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "hyperforge"
 path = "src/bin/hyperforge.rs"
 
+[[bin]]
+name = "hyperforge-auth"
+path = "src/bin/hyperforge-auth.rs"
+
 [dependencies]
 # Hub framework integration
 hub-core = { path = "../hub-core" }
