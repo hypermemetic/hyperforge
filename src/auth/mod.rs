@@ -1,11 +1,13 @@
 //! Authentication and secret management
 //!
-//! Provides secure access to forge tokens via macOS Keychain.
+//! Provides secure access to forge tokens via macOS Keychain or YAML storage.
 
 pub mod keychain;
+pub mod yaml_provider;
 
 use async_trait::async_trait;
 pub use keychain::KeychainBridge;
+pub use yaml_provider::YamlAuthProvider;
 
 /// Trait for secret providers
 #[async_trait]
