@@ -49,30 +49,33 @@ pub struct CodebergAdapter {
     client: Client,
     auth: Arc<dyn AuthProvider>,
     api_url: String,
+    org: String,
 }
 
 impl CodebergAdapter {
     /// Create a new CodebergAdapter with the given auth provider
-    pub fn new(auth: Arc<dyn AuthProvider>) -> ForgeResult<Self> {
-        Self::with_api_url(auth, CODEBERG_API_URL.to_string())
+    pub fn new(auth: Arc<dyn AuthProvider>, org: impl Into<String>) -> ForgeResult<Self> {
+        Self::with_api_url(auth, org, CODEBERG_API_URL.to_string())
     }
 
     /// Create a new CodebergAdapter with a custom API URL (for testing)
-    pub fn with_api_url(auth: Arc<dyn AuthProvider>, api_url: String) -> ForgeResult<Self> {
+    pub fn with_api_url(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String) -> ForgeResult<Self> {
         let client = Client::builder()
             .user_agent("hyperforge/2.0")
             .build()
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        Ok(Self { client, auth, api_url })
+        Ok(Self { client, auth, api_url, org: org.into() })
     }
 
     /// Get authorization headers with token from auth provider
     async fn auth_headers(&self) -> ForgeResult<header::HeaderMap> {
-        let token = self.auth.get_secret("codeberg").await
+        // Construct secret path: codeberg/{org}/token
+        let secret_path = format!("codeberg/{}/token", self.org);
+        let token = self.auth.get_secret(&secret_path).await
             .map_err(|e| ForgeError::AuthenticationFailed { message: e.to_string() })?
             .ok_or_else(|| ForgeError::AuthenticationFailed {
-                message: "No Codeberg token found in keychain".to_string(),
+                message: format!("No Codeberg token found for org: {}", self.org),
             })?;
 
         let mut headers = header::HeaderMap::new();
