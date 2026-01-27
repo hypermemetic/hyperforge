@@ -16,9 +16,9 @@ fn get_forge_adapter(forge: &Forge, org: &str) -> Result<Arc<dyn ForgePort>> {
     let auth = Arc::new(YamlAuthProvider::new()?);
 
     let adapter: Arc<dyn ForgePort> = match forge {
-        Forge::GitHub => Arc::new(GitHubAdapter::new(auth)?),
-        Forge::Codeberg => Arc::new(CodebergAdapter::new(auth)?),
-        Forge::GitLab => Arc::new(GitLabAdapter::new(auth)?),
+        Forge::GitHub => Arc::new(GitHubAdapter::new(auth, org)?),
+        Forge::Codeberg => Arc::new(CodebergAdapter::new(auth, org)?),
+        Forge::GitLab => Arc::new(GitLabAdapter::new(auth, org)?),
     };
 
     Ok(adapter)

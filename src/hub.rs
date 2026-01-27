@@ -503,7 +503,7 @@ impl HyperforgeHub {
             };
             let adapter: Arc<dyn ForgePort> = match source_forge {
                 Forge::GitHub => {
-                    match GitHubAdapter::new(auth) {
+                    match GitHubAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -514,7 +514,7 @@ impl HyperforgeHub {
                     }
                 }
                 Forge::Codeberg => {
-                    match CodebergAdapter::new(auth) {
+                    match CodebergAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -525,7 +525,7 @@ impl HyperforgeHub {
                     }
                 }
                 Forge::GitLab => {
-                    match GitLabAdapter::new(auth) {
+                    match GitLabAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -665,7 +665,7 @@ impl HyperforgeHub {
             };
             let adapter: Arc<dyn ForgePort> = match target_forge {
                 Forge::GitHub => {
-                    match GitHubAdapter::new(auth) {
+                    match GitHubAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -676,7 +676,7 @@ impl HyperforgeHub {
                     }
                 }
                 Forge::Codeberg => {
-                    match CodebergAdapter::new(auth) {
+                    match CodebergAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -687,7 +687,7 @@ impl HyperforgeHub {
                     }
                 }
                 Forge::GitLab => {
-                    match GitLabAdapter::new(auth) {
+                    match GitLabAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -782,7 +782,7 @@ impl HyperforgeHub {
             };
             let adapter: Arc<dyn ForgePort> = match target_forge {
                 Forge::GitHub => {
-                    match GitHubAdapter::new(auth) {
+                    match GitHubAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -793,7 +793,7 @@ impl HyperforgeHub {
                     }
                 }
                 Forge::Codeberg => {
-                    match CodebergAdapter::new(auth) {
+                    match CodebergAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {
@@ -804,7 +804,7 @@ impl HyperforgeHub {
                     }
                 }
                 Forge::GitLab => {
-                    match GitLabAdapter::new(auth) {
+                    match GitLabAdapter::new(auth, &org) {
                         Ok(a) => Arc::new(a),
                         Err(e) => {
                             yield HyperforgeEvent::Error {

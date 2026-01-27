@@ -54,30 +54,33 @@ pub struct GitLabAdapter {
     client: Client,
     auth: Arc<dyn AuthProvider>,
     api_url: String,
+    org: String,
 }
 
 impl GitLabAdapter {
     /// Create a new GitLabAdapter with the given auth provider
-    pub fn new(auth: Arc<dyn AuthProvider>) -> ForgeResult<Self> {
-        Self::with_api_url(auth, GITLAB_API_URL.to_string())
+    pub fn new(auth: Arc<dyn AuthProvider>, org: impl Into<String>) -> ForgeResult<Self> {
+        Self::with_api_url(auth, org, GITLAB_API_URL.to_string())
     }
 
     /// Create a new GitLabAdapter with a custom API URL (for testing or self-hosted)
-    pub fn with_api_url(auth: Arc<dyn AuthProvider>, api_url: String) -> ForgeResult<Self> {
+    pub fn with_api_url(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String) -> ForgeResult<Self> {
         let client = Client::builder()
             .user_agent("hyperforge/2.0")
             .build()
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        Ok(Self { client, auth, api_url })
+        Ok(Self { client, auth, api_url, org: org.into() })
     }
 
     /// Get authorization headers with token from auth provider
     async fn auth_headers(&self) -> ForgeResult<header::HeaderMap> {
-        let token = self.auth.get_secret("gitlab").await
+        // Construct secret path: gitlab/{org}/token
+        let secret_path = format!("gitlab/{}/token", self.org);
+        let token = self.auth.get_secret(&secret_path).await
             .map_err(|e| ForgeError::AuthenticationFailed { message: e.to_string() })?
             .ok_or_else(|| ForgeError::AuthenticationFailed {
-                message: "No GitLab token found in keychain".to_string(),
+                message: format!("No GitLab token found for org: {}", self.org),
             })?;
 
         let mut headers = header::HeaderMap::new();
