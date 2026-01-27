@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::adapters::{ForgePort, LocalForge, GitHubAdapter, CodebergAdapter, GitLabAdapter};
 use crate::auth::KeychainAuthProvider;
+use crate::commands::{init, status, push};
 use crate::services::SymmetricSyncService;
 use crate::types::{Forge, Repo, Visibility};
 
@@ -826,6 +827,298 @@ impl HyperforgeHub {
                 Err(e) => {
                     yield HyperforgeEvent::Error {
                         message: format!("Sync failed: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Initialize hyperforge for a git repository
+    #[hub_method(
+        description = "Initialize hyperforge configuration for a repository",
+        params(
+            path = "Repository path (absolute)",
+            forges = "Comma-separated list of forges (github,codeberg,gitlab)",
+            org = "Organization/username on forges",
+            repo_name = "Repository name (optional, defaults to directory name)",
+            visibility = "Repository visibility: public or private (optional, default: public)",
+            description = "Repository description (optional)",
+            ssh_keys = "SSH keys per forge in format 'forge:path,forge:path' (optional)",
+            force = "Force reinitialize even if config exists (optional, default: false)",
+            dry_run = "Preview changes without applying (optional, default: false)"
+        )
+    )]
+    pub async fn git_init(
+        &self,
+        path: String,
+        forges: String,
+        org: String,
+        repo_name: Option<String>,
+        visibility: Option<String>,
+        description: Option<String>,
+        ssh_keys: Option<String>,
+        force: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            // Parse forges
+            let forge_list: Vec<String> = forges.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if forge_list.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: "At least one forge required".to_string(),
+                };
+                return;
+            }
+
+            // Parse visibility
+            let vis = match visibility.as_deref() {
+                Some("private") => Visibility::Private,
+                Some("public") | None => Visibility::Public,
+                Some(other) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid visibility: {}. Must be public or private", other),
+                    };
+                    return;
+                }
+            };
+
+            // Parse SSH keys
+            let mut ssh_key_pairs = Vec::new();
+            if let Some(keys_str) = ssh_keys {
+                for pair in keys_str.split(',') {
+                    let parts: Vec<&str> = pair.trim().split(':').collect();
+                    if parts.len() == 2 {
+                        ssh_key_pairs.push((parts[0].to_string(), parts[1].to_string()));
+                    }
+                }
+            }
+
+            // Build options
+            let mut options = init::InitOptions::new(forge_list)
+                .with_org(org)
+                .with_visibility(vis);
+
+            if let Some(name) = repo_name {
+                options = options.with_repo_name(name);
+            }
+
+            if let Some(desc) = description {
+                options = options.with_description(desc);
+            }
+
+            for (forge, key_path) in ssh_key_pairs {
+                options = options.with_ssh_key(forge, key_path);
+            }
+
+            if force.unwrap_or(false) {
+                options = options.force();
+            }
+
+            if dry_run.unwrap_or(false) {
+                options = options.dry_run();
+            }
+
+            // Run init
+            let repo_path = std::path::Path::new(&path);
+            match init::init(repo_path, options) {
+                Ok(report) => {
+                    if report.dry_run {
+                        yield HyperforgeEvent::Info {
+                            message: "[DRY RUN] Would initialize hyperforge".to_string(),
+                        };
+                    }
+
+                    if report.git_initialized {
+                        yield HyperforgeEvent::Info {
+                            message: "Initialized git repository".to_string(),
+                        };
+                    }
+
+                    yield HyperforgeEvent::Info {
+                        message: format!("Created config at {}", repo_path.join(".hyperforge/config.toml").display()),
+                    };
+
+                    for remote in report.remotes_added {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Added remote {} → {}", remote.name, remote.url),
+                        };
+                    }
+
+                    yield HyperforgeEvent::Info {
+                        message: "Hyperforge initialized successfully".to_string(),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Init failed: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Show git repository status
+    #[hub_method(
+        description = "Show git repository sync status across all configured forges",
+        params(
+            path = "Repository path (absolute)"
+        )
+    )]
+    pub async fn git_status(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let repo_path = std::path::Path::new(&path);
+
+            match status::status(repo_path) {
+                Ok(report) => {
+                    // Current branch
+                    yield HyperforgeEvent::Info {
+                        message: format!("On branch: {}", report.branch),
+                    };
+
+                    // Working tree status
+                    if report.has_changes || report.has_staged {
+                        yield HyperforgeEvent::Info {
+                            message: "Working tree has changes".to_string(),
+                        };
+                    } else {
+                        yield HyperforgeEvent::Info {
+                            message: "Working tree clean".to_string(),
+                        };
+                    }
+
+                    // Forge status
+                    for forge_status in report.forges {
+                        let symbol = if forge_status.is_up_to_date() {
+                            "✓"
+                        } else if forge_status.ahead > 0 && forge_status.behind > 0 {
+                            "↕"
+                        } else if forge_status.ahead > 0 {
+                            "↑"
+                        } else if forge_status.behind > 0 {
+                            "↓"
+                        } else {
+                            "✗"
+                        };
+
+                        let mut msg = format!("{} {} ({})",
+                            symbol,
+                            forge_status.forge,
+                            forge_status.remote_name
+                        );
+
+                        if forge_status.ahead > 0 || forge_status.behind > 0 {
+                            msg.push_str(&format!(" ↑{} ↓{}", forge_status.ahead, forge_status.behind));
+                        }
+
+                        if let Some(err) = forge_status.error {
+                            msg.push_str(&format!(" - {}", err));
+                        }
+
+                        yield HyperforgeEvent::Info { message: msg };
+                    }
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Status failed: {}", e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Push to configured forges
+    #[hub_method(
+        description = "Push current branch to all configured forges",
+        params(
+            path = "Repository path (absolute)",
+            set_upstream = "Set upstream tracking (optional, default: false)",
+            force = "Force push (optional, default: false)",
+            dry_run = "Preview push without executing (optional, default: false)",
+            only_forges = "Only push to specific forges, comma-separated (optional)"
+        )
+    )]
+    pub async fn git_push(
+        &self,
+        path: String,
+        set_upstream: Option<bool>,
+        force: Option<bool>,
+        dry_run: Option<bool>,
+        only_forges: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let repo_path = std::path::Path::new(&path);
+
+            // Build options
+            let mut options = push::PushOptions::new();
+
+            if set_upstream.unwrap_or(false) {
+                options = options.set_upstream();
+            }
+
+            if force.unwrap_or(false) {
+                options = options.force();
+            }
+
+            if dry_run.unwrap_or(false) {
+                options = options.dry_run();
+            }
+
+            if let Some(forges_str) = only_forges {
+                let forges: Vec<String> = forges_str.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                options = options.only(forges);
+            }
+
+            // Execute push
+            match push::push(repo_path, options) {
+                Ok(report) => {
+                    if report.dry_run {
+                        yield HyperforgeEvent::Info {
+                            message: "[DRY RUN] Would push to forges".to_string(),
+                        };
+                    }
+
+                    for result in report.results {
+                        if result.success {
+                            yield HyperforgeEvent::Info {
+                                message: format!("✓ Pushed {} to {} ({})",
+                                    result.branch,
+                                    result.forge,
+                                    result.remote_name
+                                ),
+                            };
+                        } else {
+                            yield HyperforgeEvent::Error {
+                                message: format!("✗ Failed to push to {}: {}",
+                                    result.forge,
+                                    result.error.as_deref().unwrap_or("unknown error")
+                                ),
+                            };
+                        }
+                    }
+
+                    if report.all_success {
+                        yield HyperforgeEvent::Info {
+                            message: "All pushes succeeded".to_string(),
+                        };
+                    } else {
+                        yield HyperforgeEvent::Error {
+                            message: "Some pushes failed".to_string(),
+                        };
+                    }
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Push failed: {}", e),
                     };
                 }
             }

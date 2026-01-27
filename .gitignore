@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+
+# Hyperforge local config (per-repo, not committed)
+/.hyperforge/
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# Debug files
+*.pdb
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
