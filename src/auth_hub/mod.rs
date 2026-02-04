@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use futures::stream::Stream;
-use plexus_macros::hub_methods;
 use serde::{Deserialize, Serialize};
 
 use storage::{StorageError, YamlStorage};
