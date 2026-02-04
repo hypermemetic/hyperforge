@@ -8,8 +8,8 @@
 //! Default port: 4445
 
 use clap::Parser;
-use hub_core::plexus::DynamicHub;
-use hub_transport::TransportServer;
+use plexus_core::plexus::DynamicHub;
+use plexus_transport::TransportServer;
 use hyperforge::auth_hub::AuthHub;
 use std::sync::Arc;
 use tracing::{info, error};

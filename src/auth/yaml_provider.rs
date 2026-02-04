@@ -16,6 +16,7 @@ use super::AuthProvider;
 enum AuthEvent {
     #[serde(rename = "secret")]
     Secret {
+        #[allow(dead_code)]
         path: String,
         value: String,
     },

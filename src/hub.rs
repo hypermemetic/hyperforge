@@ -2,7 +2,7 @@
 
 use async_stream::stream;
 use futures::Stream;
-use hub_macro::hub_methods;
+use plexus_macros::hub_methods;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -111,15 +111,15 @@ impl Default for HyperforgeHub {
     }
 }
 
-#[hub_methods(
+#[plexus_macros::hub_methods(
     namespace = "hyperforge",
     version = "2.0.0",
     description = "Multi-forge repository management",
-    crate_path = "hub_core"
+    crate_path = "plexus_core"
 )]
 impl HyperforgeHub {
     /// Show hyperforge status
-    #[hub_method(description = "Show hyperforge status and version")]
+    #[plexus_macros::hub_method(description = "Show hyperforge status and version")]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             yield HyperforgeEvent::Status {
@@ -130,7 +130,7 @@ impl HyperforgeHub {
     }
 
     /// Show version info
-    #[hub_method(description = "Show version information")]
+    #[plexus_macros::hub_method(description = "Show version information")]
     pub async fn version(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             yield HyperforgeEvent::Info {
@@ -143,7 +143,7 @@ impl HyperforgeHub {
     }
 
     /// Test workspace diff (demonstration)
-    #[hub_method(description = "Test workspace diff with sample data")]
+    #[plexus_macros::hub_method(description = "Test workspace diff with sample data")]
     pub async fn test_diff(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let sync_service = self.sync_service.clone();
 
@@ -204,7 +204,7 @@ impl HyperforgeHub {
     }
 
     /// List repositories for an organization (from LocalForge)
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "List all repositories in the local forge for an organization",
         params(org = "Organization name")
     )]
@@ -242,7 +242,7 @@ impl HyperforgeHub {
     }
 
     /// Create a new repository in LocalForge
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Create a new repository configuration",
         params(
             org = "Organization name",
@@ -350,7 +350,7 @@ impl HyperforgeHub {
     }
 
     /// Update an existing repository
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Update repository configuration",
         params(
             org = "Organization name",
@@ -423,7 +423,7 @@ impl HyperforgeHub {
     }
 
     /// Delete a repository
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Delete a repository from local configuration",
         params(
             org = "Organization name",
@@ -463,7 +463,7 @@ impl HyperforgeHub {
     }
 
     /// Import repositories from a remote forge
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Import repository configurations from a remote forge (GitHub, Codeberg, GitLab)",
         params(
             org = "Organization name",
@@ -624,7 +624,7 @@ impl HyperforgeHub {
     }
 
     /// Compute sync diff between local and a remote forge
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Compute diff between local configuration and a remote forge",
         params(
             org = "Organization name",
@@ -738,7 +738,7 @@ impl HyperforgeHub {
     }
 
     /// Sync local configuration to a remote forge
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Sync repositories from local configuration to a remote forge",
         params(
             org = "Organization name",
@@ -858,7 +858,7 @@ impl HyperforgeHub {
     }
 
     /// Initialize hyperforge for a git repository
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Initialize hyperforge configuration for a repository",
         params(
             path = "Repository path (absolute)",
@@ -986,7 +986,7 @@ impl HyperforgeHub {
     }
 
     /// Show git repository status
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Show git repository sync status across all configured forges",
         params(
             path = "Repository path (absolute)"
@@ -1058,7 +1058,7 @@ impl HyperforgeHub {
     }
 
     /// Push to configured forges
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Push current branch to all configured forges",
         params(
             path = "Repository path (absolute)",
@@ -1150,7 +1150,7 @@ impl HyperforgeHub {
     }
 
     /// Verify workspace configuration and health
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Verify workspace configuration including orgs, SSH keys, and auth tokens",
         params(
             org = "Organization to verify (optional, verifies all if not specified)"
@@ -1235,7 +1235,7 @@ impl HyperforgeHub {
 
                 // Check auth tokens for common forges
                 for forge in &["github", "codeberg", "gitlab"] {
-                    let token_key = format!("{}/{}/token", forge, org_name);
+                    let _token_key = format!("{}/{}/token", forge, org_name);
                     // Note: We can't directly check auth hub from here without making it async
                     // This would require calling synapse, which is what YamlAuthProvider does
                     yield HyperforgeEvent::Info {
