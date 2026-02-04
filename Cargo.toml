@@ -19,9 +19,9 @@ path = "src/bin/hyperforge-auth.rs"
 
 [dependencies]
 # Hub framework integration
-hub-core = { path = "../hub-core" }
-hub-macro = { path = "../hub-macro" }
-hub-transport = { path = "../hub-transport" }
+plexus-core = { path = "../hub-core" }
+plexus-macros = { path = "../hub-macro" }
+plexus-transport = { path = "../hub-transport" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
