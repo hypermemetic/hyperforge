@@ -1,7 +1,7 @@
 //! Integration tests for hyperforge hub
 
 use futures::StreamExt;
-use hub_core::plexus::DynamicHub;
+use plexus_core::plexus::DynamicHub;
 use hyperforge::{HyperforgeEvent, HyperforgeHub};
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ async fn test_hyperforge_as_plugin() {
 
     let mut found_status = false;
     while let Some(item) = stream.next().await {
-        if let hub_core::plexus::PlexusStreamItem::Data { content, .. } = item {
+        if let plexus_core::plexus::PlexusStreamItem::Data { content, .. } = item {
             if let Ok(event) = serde_json::from_value::<HyperforgeEvent>(content) {
                 match event {
                     HyperforgeEvent::Status { version, description } => {
@@ -48,7 +48,7 @@ async fn test_hyperforge_version_method() {
 
     let mut found_version = false;
     while let Some(item) = stream.next().await {
-        if let hub_core::plexus::PlexusStreamItem::Data { content, .. } = item {
+        if let plexus_core::plexus::PlexusStreamItem::Data { content, .. } = item {
             if let Ok(event) = serde_json::from_value::<HyperforgeEvent>(content) {
                 match event {
                     HyperforgeEvent::Info { message } => {

@@ -1,6 +1,6 @@
 use clap::Parser;
-use hub_core::plexus::DynamicHub;
-use hub_transport::TransportServer;
+use plexus_core::plexus::DynamicHub;
+use plexus_transport::TransportServer;
 use hyperforge::HyperforgeHub;
 use std::sync::Arc;
 
