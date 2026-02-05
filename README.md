@@ -132,7 +132,7 @@ Returns:
 Hyperforge can be registered as a plugin in other DynamicHub-based systems:
 
 ```rust
-use hub_core::plexus::DynamicHub;
+use plexus_core::plexus::DynamicHub;
 use hyperforge::HyperforgeHub;
 use std::sync::Arc;
 
@@ -169,17 +169,17 @@ cargo test test_hyperforge_as_plugin
 
 ### Architecture Patterns
 
-**hub-macro**: Generates Activation trait implementation from `#[hub_methods]` attribute:
+**plexus-macros**: Generates Activation trait implementation from `#[hub_methods]` attribute:
 
 ```rust
-#[hub_methods(
+#[plexus_macros::hub_methods(
     namespace = "hyperforge",
     version = "2.0.0",
     description = "Multi-forge repository management",
-    crate_path = "hub_core"
+    crate_path = "plexus_core"
 )]
 impl HyperforgeHub {
-    #[hub_method(description = "Show status")]
+    #[plexus_macros::hub_method(description = "Show status")]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         // Implementation
     }

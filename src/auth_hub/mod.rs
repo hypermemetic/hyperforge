@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use futures::stream::Stream;
-use hub_macro::hub_methods;
 use serde::{Deserialize, Serialize};
 
 use storage::{StorageError, YamlStorage};
@@ -70,15 +69,15 @@ impl AuthHub {
     }
 }
 
-#[hub_methods(
+#[plexus_macros::hub_methods(
     namespace = "auth",
     version = "1.0.0",
     description = "Simple secret management with YAML storage",
-    crate_path = "hub_core"
+    crate_path = "plexus_core"
 )]
 impl AuthHub {
     /// Get a secret by path
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Get a secret by path",
         params(
             secret_key = "Secret key (e.g., 'github/alice/token')"
@@ -112,7 +111,7 @@ impl AuthHub {
     }
 
     /// Set a secret
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Set a secret value",
         params(
             secret_key = "Secret key (e.g., 'github/alice/token')",
@@ -145,7 +144,7 @@ impl AuthHub {
     }
 
     /// List secrets matching a prefix
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "List secrets matching a prefix",
         params(
             prefix = "Prefix to filter by (empty string for all secrets)"
@@ -178,7 +177,7 @@ impl AuthHub {
     }
 
     /// Delete a secret
-    #[hub_method(
+    #[plexus_macros::hub_method(
         description = "Delete a secret",
         params(
             secret_key = "Secret key to delete"

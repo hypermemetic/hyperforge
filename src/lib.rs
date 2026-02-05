@@ -15,8 +15,8 @@ pub mod remote;
 pub mod services;
 pub mod types;
 
-// Re-export serde_helpers from hub_core (required by hub-macro generated code)
-pub use hub_core::serde_helpers;
+// Re-export serde_helpers from plexus_core (required by plexus_macros generated code)
+pub use plexus_core::serde_helpers;
 
 // Re-exports for convenience
 pub use adapters::{ForgePort, LocalForge};
