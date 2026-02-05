@@ -461,6 +461,151 @@ impl HyperforgeHub {
         }
     }
 
+    /// Rename a repository on remote forge(s) and in local config
+    #[plexus_macros::hub_method(
+        description = "Rename a repository on remote forge(s) and update local configuration",
+        params(
+            org = "Organization name",
+            old_name = "Current repository name",
+            new_name = "New repository name",
+            forges = "Comma-separated forges to rename on (optional, defaults to origin only)"
+        )
+    )]
+    pub async fn repos_rename(
+        &self,
+        org: String,
+        old_name: String,
+        new_name: String,
+        forges: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let hub = self.clone();
+
+        stream! {
+            // Get local forge and verify repo exists
+            let local = hub.get_local_forge(&org).await;
+
+            let repo = match local.get_repo(&org, &old_name).await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repository not found in local config: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Determine which forges to rename on
+            let target_forges: Vec<Forge> = if let Some(forge_list) = forges {
+                forge_list
+                    .split(',')
+                    .filter_map(|f| match f.trim().to_lowercase().as_str() {
+                        "github" => Some(Forge::GitHub),
+                        "codeberg" => Some(Forge::Codeberg),
+                        "gitlab" => Some(Forge::GitLab),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                // Default to origin only
+                vec![repo.origin.clone()]
+            };
+
+            // Get auth provider
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Rename on each target forge
+            let mut errors = Vec::new();
+            for forge in &target_forges {
+                let adapter: Box<dyn ForgePort> = match forge {
+                    Forge::GitHub => {
+                        match GitHubAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                errors.push(format!("GitHub: {}", e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::Codeberg => {
+                        match CodebergAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                errors.push(format!("Codeberg: {}", e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::GitLab => {
+                        match GitLabAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                errors.push(format!("GitLab: {}", e));
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                match adapter.rename_repo(&org, &old_name, &new_name).await {
+                    Ok(_) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Renamed on {:?}: {} -> {}", forge, old_name, new_name),
+                        };
+                    }
+                    Err(e) => {
+                        errors.push(format!("{:?}: {}", forge, e));
+                    }
+                }
+            }
+
+            // Report any errors from remote renames
+            for error in &errors {
+                yield HyperforgeEvent::Error {
+                    message: format!("Remote rename failed - {}", error),
+                };
+            }
+
+            // Update local config regardless of remote errors (user may want to fix manually)
+            match local.rename_repo(&org, &old_name, &new_name).await {
+                Ok(_) => {
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save repos.yaml: {}", e),
+                        };
+                        return;
+                    }
+
+                    yield HyperforgeEvent::Info {
+                        message: format!("Local config updated: {} -> {}", old_name, new_name),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to update local config: {}", e),
+                    };
+                }
+            }
+
+            if errors.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!("Renamed repository: {} -> {}", old_name, new_name),
+                };
+            } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Rename completed with {} error(s)", errors.len()),
+                };
+            }
+        }
+    }
+
     /// Import repositories from a remote forge
     #[plexus_macros::hub_method(
         description = "Import repository configurations from a remote forge (GitHub, Codeberg, GitLab)",

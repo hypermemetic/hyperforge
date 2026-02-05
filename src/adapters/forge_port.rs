@@ -66,6 +66,9 @@ pub trait ForgePort: Send + Sync {
     /// Delete a repository
     async fn delete_repo(&self, org: &str, name: &str) -> ForgeResult<()>;
 
+    /// Rename a repository
+    async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()>;
+
     /// Check if a repository exists
     async fn repo_exists(&self, org: &str, name: &str) -> ForgeResult<bool> {
         match self.get_repo(org, name).await {
