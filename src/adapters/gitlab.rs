@@ -43,6 +43,13 @@ struct UpdateProjectRequest {
     visibility: Option<String>,
 }
 
+/// Request body for renaming a project
+#[derive(Debug, Serialize)]
+struct RenameProjectRequest {
+    name: String,
+    path: String,
+}
+
 /// GitLab group response
 #[derive(Debug, Deserialize)]
 struct GitLabGroup {
@@ -321,6 +328,40 @@ impl ForgePort for GitLabAdapter {
         Err(ForgeError::ApiError(format!(
             "GitLab API error {}: {}", status, body
         )))
+    }
+
+    async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let project_path = format!("{}/{}", org, old_name);
+        let encoded_path = urlencoding::encode(&project_path);
+        let url = format!("{}/projects/{}", self.api_url, encoded_path);
+
+        // GitLab requires both name and path to be updated for a rename
+        let request = RenameProjectRequest {
+            name: new_name.to_string(),
+            path: new_name.to_string(),
+        };
+
+        let response = self.client.put(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: old_name.to_string() });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitLab API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
     }
 }
 

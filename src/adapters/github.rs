@@ -42,6 +42,12 @@ struct UpdateRepoRequest {
     private: Option<bool>,
 }
 
+/// Request body for renaming a repository
+#[derive(Debug, Serialize)]
+struct RenameRepoRequest {
+    name: String,
+}
+
 /// GitHub adapter for ForgePort trait
 pub struct GitHubAdapter {
     client: Client,
@@ -255,6 +261,36 @@ impl ForgePort for GitHubAdapter {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             // Already deleted, treat as success
             return Ok(());
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitHub API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let url = format!("{}/repos/{}/{}", self.api_url, org, old_name);
+
+        let request = RenameRepoRequest {
+            name: new_name.to_string(),
+        };
+
+        let response = self.client.patch(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: old_name.to_string() });
         }
 
         if !response.status().is_success() {

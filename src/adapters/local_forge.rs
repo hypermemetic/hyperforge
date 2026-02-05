@@ -210,6 +210,37 @@ impl ForgePort for LocalForge {
 
         self.remove_repo(name)
     }
+
+    async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()> {
+        if org != self.org {
+            return Err(ForgeError::ApiError(format!(
+                "Organization mismatch: expected {}, got {}",
+                self.org, org
+            )));
+        }
+
+        let mut repos = self.repos.write().map_err(|e| {
+            ForgeError::ApiError(format!("Lock poisoned: {}", e))
+        })?;
+
+        // Get the existing repo
+        let mut repo = repos.remove(old_name).ok_or_else(|| {
+            ForgeError::RepoNotFound { name: old_name.to_string() }
+        })?;
+
+        // Check new name doesn't already exist
+        if repos.contains_key(new_name) {
+            // Put the old one back
+            repos.insert(old_name.to_string(), repo);
+            return Err(ForgeError::RepoAlreadyExists { name: new_name.to_string() });
+        }
+
+        // Update the name and insert with new key
+        repo.name = new_name.to_string();
+        repos.insert(new_name.to_string(), repo);
+
+        Ok(())
+    }
 }
 
 /// YAML file format for repos.yaml
