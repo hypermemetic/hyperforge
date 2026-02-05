@@ -1,300 +1,250 @@
-# Hyperforge (LFORGE2)
+# Hyperforge
 
-Multi-forge repository management with repo-local configuration and git-native workflows.
+Multi-forge repository management with declarative configuration.
 
 ## Overview
 
-Hyperforge is a declarative repository management system that syncs repositories across GitHub, Codeberg, and other forges. LFORGE2 is a complete redesign focusing on:
+Hyperforge syncs repositories across GitHub, Codeberg, and GitLab using direct API calls. It maintains a local state (LocalForge) that tracks your repos and their forge configurations.
 
-- **Repo-local configuration**: Each repo has `.hyperforge/config.toml` defining its forge settings
-- **Git-native**: Uses standard git config and remotes, no SSH host aliases
-- **Workspace emergence**: Workspaces are discovered from directory structure, not predefined
-- **Direct API calls**: No Pulumi - uses SymmetricSyncService with ForgePort adapters
+**Key features:**
+- **Declarative config**: Define repos in YAML, sync to forges
+- **Multi-forge**: Origin + mirrors pattern (e.g., GitHub origin, Codeberg mirror)
+- **Direct API**: No Pulumi - uses ForgePort adapters for each forge
+- **Workspace operations**: Diff, sync, verify across all repos
+
+## Quick Start
+
+```bash
+# List repos for an org
+synapse substrate hyperforge repos_list --org hypermemetic
+
+# Import existing repos from GitHub
+synapse substrate hyperforge repos_import --forge github --org hypermemetic
+
+# Check what would change
+synapse substrate hyperforge workspace_diff --org hypermemetic --forge github
+
+# Apply changes
+synapse substrate hyperforge workspace_sync --org hypermemetic --forge github
+```
+
+## Commands
+
+### Repo Management
+
+```bash
+# List repos in LocalForge
+synapse substrate hyperforge repos_list --org <org>
+
+# Create a new repo
+synapse substrate hyperforge repos_create \
+  --org <org> \
+  --name my-tool \
+  --origin github \
+  --visibility public \
+  --mirrors codeberg
+
+# Update repo settings
+synapse substrate hyperforge repos_update \
+  --org <org> \
+  --name my-tool \
+  --visibility private
+
+# Delete repo from LocalForge
+synapse substrate hyperforge repos_delete --org <org> --name my-tool
+
+# Import repos from a forge
+synapse substrate hyperforge repos_import --forge github --org <org>
+```
+
+### Workspace Operations
+
+```bash
+# Diff local state vs remote forge
+synapse substrate hyperforge workspace_diff --org <org> --forge github
+
+# Sync local state to remote forge
+synapse substrate hyperforge workspace_sync --org <org> --forge github
+
+# Verify workspace configuration
+synapse substrate hyperforge workspace_verify --org <org>
+```
+
+### Git Operations
+
+```bash
+# Initialize a repo for multi-forge sync
+synapse substrate hyperforge git_init \
+  --path /path/to/repo \
+  --org <org> \
+  --forges "github,codeberg"
+
+# Push to all configured forges
+synapse substrate hyperforge git_push --path /path/to/repo
+
+# Check git status
+synapse substrate hyperforge git_status --path /path/to/repo
+```
+
+### Meta
+
+```bash
+# Show status
+synapse substrate hyperforge status
+
+# Show version
+synapse substrate hyperforge version
+```
+
+## Configuration
+
+Config lives in `~/.config/hyperforge/`:
+
+```
+~/.config/hyperforge/
+├── config.yaml           # Global config, org definitions
+└── orgs/
+    └── <org>/
+        └── repos.yaml    # Repo configurations for this org
+```
+
+### Global Config (`config.yaml`)
+
+```yaml
+default_org: hypermemetic
+secret_provider: keychain
+
+organizations:
+  hypermemetic:
+    owner: hypermemetic
+    owner_type: user        # user | org (affects API endpoints)
+    ssh_key: hypermemetic
+    origin: github
+    forges:
+      - github
+      - codeberg
+    default_visibility: public
+```
+
+### Repo Config (`orgs/<org>/repos.yaml`)
+
+```yaml
+repos:
+  - name: my-tool
+    origin: github
+    visibility: public
+    description: "My awesome tool"
+    mirrors:
+      - codeberg
+    protected: false
+```
 
 ## Architecture
 
-Hyperforge is built on the hub-core activation system:
+Hyperforge is a Plexus RPC activation that integrates with substrate:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  DynamicHub (namespace: "lforge")                       │
-│  ├─ Provides .call() routing for CLI tools              │
-│  └─ Registers activations dynamically                   │
-└─────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│  HyperforgeHub (namespace: "hyperforge")                │
-│  ├─ status()  - Show version and status                 │
-│  ├─ version() - Version information                     │
-│  └─ [future methods for repo management]                │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  substrate (Plexus RPC server)          │
+│  └─ hyperforge activation               │
+│     ├─ HyperforgeHub (methods)          │
+│     ├─ LocalForge (local state)         │
+│     └─ ForgePort adapters               │
+│        ├─ GitHubAdapter                 │
+│        ├─ CodebergAdapter               │
+│        └─ GitLabAdapter                 │
+└─────────────────────────────────────────┘
 ```
 
-**Transport Layer**: hub-transport provides:
-- WebSocket server (JSON-RPC)
-- stdio mode (MCP-compatible)
-- MCP HTTP server (optional)
-
-**Calling Pattern**: `synapse -p <port> lforge hyperforge <method>`
-- `lforge` = DynamicHub namespace (the backend)
-- `hyperforge` = activation namespace (the plugin)
-- `<method>` = method to call (status, version, etc.)
-
-## Installation
-
-### Building from Source
-
-```bash
-# Clone the repository
-git clone <repo-url>
-cd hyperforge-lforge2
-
-# Build
-cargo build --release
-
-# The binary will be at target/release/hyperforge
-```
-
-### Running the Server
-
-```bash
-# WebSocket mode (default port 4446)
-./target/release/hyperforge
-
-# Custom port
-./target/release/hyperforge --port 8080
-
-# With MCP HTTP server (on port + 1)
-./target/release/hyperforge --mcp
-
-# stdio mode (for MCP integration)
-./target/release/hyperforge --stdio
-```
-
-## Usage
-
-### Standalone Server
-
-Start the server:
-
-```bash
-./target/release/hyperforge
-```
-
-Output:
-```
-LFORGE2 initialized
-  Namespace: lforge
-  Activation: hyperforge
-  Version: 2.0.0
-  Description: Multi-forge repository management
-
-LFORGE2 started
-  WebSocket: ws://127.0.0.1:4446
-
-Usage:
-  synapse -p 4446 lforge hyperforge status
-  synapse -p 4446 lforge hyperforge version
-```
-
-### Using with Synapse
-
-Check status:
-```bash
-synapse -p 4446 lforge hyperforge status
-```
-
-Returns:
-```json
-{
-  "type": "status",
-  "version": "2.0.0",
-  "description": "Multi-forge repository management (LFORGE2)"
-}
-```
-
-Get version:
-```bash
-synapse -p 4446 lforge hyperforge version
-```
-
-Returns:
-```json
-{
-  "type": "info",
-  "message": "hyperforge 2.0.0 (LFORGE2 - repo-local, git-native)"
-}
-```
-
-### Plugin Mode
-
-Hyperforge can be registered as a plugin in other DynamicHub-based systems:
+### ForgePort Trait
 
 ```rust
-use plexus_core::plexus::DynamicHub;
-use hyperforge::HyperforgeHub;
-use std::sync::Arc;
-
-// Register hyperforge in your hub
-let hub = Arc::new(
-    DynamicHub::new("myapp")
-        .register(HyperforgeHub::new())
-);
-
-// Now callable via: myapp.hyperforge.status
-let stream = hub.route("hyperforge.status", serde_json::json!({})).await?;
+#[async_trait]
+pub trait ForgePort {
+    async fn list_repos(&self, org: &str) -> ForgeResult<Vec<Repo>>;
+    async fn get_repo(&self, org: &str, name: &str) -> ForgeResult<Repo>;
+    async fn create_repo(&self, org: &str, repo: &Repo) -> ForgeResult<()>;
+    async fn update_repo(&self, org: &str, repo: &Repo) -> ForgeResult<()>;
+    async fn delete_repo(&self, org: &str, name: &str) -> ForgeResult<()>;
+}
 ```
+
+### Authentication
+
+Tokens are retrieved from the secrets auth hub:
+
+```bash
+# Set a token
+synapse secrets auth set_secret \
+  --secret-key "github/<org>/token" \
+  --value "<token>"
+
+# Tokens are stored at:
+# - github/<org>/token
+# - codeberg/<org>/token
+# - gitlab/<org>/token
+```
+
+## Sync Model
+
+### Origin + Mirrors
+
+Each repo has one **origin** forge and optional **mirrors**:
+
+- **Origin**: Source of truth, where repo is primarily managed
+- **Mirrors**: Read-only copies synced from origin
+
+### Diff Operations
+
+`workspace_diff` compares LocalForge state against a remote forge:
+
+| Status | Meaning |
+|--------|---------|
+| `in_sync` | Local and remote match |
+| `to_create` | Exists locally, not on remote |
+| `to_update` | Metadata differs |
+| `to_delete` | Marked for deletion locally |
+
+### Sync Operations
+
+`workspace_sync` applies local state to remote:
+
+1. Creates repos that exist locally but not remotely
+2. Updates repos where metadata differs
+3. Deletes repos marked for removal
+
+## Known Issues
+
+### User vs Org Accounts
+
+Codeberg/GitHub have different API endpoints for user accounts vs organizations. If sync fails with "org does not exist", add `owner_type: user` to your org config.
+
+See `docs/architecture/16676594318971935743_owner-type-enum.md` for the planned fix.
 
 ## Development
 
-### Running Tests
+### Building
 
 ```bash
-# All tests
+cargo build --release
+```
+
+### Testing
+
+```bash
 cargo test
-
-# Integration tests only
 cargo test --test integration_test
-
-# Specific test
-cargo test test_hyperforge_as_plugin
 ```
 
-### Test Coverage
-
-- `test_hyperforge_as_plugin`: Verifies DynamicHub integration and routing
-- `test_hyperforge_version_method`: Tests version method returns correct data
-- `test_dynamic_hub_lists_hyperforge`: Validates activation listing/introspection
-
-### Architecture Patterns
-
-**plexus-macros**: Generates Activation trait implementation from `#[hub_methods]` attribute:
-
-```rust
-#[plexus_macros::hub_methods(
-    namespace = "hyperforge",
-    version = "2.0.0",
-    description = "Multi-forge repository management",
-    crate_path = "plexus_core"
-)]
-impl HyperforgeHub {
-    #[plexus_macros::hub_method(description = "Show status")]
-    pub async fn status(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        // Implementation
-    }
-}
-```
-
-**DynamicHub wrapper**: Even for single-activation servers, DynamicHub provides:
-- `.call()` routing method expected by synapse
-- Activation listing/introspection
-- Schema generation
-- Consistent plugin interface
-
-**Event-based API**: All methods return `Stream<Item = HyperforgeEvent>`:
-- Enables progressive updates
-- Natural for long-running operations
-- Compatible with JSON-RPC streaming
-
-## Design Principles
-
-### 1. Repo-Local Configuration
-
-Each repository has `.hyperforge/config.toml`:
-
-```toml
-[forge]
-origin = "github"           # Primary forge
-mirrors = ["codeberg"]      # Optional mirrors
-visibility = "public"
-
-[metadata]
-description = "My awesome project"
-topics = ["rust", "cli"]
-```
-
-No global workspace configuration - settings travel with the repo.
-
-### 2. Git-Native Approach
-
-Use standard git features:
+### Running Standalone
 
 ```bash
-# Configure forge credentials via git config
-git config forge.github.token <token>
-git config forge.codeberg.token <token>
+# As standalone server (port 4446)
+./target/release/hyperforge
 
-# Remotes are standard git remotes
-git remote -v
-# origin   git@github.com:user/repo.git (fetch)
-# codeberg git@codeberg.org:user/repo.git (fetch)
+# With custom port
+./target/release/hyperforge --port 8080
 ```
-
-No SSH host aliases or custom git protocols.
-
-### 3. Emergent Workspaces
-
-Workspaces are discovered, not configured:
-
-```
-~/dev/projects/
-  ├─ tool1/.hyperforge/     # Workspace member
-  ├─ tool2/.hyperforge/     # Workspace member
-  └─ library1/.hyperforge/  # Workspace member
-```
-
-Run `hyperforge workspace sync --path ~/dev/projects` to sync all repos in that directory tree.
-
-### 4. Origin-Based Sync
-
-Each repo has one **origin** forge (source of truth) and optional **mirrors**:
-
-- **Import**: Discover repos from forges → add to local state
-- **Sync**: Apply local state → forges
-  - Ensure repo exists on origin
-  - Mirror to configured mirrors
-  - Delete from forges if marked for removal
-
-### 5. Direct API Integration
-
-No Pulumi subprocess - direct Rust API calls via ForgePort adapters:
-
-```rust
-pub trait ForgePort {
-    async fn list_repos(&self, org: &str) -> Result<Vec<Repo>>;
-    async fn create_repo(&self, org: &str, repo: &Repo) -> Result<()>;
-    async fn update_repo(&self, org: &str, repo: &Repo) -> Result<()>;
-    async fn delete_repo(&self, org: &str, name: &str) -> Result<()>;
-}
-```
-
-Implementations: `GitHubAdapter`, `CodebergAdapter`, `LocalForge` (repo-local state).
-
-## Roadmap
-
-### Current (v2.0.0)
-
-- ✅ Hub-transport integration
-- ✅ Basic activation with status/version
-- ✅ Plugin mode support
-- ✅ Integration tests
-
-### In Progress (LFORGE2-* tickets)
-
-- [ ] LFORGE2-1: Core module structure
-- [ ] LFORGE2-2: LocalForge implementing ForgePort
-- [ ] LFORGE2-3: Repo type with origin/mirrors
-- [ ] LFORGE2-4: SymmetricSyncService with origin logic
-- [ ] LFORGE2-5: LocalForge ↔ repos.yaml persistence
-- [ ] LFORGE2-6: Wire activations to sync service
-
-### Future
-
-- Multi-org support
-- Workspace commands (diff, sync, import, clone_all)
-- Repo management (create, update, remove)
-- Package management (npm, cargo, etc.)
 
 ## License
 
@@ -302,9 +252,8 @@ AGPL-3.0-only
 
 ## Related Projects
 
-- **hub-core**: Activation system core infrastructure
-- **hub-transport**: Transport layer (WebSocket, stdio, MCP HTTP)
-- **hub-macro**: Procedural macros for activation generation
-- **synapse**: CLI client for hub-based systems
-
-<!-- test -->
+- **plexus-core** (hub-core): Activation system infrastructure
+- **plexus-transport** (hub-transport): WebSocket/stdio transport
+- **plexus-macros** (hub-macro): Procedural macros for activations
+- **synapse**: CLI client for Plexus RPC servers
+- **substrate**: Reference Plexus RPC server with built-in activations
