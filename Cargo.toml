@@ -19,9 +19,9 @@ path = "src/bin/hyperforge-auth.rs"
 
 [dependencies]
 # Hub framework integration
-plexus-core = { path = "../hub-core" }
-plexus-macros = { path = "../hub-macro" }
-plexus-transport = { path = "../hub-transport" }
+plexus-core = "0.2.1"
+plexus-macros = "0.2.1"
+plexus-transport = "0.1.0"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -69,3 +69,9 @@ urlencoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Uncomment to use local versions during development:
+# [patch.crates-io]
+# plexus-core = { path = "../plexus-core" }
+# plexus-macros = { path = "../plexus-macros" }
+# plexus-transport = { path = "../plexus-transport" }
