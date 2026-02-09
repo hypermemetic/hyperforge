@@ -17,6 +17,9 @@
 *.swo
 *~
 
+# Database files
+*.db
+
 # OS files
 .DS_Store
 Thumbs.db
