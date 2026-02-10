@@ -50,6 +50,12 @@ struct RenameProjectRequest {
     path: String,
 }
 
+/// Request body for setting default branch
+#[derive(Debug, Serialize)]
+struct SetDefaultBranchRequest {
+    default_branch: String,
+}
+
 /// GitLab group response
 #[derive(Debug, Deserialize)]
 struct GitLabGroup {
@@ -149,6 +155,7 @@ impl GitLabAdapter {
             origin: Forge::GitLab,
             mirrors: Vec::new(),
             protected: gl_project.archived,
+            aliases: Vec::new(),
         }
     }
 
@@ -363,6 +370,38 @@ impl ForgePort for GitLabAdapter {
 
         Ok(())
     }
+
+    async fn set_default_branch(&self, org: &str, name: &str, branch: &str) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let project_path = format!("{}/{}", org, name);
+        let encoded_path = urlencoding::encode(&project_path);
+        let url = format!("{}/projects/{}", self.api_url, encoded_path);
+
+        let request = SetDefaultBranchRequest {
+            default_branch: branch.to_string(),
+        };
+
+        let response = self.client.put(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: name.to_string() });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitLab API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl GitLabAdapter {
@@ -465,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_headers_missing_token() {
         let auth = Arc::new(MockAuthProvider::without_token());
-        let adapter = GitLabAdapter::new(auth).unwrap();
+        let adapter = GitLabAdapter::new(auth, "test-org").unwrap();
 
         let result = adapter.auth_headers().await;
         assert!(matches!(result, Err(ForgeError::AuthenticationFailed { .. })));
@@ -474,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_headers_with_token() {
         let auth = Arc::new(MockAuthProvider::with_token("glpat-test123"));
-        let adapter = GitLabAdapter::new(auth).unwrap();
+        let adapter = GitLabAdapter::new(auth, "test-org").unwrap();
 
         let headers = adapter.auth_headers().await.unwrap();
         assert!(headers.contains_key("PRIVATE-TOKEN"));

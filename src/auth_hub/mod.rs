@@ -212,7 +212,6 @@ impl AuthHub {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use std::path::PathBuf;
     use futures::StreamExt;
 
     async fn create_test_hub() -> (AuthHub, TempDir) {
@@ -227,7 +226,8 @@ mod tests {
         let (hub, _temp) = create_test_hub().await;
 
         // Set a secret
-        let mut set_stream = hub.set_secret("github/alice/token".to_string(), "ghp_xxx".to_string()).await;
+        let set_stream = hub.set_secret("github/alice/token".to_string(), "ghp_xxx".to_string()).await;
+        tokio::pin!(set_stream);
         while let Some(event) = set_stream.next().await {
             match event {
                 AuthEvent::Success { .. } => {}
@@ -237,7 +237,8 @@ mod tests {
         }
 
         // Get it back
-        let mut get_stream = hub.get_secret("github/alice/token".to_string()).await;
+        let get_stream = hub.get_secret("github/alice/token".to_string()).await;
+        tokio::pin!(get_stream);
         let mut found = false;
         while let Some(event) = get_stream.next().await {
             match event {
@@ -256,13 +257,22 @@ mod tests {
     async fn test_list_secrets() {
         let (hub, _temp) = create_test_hub().await;
 
-        // Set multiple secrets
-        hub.set_secret("github/alice/token".to_string(), "ghp_xxx".to_string()).await;
-        hub.set_secret("github/bob/token".to_string(), "ghp_yyy".to_string()).await;
-        hub.set_secret("codeberg/alice/token".to_string(), "cb_zzz".to_string()).await;
+        // Set multiple secrets (consume streams to ensure writes complete)
+        let s1 = hub.set_secret("github/alice/token".to_string(), "ghp_xxx".to_string()).await;
+        tokio::pin!(s1);
+        while let Some(_) = s1.next().await {}
+
+        let s2 = hub.set_secret("github/bob/token".to_string(), "ghp_yyy".to_string()).await;
+        tokio::pin!(s2);
+        while let Some(_) = s2.next().await {}
+
+        let s3 = hub.set_secret("codeberg/alice/token".to_string(), "cb_zzz".to_string()).await;
+        tokio::pin!(s3);
+        while let Some(_) = s3.next().await {}
 
         // List github secrets
-        let mut list_stream = hub.list_secrets("github/".to_string()).await;
+        let list_stream = hub.list_secrets("github/".to_string()).await;
+        tokio::pin!(list_stream);
         let mut count = 0;
         while let Some(event) = list_stream.next().await {
             match event {
@@ -282,10 +292,13 @@ mod tests {
         let (hub, _temp) = create_test_hub().await;
 
         // Set a secret
-        hub.set_secret("github/alice/token".to_string(), "ghp_xxx".to_string()).await;
+        let set_stream = hub.set_secret("github/alice/token".to_string(), "ghp_xxx".to_string()).await;
+        tokio::pin!(set_stream);
+        while let Some(_) = set_stream.next().await {}
 
         // Delete it
-        let mut delete_stream = hub.delete_secret("github/alice/token".to_string()).await;
+        let delete_stream = hub.delete_secret("github/alice/token".to_string()).await;
+        tokio::pin!(delete_stream);
         while let Some(event) = delete_stream.next().await {
             match event {
                 AuthEvent::Success { .. } => {}
@@ -295,7 +308,8 @@ mod tests {
         }
 
         // Try to get it (should fail)
-        let mut get_stream = hub.get_secret("github/alice/token".to_string()).await;
+        let get_stream = hub.get_secret("github/alice/token".to_string()).await;
+        tokio::pin!(get_stream);
         let mut got_error = false;
         while let Some(event) = get_stream.next().await {
             match event {

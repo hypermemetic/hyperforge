@@ -50,28 +50,52 @@ struct RenameRepoRequest {
     name: String,
 }
 
+/// Request body for setting default branch
+#[derive(Debug, Serialize)]
+struct SetDefaultBranchRequest {
+    default_branch: String,
+}
+
+use crate::types::AccountType;
+
 /// Codeberg adapter for ForgePort trait
 pub struct CodebergAdapter {
     client: Client,
     auth: Arc<dyn AuthProvider>,
     api_url: String,
     org: String,
+    account_type: AccountType,
 }
 
 impl CodebergAdapter {
-    /// Create a new CodebergAdapter with the given auth provider
+    /// Create a new CodebergAdapter with the given auth provider (defaults to User account type)
     pub fn new(auth: Arc<dyn AuthProvider>, org: impl Into<String>) -> ForgeResult<Self> {
-        Self::with_api_url(auth, org, CODEBERG_API_URL.to_string())
+        Self::with_options(auth, org, CODEBERG_API_URL.to_string(), AccountType::User)
+    }
+
+    /// Create a new CodebergAdapter with explicit account type
+    pub fn with_account_type(auth: Arc<dyn AuthProvider>, org: impl Into<String>, account_type: AccountType) -> ForgeResult<Self> {
+        Self::with_options(auth, org, CODEBERG_API_URL.to_string(), account_type)
     }
 
     /// Create a new CodebergAdapter with a custom API URL (for testing)
     pub fn with_api_url(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String) -> ForgeResult<Self> {
+        Self::with_options(auth, org, api_url, AccountType::User)
+    }
+
+    /// Create a new CodebergAdapter with all options
+    pub fn with_options(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String, account_type: AccountType) -> ForgeResult<Self> {
         let client = Client::builder()
             .user_agent("hyperforge/2.0")
             .build()
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        Ok(Self { client, auth, api_url, org: org.into() })
+        Ok(Self { client, auth, api_url, org: org.into(), account_type })
+    }
+
+    /// Check if this is a user account (vs organization)
+    fn is_user(&self) -> bool {
+        self.account_type == AccountType::User
     }
 
     /// Get authorization headers with token from auth provider
@@ -112,6 +136,7 @@ impl CodebergAdapter {
             origin: Forge::Codeberg,
             mirrors: Vec::new(),
             protected: cb_repo.archived,
+            aliases: Vec::new(),
         }
     }
 }
@@ -119,6 +144,11 @@ impl CodebergAdapter {
 #[async_trait]
 impl ForgePort for CodebergAdapter {
     async fn list_repos(&self, org: &str) -> ForgeResult<Vec<Repo>> {
+        // Use appropriate endpoint based on account type
+        if self.is_user() {
+            return self.list_user_repos(org).await;
+        }
+
         let headers = self.auth_headers().await?;
         let url = format!("{}/orgs/{}/repos?limit=100", self.api_url, org);
 
@@ -127,11 +157,6 @@ impl ForgePort for CodebergAdapter {
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            // Try user repos if org not found
-            return self.list_user_repos(org).await;
-        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -175,9 +200,14 @@ impl ForgePort for CodebergAdapter {
         Ok(Self::to_repo(cb_repo))
     }
 
-    async fn create_repo(&self, org: &str, repo: &Repo) -> ForgeResult<()> {
+    async fn create_repo(&self, _org: &str, repo: &Repo) -> ForgeResult<()> {
+        // Use appropriate endpoint based on account type
+        if self.is_user() {
+            return self.create_user_repo(repo).await;
+        }
+
         let headers = self.auth_headers().await?;
-        let url = format!("{}/org/{}/repos", self.api_url, org);
+        let url = format!("{}/org/{}/repos", self.api_url, self.org);
 
         let request = CreateRepoRequest {
             name: repo.name.clone(),
@@ -192,11 +222,6 @@ impl ForgePort for CodebergAdapter {
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
-
-        // If org create fails with 404, try user create
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return self.create_user_repo(repo).await;
-        }
 
         if response.status() == reqwest::StatusCode::CONFLICT {
             return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
@@ -307,13 +332,44 @@ impl ForgePort for CodebergAdapter {
 
         Ok(())
     }
+
+    async fn set_default_branch(&self, org: &str, name: &str, branch: &str) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let url = format!("{}/repos/{}/{}", self.api_url, org, name);
+
+        let request = SetDefaultBranchRequest {
+            default_branch: branch.to_string(),
+        };
+
+        let response = self.client.patch(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: name.to_string() });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "Codeberg API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl CodebergAdapter {
-    /// List repos for a user (fallback when org doesn't exist)
-    async fn list_user_repos(&self, username: &str) -> ForgeResult<Vec<Repo>> {
+    /// List repos for the authenticated user (includes private repos)
+    async fn list_user_repos(&self, _username: &str) -> ForgeResult<Vec<Repo>> {
         let headers = self.auth_headers().await?;
-        let url = format!("{}/users/{}/repos?limit=100", self.api_url, username);
+        // Use /user/repos to get authenticated user's repos including private
+        let url = format!("{}/user/repos?limit=100", self.api_url);
 
         let response = self.client.get(&url)
             .headers(headers)
@@ -438,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_headers_missing_token() {
         let auth = Arc::new(MockAuthProvider::without_token());
-        let adapter = CodebergAdapter::new(auth).unwrap();
+        let adapter = CodebergAdapter::new(auth, "test-org").unwrap();
 
         let result = adapter.auth_headers().await;
         assert!(matches!(result, Err(ForgeError::AuthenticationFailed { .. })));
@@ -447,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_headers_with_token() {
         let auth = Arc::new(MockAuthProvider::with_token("cb_test123"));
-        let adapter = CodebergAdapter::new(auth).unwrap();
+        let adapter = CodebergAdapter::new(auth, "test-org").unwrap();
 
         let headers = adapter.auth_headers().await.unwrap();
         assert!(headers.contains_key(header::AUTHORIZATION));

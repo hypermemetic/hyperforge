@@ -20,6 +20,10 @@ pub struct LocalForge {
     repos: Arc<RwLock<HashMap<String, Repo>>>,
     /// Path to repos.yaml file
     config_path: Option<PathBuf>,
+    /// Raw YAML content from last load/save (for change detection)
+    last_loaded_content: Arc<RwLock<Option<String>>>,
+    /// Directory to write backup files when external changes detected
+    backup_dir: PathBuf,
 }
 
 impl LocalForge {
@@ -29,6 +33,8 @@ impl LocalForge {
             org: org.into(),
             repos: Arc::new(RwLock::new(HashMap::new())),
             config_path: None,
+            last_loaded_content: Arc::new(RwLock::new(None)),
+            backup_dir: PathBuf::from("/var/log/plexusrpc/substrate"),
         }
     }
 
@@ -38,7 +44,15 @@ impl LocalForge {
             org: org.into(),
             repos: Arc::new(RwLock::new(HashMap::new())),
             config_path: Some(path),
+            last_loaded_content: Arc::new(RwLock::new(None)),
+            backup_dir: PathBuf::from("/var/log/plexusrpc/substrate"),
         }
+    }
+
+    /// Set the backup directory (for testing)
+    pub fn with_backup_dir(mut self, dir: PathBuf) -> Self {
+        self.backup_dir = dir;
+        self
     }
 
     /// Get the organization name
@@ -82,6 +96,10 @@ impl LocalForge {
     }
 
     /// Load repositories from YAML file
+    ///
+    /// Detects external changes by comparing file content against the last
+    /// loaded/saved content. When a change is detected (and this isn't the
+    /// first load), backs up the previous content before applying the new state.
     pub async fn load_from_yaml(&self) -> ForgeResult<()> {
         let path = self.config_path.as_ref()
             .ok_or_else(|| ForgeError::ApiError("No config path set".to_string()))?;
@@ -92,6 +110,22 @@ impl LocalForge {
         }
 
         let content = tokio::fs::read_to_string(path).await?;
+
+        // Change detection: clone previous content out of lock, then compare
+        let previous_content = {
+            let last = self.last_loaded_content.read().map_err(|e| {
+                ForgeError::ApiError(format!("Lock poisoned: {}", e))
+            })?;
+            last.clone()
+        }; // lock dropped here, before any .await
+
+        if let Some(previous) = previous_content.as_ref() {
+            if *previous != content {
+                // External change detected — backup previous content
+                self.write_backup(previous).await;
+            }
+        }
+
         let config: ReposYaml = serde_yaml::from_str(&content)
             .map_err(|e| ForgeError::SerdeError(e.to_string()))?;
 
@@ -106,7 +140,33 @@ impl LocalForge {
             repos.insert(r.name.clone(), r);
         }
 
+        // Update tracked content after successful load
+        drop(repos); // release repos lock before acquiring last_loaded_content
+        {
+            let mut last = self.last_loaded_content.write().map_err(|e| {
+                ForgeError::ApiError(format!("Lock poisoned: {}", e))
+            })?;
+            *last = Some(content);
+        }
+
         Ok(())
+    }
+
+    /// Best-effort backup of previous YAML content before external changes overwrite it.
+    /// Writes to `{backup_dir}/{org}-repos-{timestamp}.yaml`.
+    async fn write_backup(&self, previous_content: &str) {
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
+        let filename = format!("{}-repos-{}.yaml", self.org, timestamp);
+        let backup_path = self.backup_dir.join(filename);
+
+        if let Err(e) = tokio::fs::create_dir_all(&self.backup_dir).await {
+            eprintln!("hyperforge: failed to create backup dir {:?}: {}", self.backup_dir, e);
+            return;
+        }
+
+        if let Err(e) = tokio::fs::write(&backup_path, previous_content).await {
+            eprintln!("hyperforge: failed to write backup {:?}: {}", backup_path, e);
+        }
     }
 
     /// Save repositories to YAML file
@@ -139,7 +199,15 @@ impl LocalForge {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(path, yaml).await?;
+        tokio::fs::write(path, &yaml).await?;
+
+        // Update tracked content so our own writes don't trigger false change detection
+        {
+            let mut last = self.last_loaded_content.write().map_err(|e| {
+                ForgeError::ApiError(format!("Lock poisoned: {}", e))
+            })?;
+            *last = Some(yaml);
+        }
 
         Ok(())
     }
@@ -235,10 +303,24 @@ impl ForgePort for LocalForge {
             return Err(ForgeError::RepoAlreadyExists { name: new_name.to_string() });
         }
 
+        // Track old name in aliases (most recent first)
+        repo.aliases.insert(0, old_name.to_string());
+
         // Update the name and insert with new key
         repo.name = new_name.to_string();
         repos.insert(new_name.to_string(), repo);
 
+        Ok(())
+    }
+
+    async fn set_default_branch(&self, org: &str, _name: &str, _branch: &str) -> ForgeResult<()> {
+        if org != self.org {
+            return Err(ForgeError::ApiError(format!(
+                "Organization mismatch: expected {}, got {}",
+                self.org, org
+            )));
+        }
+        // LocalForge doesn't track default branch - this is a remote-only operation
         Ok(())
     }
 }

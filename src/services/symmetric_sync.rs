@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::adapters::{ForgePort, ForgeResult};
+use crate::adapters::{ForgeError, ForgePort, ForgeResult};
 use crate::types::Repo;
 
 /// Sync operation type
@@ -177,7 +177,27 @@ impl SymmetricSyncService {
         org: &str,
         dry_run: bool,
     ) -> ForgeResult<SyncDiff> {
-        let diff = self.diff(source.clone(), target.clone(), org).await?;
+        self.sync_with_options(source, target, org, dry_run, false).await
+    }
+
+    /// Execute sync operations with options
+    ///
+    /// # Arguments
+    /// * `skip_delete` - If true, skip delete operations (safer for partial configs)
+    pub async fn sync_with_options(
+        &self,
+        source: Arc<dyn ForgePort>,
+        target: Arc<dyn ForgePort>,
+        org: &str,
+        dry_run: bool,
+        skip_delete: bool,
+    ) -> ForgeResult<SyncDiff> {
+        let mut diff = self.diff(source.clone(), target.clone(), org).await?;
+
+        // Filter out deletes if skip_delete is true
+        if skip_delete {
+            diff.ops.retain(|op| op.op != SyncOp::Delete);
+        }
 
         if dry_run {
             return Ok(diff);
@@ -187,13 +207,26 @@ impl SymmetricSyncService {
         for op in &diff.ops {
             match op.op {
                 SyncOp::Create => {
-                    target.create_repo(org, &op.repo).await?;
+                    match target.create_repo(org, &op.repo).await {
+                        Ok(_) => {}
+                        Err(ForgeError::RepoAlreadyExists { .. }) => {
+                            // Repo exists but wasn't in our diff - try update instead
+                            target.update_repo(org, &op.repo).await?;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 SyncOp::Update => {
                     target.update_repo(org, &op.repo).await?;
                 }
                 SyncOp::Delete => {
-                    target.delete_repo(org, &op.repo.name).await?;
+                    match target.delete_repo(org, &op.repo.name).await {
+                        Ok(_) => {}
+                        Err(ForgeError::RepoNotFound { .. }) => {
+                            // Already deleted, that's fine
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 SyncOp::InSync => {
                     // No action needed
@@ -275,7 +308,19 @@ impl Default for SymmetricSyncService {
 
 /// Check if two repos differ in meaningful ways
 fn repos_differ(a: &Repo, b: &Repo) -> bool {
-    a.description != b.description || a.visibility != b.visibility
+    !descriptions_equal(&a.description, &b.description) || a.visibility != b.visibility
+}
+
+/// Compare descriptions, treating None and Some("") as equal
+fn descriptions_equal(a: &Option<String>, b: &Option<String>) -> bool {
+    let a_empty = a.as_ref().map(|s| s.is_empty()).unwrap_or(true);
+    let b_empty = b.as_ref().map(|s| s.is_empty()).unwrap_or(true);
+
+    if a_empty && b_empty {
+        true
+    } else {
+        a == b
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ pub mod config;
 pub mod git;
 pub mod hub;
 pub mod package;
+pub mod packages;
 pub mod remote;
 pub mod services;
 pub mod types;

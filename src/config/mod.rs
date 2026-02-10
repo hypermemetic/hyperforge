@@ -75,6 +75,10 @@ pub struct HyperforgeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Default branch name (e.g., "main" or "master")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+
     /// SSH key paths per forge
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ssh: HashMap<String, String>,
@@ -92,6 +96,7 @@ impl Default for HyperforgeConfig {
             forges: vec!["github".to_string()],
             visibility: Visibility::Public,
             description: None,
+            default_branch: None,
             ssh: HashMap::new(),
             forge_config: HashMap::new(),
         }
@@ -128,6 +133,12 @@ impl HyperforgeConfig {
     /// Builder method: set description
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Builder method: set default branch
+    pub fn with_default_branch(mut self, branch: impl Into<String>) -> Self {
+        self.default_branch = Some(branch.into());
         self
     }
 

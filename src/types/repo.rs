@@ -25,6 +25,10 @@ pub struct Repo {
     /// Whether this repo is protected from deletion
     #[serde(default)]
     pub protected: bool,
+
+    /// Previous names this repo was known by (most recent first)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 impl Repo {
@@ -37,6 +41,7 @@ impl Repo {
             origin,
             mirrors: Vec::new(),
             protected: false,
+            aliases: Vec::new(),
         }
     }
 

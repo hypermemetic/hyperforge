@@ -69,6 +69,9 @@ pub trait ForgePort: Send + Sync {
     /// Rename a repository
     async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()>;
 
+    /// Set the default branch for a repository
+    async fn set_default_branch(&self, org: &str, name: &str, branch: &str) -> ForgeResult<()>;
+
     /// Check if a repository exists
     async fn repo_exists(&self, org: &str, name: &str) -> ForgeResult<bool> {
         match self.get_repo(org, name).await {
