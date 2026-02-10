@@ -5,7 +5,9 @@
 pub mod init;
 pub mod push;
 pub mod status;
+pub mod workspace;
 
 pub use init::{init, InitOptions, InitResult};
 pub use push::{push, ForgePushResult, PushOptions, PushReport, PushResult};
 pub use status::{status, ForgeStatus, RepoStatusReport, StatusResult};
+pub use workspace::{discover_workspace, DiscoveredRepo, WorkspaceContext, WorkspaceResult};
