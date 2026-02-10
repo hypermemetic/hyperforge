@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "hyperforge"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1317,7 +1317,9 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "plexus-core"
-version = "0.2.1-worktree"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e1de332bf653157da340fa288b504375a25c8ab705e22845857ec65ddb4dd8a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1340,7 +1342,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-macros"
-version = "0.2.1-worktree"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3060dedfe04798cddad0defa8ea6f48bd6a4f59681b00b9e4f40ccd284dedbce"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1351,6 +1355,8 @@ dependencies = [
 [[package]]
 name = "plexus-transport"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de8acb876d704c52632277fbaac6027e876b16f8d84cd40aadec421c4e789f35"
 dependencies = [
  "anyhow",
  "async-stream",

@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod git;
 pub mod hub;
+pub mod hubs;
 pub mod package;
 pub mod remote;
 pub mod services;
