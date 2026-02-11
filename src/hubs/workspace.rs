@@ -61,7 +61,6 @@ fn make_adapter(forge: &str, org: &str) -> Result<Arc<dyn ForgePort>, String> {
 
 #[plexus_macros::hub_methods(
     namespace = "workspace",
-    version = "3.1.0",
     description = "Multi-repo workspace orchestration",
     crate_path = "plexus_core"
 )]

@@ -28,7 +28,6 @@ impl RepoHub {
 
 #[plexus_macros::hub_methods(
     namespace = "repo",
-    version = "3.1.0",
     description = "Single-repo operations and registry CRUD",
     crate_path = "plexus_core"
 )]

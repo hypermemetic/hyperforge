@@ -24,7 +24,6 @@ impl ConfigHub {
 
 #[plexus_macros::hub_methods(
     namespace = "config",
-    version = "3.1.0",
     description = "Org-level configuration",
     crate_path = "plexus_core"
 )]
