@@ -108,7 +108,7 @@ impl Default for HyperforgeHub {
 
 #[plexus_macros::hub_methods(
     namespace = "hyperforge",
-    version = "3.0.0",
+    version = "3.1.0",
     description = "Multi-forge repository management",
     crate_path = "plexus_core",
     hub
