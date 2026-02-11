@@ -3,6 +3,10 @@
 use serde::{Deserialize, Serialize};
 use super::{Forge, Visibility};
 
+pub(crate) fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Repository configuration with origin and mirrors
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
@@ -25,6 +29,10 @@ pub struct Repo {
     /// Whether this repo is protected from deletion
     #[serde(default)]
     pub protected: bool,
+
+    /// Whether this repo is staged for deletion by `workspace reflect`
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub staged_for_deletion: bool,
 }
 
 impl Repo {
@@ -37,6 +45,7 @@ impl Repo {
             origin,
             mirrors: Vec::new(),
             protected: false,
+            staged_for_deletion: false,
         }
     }
 
@@ -71,6 +80,12 @@ impl Repo {
     /// Mark as protected
     pub fn with_protected(mut self, protected: bool) -> Self {
         self.protected = protected;
+        self
+    }
+
+    /// Mark as staged for deletion
+    pub fn with_staged_for_deletion(mut self, staged: bool) -> Self {
+        self.staged_for_deletion = staged;
         self
     }
 

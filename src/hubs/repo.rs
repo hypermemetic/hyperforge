@@ -58,6 +58,7 @@ impl RepoHub {
                                 .map(|f| format!("{:?}", f).to_lowercase())
                                 .collect(),
                             protected: repo.protected,
+                            staged_for_deletion: repo.staged_for_deletion,
                         };
                     }
                 }
@@ -167,6 +168,7 @@ impl RepoHub {
                             .map(|f| format!("{:?}", f).to_lowercase())
                             .collect(),
                         protected: repo.protected,
+                        staged_for_deletion: repo.staged_for_deletion,
                     };
                 }
                 Err(e) => {
@@ -569,6 +571,7 @@ impl RepoHub {
                                 .map(|f| format!("{:?}", f).to_lowercase())
                                 .collect(),
                             protected: repo.protected,
+                            staged_for_deletion: repo.staged_for_deletion,
                         };
                     }
                     Err(e) => {

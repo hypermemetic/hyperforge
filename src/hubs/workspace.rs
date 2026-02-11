@@ -21,7 +21,8 @@ use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::services::SyncOp;
-use crate::types::Forge;
+use crate::types::{Forge, Visibility};
+use std::collections::HashSet;
 
 /// Sub-hub for multi-repo workspace orchestration
 #[derive(Clone)]
@@ -1057,6 +1058,588 @@ impl WorkspaceHub {
                     }
                 }
             }
+        }
+    }
+
+    /// Make the workspace directory the canonical source of truth.
+    ///
+    /// Like `sync` but adds Phase 6 (Retire): remote-only repos are made private and
+    /// staged for deletion. With `--purge`, previously-staged repos are permanently deleted.
+    #[plexus_macros::hub_method(
+        description = "Make workspace the canonical source of truth. Remote-only repos are retired (made private + staged for deletion). Use --purge to permanently delete previously staged repos.",
+        params(
+            path = "Path to workspace directory (required)",
+            org = "Organization name (inferred from workspace if only one org exists)",
+            forges = "Forges for unconfigured repos (inferred from existing configs if not specified)",
+            dry_run = "Preview all phases without making changes (optional, default: false)",
+            no_push = "Skip the git push phase (optional, default: false)",
+            no_init = "Skip initializing unconfigured repos (optional, default: false)",
+            purge = "Actually delete repos previously staged for deletion (optional, default: false)"
+        )
+    )]
+    pub async fn reflect(
+        &self,
+        path: String,
+        org: Option<String>,
+        forges: Option<Vec<String>>,
+        dry_run: Option<bool>,
+        no_push: Option<bool>,
+        no_init: Option<bool>,
+        purge: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let sync_service = self.state.sync_service.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+        let is_no_push = no_push.unwrap_or(false);
+        let is_no_init = no_init.unwrap_or(false);
+        let is_purge = purge.unwrap_or(false);
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+            // ── Phase 1: Discover ──
+            yield HyperforgeEvent::Info {
+                message: format!("{}Phase 1/7: Discovering workspace...", dry_prefix),
+            };
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "  Found {} configured, {} unconfigured, {} non-git dirs. Orgs: [{}], Forges: [{}]",
+                    ctx.repos.len(),
+                    ctx.unconfigured_repos.len(),
+                    ctx.skipped_dirs.len(),
+                    ctx.orgs.join(", "),
+                    ctx.forges.join(", "),
+                ),
+            };
+
+            if !ctx.skipped_dirs.is_empty() {
+                for dir in &ctx.skipped_dirs {
+                    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {} [no git — needs git init]", name),
+                    };
+                }
+            }
+
+            // ── Infer org and forges ──
+            let inferred_org: Option<String> = org.clone().or_else(|| {
+                if ctx.orgs.len() == 1 {
+                    Some(ctx.orgs[0].clone())
+                } else {
+                    None
+                }
+            });
+
+            let inferred_forges: Vec<String> = forges.clone().unwrap_or_else(|| ctx.forges.clone());
+
+            let has_unconfigured = !ctx.unconfigured_repos.is_empty();
+
+            if has_unconfigured && inferred_org.is_none() {
+                yield HyperforgeEvent::Error {
+                    message: "Cannot init unconfigured repos: multiple orgs found and --org not specified. Skipping init phase.".to_string(),
+                };
+            }
+            if has_unconfigured && inferred_forges.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: "Cannot init unconfigured repos: no forges found and --forges not specified. Skipping init phase.".to_string(),
+                };
+            }
+
+            // ── Phase 2: Init + re-discover ──
+            let mut inits_performed = 0usize;
+
+            if !is_no_init && has_unconfigured && inferred_org.is_some() && !inferred_forges.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "{}Phase 2/7: Initializing {} unconfigured repos (org={}, forges=[{}])...",
+                        dry_prefix,
+                        ctx.unconfigured_repos.len(),
+                        inferred_org.as_deref().unwrap_or("?"),
+                        inferred_forges.join(", "),
+                    ),
+                };
+
+                for repo_path in &ctx.unconfigured_repos {
+                    let dir_name = repo_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?");
+
+                    let mut opts = InitOptions::new(inferred_forges.clone());
+                    if let Some(ref o) = inferred_org {
+                        opts = opts.with_org(o.as_str());
+                    }
+                    if is_dry_run {
+                        opts = opts.dry_run();
+                    }
+
+                    match init(repo_path, opts) {
+                        Ok(_report) => {
+                            inits_performed += 1;
+                            yield HyperforgeEvent::Info {
+                                message: format!("  {}Initialized {}", dry_prefix, dir_name),
+                            };
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("  Failed to init {}: {}", dir_name, e),
+                            };
+                        }
+                    }
+                }
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("{}Phase 2/7: Init skipped.", dry_prefix),
+                };
+            }
+
+            // Re-discover after inits
+            let ctx = if inits_performed > 0 && !is_dry_run {
+                match discover_workspace(&workspace_path) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Re-discovery failed: {}", e),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                ctx
+            };
+
+            // ── Phase 3: Register + unstage ──
+            yield HyperforgeEvent::Info {
+                message: format!("{}Phase 3/7: Registering {} configured repos in LocalForge...", dry_prefix, ctx.repos.len()),
+            };
+
+            let mut registered = 0usize;
+            let mut already_registered = 0usize;
+            let mut unstaged = 0usize;
+
+            for discovered in &ctx.repos {
+                let repo = match repo_from_config(discovered) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let repo_org = match discovered.org() {
+                    Some(o) => o.to_string(),
+                    None => continue,
+                };
+
+                let local = state.get_local_forge(&repo_org).await;
+
+                match local.repo_exists(&repo_org, &repo.name).await {
+                    Ok(true) => {
+                        // Check if previously staged for deletion — unstage it
+                        match local.get_repo(&repo_org, &repo.name).await {
+                            Ok(existing) if existing.staged_for_deletion => {
+                                let mut updated = existing.clone();
+                                updated.staged_for_deletion = false;
+                                if let Err(e) = local.update_repo(&repo_org, &updated).await {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("  Failed to unstage {}: {}", repo.name, e),
+                                    };
+                                } else {
+                                    unstaged += 1;
+                                    yield HyperforgeEvent::Info {
+                                        message: format!("  {}Unstaged {} (found locally)", dry_prefix, repo.name),
+                                    };
+                                }
+                            }
+                            _ => {}
+                        }
+                        already_registered += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to check {}: {}", repo.name, e),
+                        };
+                        continue;
+                    }
+                }
+
+                if let Err(e) = local.create_repo(&repo_org, &repo).await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("  Failed to register {}: {}", repo.name, e),
+                    };
+                    continue;
+                }
+
+                registered += 1;
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}Registered {}", dry_prefix, repo.name),
+                };
+            }
+
+            if !is_dry_run && (registered > 0 || unstaged > 0) {
+                for org_name in &ctx.orgs {
+                    let local = state.get_local_forge(org_name).await;
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to save LocalForge for {}: {}", org_name, e),
+                        };
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "  {} newly registered, {} already in LocalForge, {} unstaged",
+                    registered, already_registered, unstaged,
+                ),
+            };
+
+            // ── Phase 4: Diff ──
+            let pairs = ctx.org_forge_pairs();
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}Phase 4/7: Computing diffs...", dry_prefix),
+            };
+
+            let mut all_diffs: Vec<(String, String, crate::services::SyncDiff)> = Vec::new();
+
+            for (org_name, forge_name) in &pairs {
+                let adapter = match make_adapter(forge_name, org_name) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
+                        continue;
+                    }
+                };
+
+                let local = state.get_local_forge(org_name).await;
+
+                match sync_service.diff(local, adapter, org_name).await {
+                    Ok(diff) => {
+                        yield HyperforgeEvent::SyncSummary {
+                            forge: forge_name.clone(),
+                            total: diff.ops.len(),
+                            to_create: diff.to_create().len(),
+                            to_update: diff.to_update().len(),
+                            to_delete: diff.to_delete().len(),
+                            in_sync: diff.in_sync().len(),
+                        };
+
+                        all_diffs.push((org_name.clone(), forge_name.clone(), diff));
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Diff failed for {}/{}: {}", org_name, forge_name, e),
+                        };
+                    }
+                }
+            }
+
+            // ── Phase 5: Apply creates/updates (no deletes) ──
+            yield HyperforgeEvent::Info {
+                message: format!("{}Phase 5/7: Applying creates and updates (no deletes)...", dry_prefix),
+            };
+
+            let mut total_created = 0usize;
+            let mut total_updated = 0usize;
+
+            for (org_name, forge_name, diff) in &all_diffs {
+                let adapter = match make_adapter(forge_name, org_name) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
+                        continue;
+                    }
+                };
+
+                for repo_op in &diff.ops {
+                    match repo_op.op {
+                        SyncOp::Create => {
+                            if !is_dry_run {
+                                if let Err(e) = adapter.create_repo(org_name, &repo_op.repo).await {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("  Failed to create {} on {}: {}", repo_op.repo.name, forge_name, e),
+                                    };
+                                    continue;
+                                }
+                            }
+                            total_created += 1;
+                            yield HyperforgeEvent::SyncOp {
+                                repo_name: repo_op.repo.name.clone(),
+                                operation: "create".to_string(),
+                                forge: forge_name.clone(),
+                            };
+                        }
+                        SyncOp::Update => {
+                            if !is_dry_run {
+                                if let Err(e) = adapter.update_repo(org_name, &repo_op.repo).await {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("  Failed to update {} on {}: {}", repo_op.repo.name, forge_name, e),
+                                    };
+                                    continue;
+                                }
+                            }
+                            total_updated += 1;
+                            yield HyperforgeEvent::SyncOp {
+                                repo_name: repo_op.repo.name.clone(),
+                                operation: "update".to_string(),
+                                forge: forge_name.clone(),
+                            };
+                        }
+                        SyncOp::Delete | SyncOp::InSync => {
+                            // Handled in Phase 6 (retire) or nothing to do
+                        }
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "  {}{} created, {} updated on remotes",
+                    dry_prefix, total_created, total_updated,
+                ),
+            };
+
+            // ── Phase 6: Retire remote-only repos ──
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Phase 6/7: {}retiring remote-only repos...",
+                    dry_prefix,
+                    if is_purge { "Purging previously " } else { "Staging and " },
+                ),
+            };
+
+            // Build set of local repo names from workspace discovery
+            let local_names: HashSet<String> = ctx.repos.iter()
+                .filter_map(|r| repo_from_config(r).map(|repo| repo.name))
+                .collect();
+
+            let mut staged_count = 0usize;
+            let mut purged_count = 0usize;
+            let mut protected_skipped = 0usize;
+
+            for (org_name, forge_name) in &pairs {
+                let adapter = match make_adapter(forge_name, org_name) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
+                        continue;
+                    }
+                };
+
+                let remote_repos = match adapter.list_repos(org_name).await {
+                    Ok(repos) => repos,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to list remote repos for {}/{}: {}", org_name, forge_name, e),
+                        };
+                        continue;
+                    }
+                };
+
+                let local = state.get_local_forge(org_name).await;
+
+                for remote_repo in &remote_repos {
+                    if local_names.contains(&remote_repo.name) {
+                        continue;
+                    }
+
+                    // Remote-only repo found
+                    if remote_repo.protected {
+                        protected_skipped += 1;
+                        yield HyperforgeEvent::Info {
+                            message: format!(
+                                "  Skipping {} on {} (protected/archived)",
+                                remote_repo.name, forge_name,
+                            ),
+                        };
+                        continue;
+                    }
+
+                    if is_purge {
+                        // Purge mode: only delete repos that were previously staged
+                        let is_staged = match local.get_repo(org_name, &remote_repo.name).await {
+                            Ok(existing) => existing.staged_for_deletion,
+                            Err(_) => false,
+                        };
+
+                        if !is_staged {
+                            // Not previously staged — stage it instead
+                            let privatized = remote_repo.clone()
+                                .with_visibility(Visibility::Private)
+                                .with_staged_for_deletion(true);
+
+                            if !is_dry_run {
+                                let _ = adapter.update_repo(org_name, &privatized).await;
+                            }
+
+                            // Register/update in LocalForge
+                            match local.repo_exists(org_name, &remote_repo.name).await {
+                                Ok(true) => { let _ = local.update_repo(org_name, &privatized).await; }
+                                Ok(false) => { let _ = local.create_repo(org_name, &privatized).await; }
+                                Err(_) => {}
+                            }
+
+                            staged_count += 1;
+                            yield HyperforgeEvent::SyncOp {
+                                repo_name: remote_repo.name.clone(),
+                                operation: "staged".to_string(),
+                                forge: forge_name.clone(),
+                            };
+                            continue;
+                        }
+
+                        // Actually delete
+                        if !is_dry_run {
+                            if let Err(e) = adapter.delete_repo(org_name, &remote_repo.name).await {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("  Failed to delete {} on {}: {}", remote_repo.name, forge_name, e),
+                                };
+                                continue;
+                            }
+                            let _ = local.delete_repo(org_name, &remote_repo.name).await;
+                        }
+
+                        purged_count += 1;
+                        yield HyperforgeEvent::SyncOp {
+                            repo_name: remote_repo.name.clone(),
+                            operation: "purged".to_string(),
+                            forge: forge_name.clone(),
+                        };
+                    } else {
+                        // Default: stage for deletion (make private + flag)
+                        let privatized = remote_repo.clone()
+                            .with_visibility(Visibility::Private)
+                            .with_staged_for_deletion(true);
+
+                        if !is_dry_run {
+                            if let Err(e) = adapter.update_repo(org_name, &privatized).await {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("  Failed to make {} private on {}: {}", remote_repo.name, forge_name, e),
+                                };
+                                continue;
+                            }
+                        }
+
+                        // Register/update in LocalForge (always for accurate reporting)
+                        match local.repo_exists(org_name, &remote_repo.name).await {
+                            Ok(true) => { let _ = local.update_repo(org_name, &privatized).await; }
+                            Ok(false) => { let _ = local.create_repo(org_name, &privatized).await; }
+                            Err(_) => {}
+                        }
+
+                        staged_count += 1;
+                        yield HyperforgeEvent::SyncOp {
+                            repo_name: remote_repo.name.clone(),
+                            operation: "staged".to_string(),
+                            forge: forge_name.clone(),
+                        };
+                    }
+                }
+
+                // Persist LocalForge changes
+                if !is_dry_run {
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to save LocalForge for {}: {}", org_name, e),
+                        };
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "  {}{} staged, {} purged, {} protected (skipped)",
+                    dry_prefix, staged_count, purged_count, protected_skipped,
+                ),
+            };
+
+            // ── Phase 7: Push git content ──
+            if is_no_push {
+                yield HyperforgeEvent::Info {
+                    message: format!("{}Phase 7/7: Push skipped (--no_push).", dry_prefix),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("{}Phase 7/7: Pushing {} repos...", dry_prefix, ctx.repos.len()),
+                };
+
+                let mut push_success = 0usize;
+                let mut push_failed = 0usize;
+
+                for repo in &ctx.repos {
+                    if !repo.is_git_repo {
+                        continue;
+                    }
+
+                    let mut options = PushOptions::new();
+                    if is_dry_run {
+                        options = options.dry_run();
+                    }
+
+                    match push(&repo.path, options) {
+                        Ok(report) => {
+                            for result in &report.results {
+                                yield HyperforgeEvent::RepoPush {
+                                    repo_name: repo.dir_name.clone(),
+                                    path: repo.path.display().to_string(),
+                                    forge: result.forge.clone(),
+                                    success: result.success,
+                                    error: result.error.clone(),
+                                };
+                            }
+                            if report.all_success {
+                                push_success += 1;
+                            } else {
+                                push_failed += 1;
+                            }
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::RepoPush {
+                                repo_name: repo.dir_name.clone(),
+                                path: repo.path.display().to_string(),
+                                forge: "all".to_string(),
+                                success: false,
+                                error: Some(e.to_string()),
+                            };
+                            push_failed += 1;
+                        }
+                    }
+                }
+
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "  {}{} pushed successfully, {} failed",
+                        dry_prefix, push_success, push_failed,
+                    ),
+                };
+            }
+
+            // ── Summary ──
+            yield HyperforgeEvent::Info {
+                message: format!("{}Reflect pipeline complete.", dry_prefix),
+            };
+
+            yield HyperforgeEvent::WorkspaceSummary {
+                total_repos: ctx.repos.len() + ctx.unconfigured_repos.len(),
+                configured_repos: ctx.repos.len(),
+                unconfigured_repos: ctx.unconfigured_repos.len(),
+                clean_repos: None,
+                dirty_repos: None,
+                wrong_branch_repos: None,
+                push_success: None,
+                push_failed: None,
+            };
         }
     }
 

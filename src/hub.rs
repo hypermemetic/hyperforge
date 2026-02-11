@@ -39,6 +39,8 @@ pub enum HyperforgeEvent {
         origin: String,
         mirrors: Vec<String>,
         protected: bool,
+        #[serde(default, skip_serializing_if = "crate::types::repo::is_false")]
+        staged_for_deletion: bool,
     },
     /// Sync diff result - repo operation
     SyncOp {
