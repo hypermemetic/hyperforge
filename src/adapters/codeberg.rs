@@ -112,6 +112,7 @@ impl CodebergAdapter {
             origin: Forge::Codeberg,
             mirrors: Vec::new(),
             protected: cb_repo.archived,
+            staged_for_deletion: false,
         }
     }
 }

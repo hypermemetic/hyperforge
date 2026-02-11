@@ -149,6 +149,7 @@ impl GitLabAdapter {
             origin: Forge::GitLab,
             mirrors: Vec::new(),
             protected: gl_project.archived,
+            staged_for_deletion: false,
         }
     }
 

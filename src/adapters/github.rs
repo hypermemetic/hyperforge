@@ -113,6 +113,7 @@ impl GitHubAdapter {
             origin: Forge::GitHub,
             mirrors: Vec::new(),
             protected: gh_repo.archived,
+            staged_for_deletion: false,
         }
     }
 }
