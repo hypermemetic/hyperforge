@@ -643,13 +643,12 @@ impl WorkspaceHub {
                     }
                 }
 
-                if !is_dry_run {
-                    if let Err(e) = local.create_repo(&repo_org, &repo).await {
-                        yield HyperforgeEvent::Error {
-                            message: format!("  Failed to register {}: {}", repo.name, e),
-                        };
-                        continue;
-                    }
+                // Always populate in-memory state (even in dry-run) so Phase 6 diff is accurate
+                if let Err(e) = local.create_repo(&repo_org, &repo).await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("  Failed to register {}: {}", repo.name, e),
+                    };
+                    continue;
                 }
 
                 registered += 1;
@@ -658,7 +657,7 @@ impl WorkspaceHub {
                 };
             }
 
-            // Save all LocalForges that were modified
+            // Persist to disk only on real runs
             if !is_dry_run && registered > 0 {
                 // Save each org's LocalForge
                 for org_name in &ctx.orgs {
@@ -720,13 +719,12 @@ impl WorkspaceHub {
                         }
                     }
 
-                    if !is_dry_run {
-                        if let Err(e) = local.create_repo(org_name, remote_repo).await {
-                            yield HyperforgeEvent::Error {
-                                message: format!("  Failed to import {}: {}", remote_repo.name, e),
-                            };
-                            continue;
-                        }
+                    // Always populate in-memory state (even in dry-run) so Phase 6 diff is accurate
+                    if let Err(e) = local.create_repo(org_name, remote_repo).await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to import {}: {}", remote_repo.name, e),
+                        };
+                        continue;
                     }
 
                     imported += 1;
@@ -735,7 +733,7 @@ impl WorkspaceHub {
                     };
                 }
 
-                // Save after each forge
+                // Persist to disk only on real runs
                 if !is_dry_run && imported > 0 {
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
