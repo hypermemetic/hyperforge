@@ -22,7 +22,7 @@ async fn test_hyperforge_as_plugin() {
             if let Ok(event) = serde_json::from_value::<HyperforgeEvent>(content) {
                 match event {
                     HyperforgeEvent::Status { version, description } => {
-                        assert_eq!(version, "3.0.0");
+                        assert_eq!(version, "3.1.0");
                         assert!(description.contains("LFORGE2"));
                         found_status = true;
                     }
@@ -52,7 +52,7 @@ async fn test_hyperforge_version_method() {
             if let Ok(event) = serde_json::from_value::<HyperforgeEvent>(content) {
                 match event {
                     HyperforgeEvent::Info { message } => {
-                        assert!(message.contains("3.0.0"));
+                        assert!(message.contains("3.1.0"));
                         assert!(message.contains("LFORGE2"));
                         found_version = true;
                     }
@@ -80,7 +80,7 @@ async fn test_dynamic_hub_lists_hyperforge() {
         .find(|a| a.namespace == "hyperforge")
         .expect("hyperforge should be listed in activations");
 
-    assert_eq!(hyperforge_activation.version, "3.0.0");
+    assert_eq!(hyperforge_activation.version, "3.1.0");
     assert_eq!(hyperforge_activation.description, "Multi-forge repository management");
 
     // Check that methods are listed
