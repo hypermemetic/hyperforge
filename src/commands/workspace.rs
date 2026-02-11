@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::config::HyperforgeConfig;
 use crate::git::Git;
+use crate::types::Repo;
 
 /// Errors during workspace discovery
 #[derive(Debug, Error)]
@@ -110,6 +111,41 @@ impl WorkspaceContext {
         }
         pairs.into_iter().collect()
     }
+}
+
+/// Build a `Repo` (suitable for LocalForge) from a discovered repo's config.
+///
+/// First forge → origin, remaining → mirrors.
+/// Returns `None` if config is missing, has no org, or has no valid forges.
+pub fn repo_from_config(discovered: &DiscoveredRepo) -> Option<Repo> {
+    let config = discovered.config.as_ref()?;
+    let _org = config.org.as_ref()?;
+
+    // Parse forge strings into Forge enums, keeping only valid ones
+    let parsed_forges: Vec<_> = config
+        .forges
+        .iter()
+        .filter_map(|f| HyperforgeConfig::parse_forge(f))
+        .collect();
+
+    if parsed_forges.is_empty() {
+        return None;
+    }
+
+    let origin = parsed_forges[0].clone();
+    let mirrors: Vec<_> = parsed_forges[1..].to_vec();
+
+    let repo_name = config.get_repo_name(&discovered.path);
+
+    let mut repo = Repo::new(repo_name, origin)
+        .with_visibility(config.visibility.clone())
+        .with_mirrors(mirrors);
+
+    if let Some(ref desc) = config.description {
+        repo = repo.with_description(desc);
+    }
+
+    Some(repo)
 }
 
 /// Scan immediate children of workspace_path to discover repos.
@@ -291,6 +327,59 @@ mod tests {
     fn test_discover_nonexistent_path() {
         let result = discover_workspace(Path::new("/nonexistent/path"));
         assert!(matches!(result, Err(WorkspaceError::PathNotFound { .. })));
+    }
+
+    #[test]
+    fn test_repo_from_config_basic() {
+        let workspace = setup_workspace();
+        let ctx = discover_workspace(workspace.path()).unwrap();
+
+        // repo-a has github + codeberg, org=alice
+        let repo_a = ctx.repos.iter().find(|r| r.dir_name == "repo-a").unwrap();
+        let repo = repo_from_config(repo_a).unwrap();
+
+        assert_eq!(repo.name, "repo-a");
+        assert_eq!(repo.origin, crate::types::Forge::GitHub);
+        assert_eq!(repo.mirrors, vec![crate::types::Forge::Codeberg]);
+    }
+
+    #[test]
+    fn test_repo_from_config_single_forge() {
+        let workspace = setup_workspace();
+        let ctx = discover_workspace(workspace.path()).unwrap();
+
+        // repo-b has github only, org=bob
+        let repo_b = ctx.repos.iter().find(|r| r.dir_name == "repo-b").unwrap();
+        let repo = repo_from_config(repo_b).unwrap();
+
+        assert_eq!(repo.name, "repo-b");
+        assert_eq!(repo.origin, crate::types::Forge::GitHub);
+        assert!(repo.mirrors.is_empty());
+    }
+
+    #[test]
+    fn test_repo_from_config_no_config() {
+        let discovered = DiscoveredRepo {
+            path: PathBuf::from("/tmp/fake"),
+            dir_name: "fake".to_string(),
+            config: None,
+            is_git_repo: true,
+            is_hyperforge_repo: false,
+        };
+        assert!(repo_from_config(&discovered).is_none());
+    }
+
+    #[test]
+    fn test_repo_from_config_no_org() {
+        let discovered = DiscoveredRepo {
+            path: PathBuf::from("/tmp/fake"),
+            dir_name: "fake".to_string(),
+            config: Some(HyperforgeConfig::new(vec!["github".to_string()])),
+            is_git_repo: true,
+            is_hyperforge_repo: true,
+        };
+        // No org set → returns None
+        assert!(repo_from_config(&discovered).is_none());
     }
 
     #[test]
