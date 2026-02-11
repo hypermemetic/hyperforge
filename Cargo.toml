@@ -1,6 +1,6 @@
 [package]
 name = "hyperforge"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2021"
 description = "Multi-forge repository management"
 license = "MIT"
@@ -20,7 +20,7 @@ path = "src/bin/hyperforge-auth.rs"
 [dependencies]
 # Hub framework integration
 plexus-core = "0.2.1"
-plexus-macros = "0.2.1"
+plexus-macros = "0.2.2"
 plexus-transport = "0.1.0"
 
 # Async

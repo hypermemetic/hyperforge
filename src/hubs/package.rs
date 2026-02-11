@@ -24,7 +24,6 @@ impl PackageHub {
 
 #[plexus_macros::hub_methods(
     namespace = "package",
-    version = "3.1.0",
     description = "Package publishing lifecycle",
     crate_path = "plexus_core"
 )]
