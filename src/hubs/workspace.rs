@@ -496,13 +496,24 @@ impl WorkspaceHub {
 
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "  Found {} configured, {} unconfigured repos. Orgs: [{}], Forges: [{}]",
+                    "  Found {} configured, {} unconfigured, {} non-git dirs. Orgs: [{}], Forges: [{}]",
                     ctx.repos.len(),
                     ctx.unconfigured_repos.len(),
+                    ctx.skipped_dirs.len(),
                     ctx.orgs.join(", "),
                     ctx.forges.join(", "),
                 ),
             };
+
+            // Report non-git directories (no .git, no .hyperforge)
+            if !ctx.skipped_dirs.is_empty() {
+                for dir in &ctx.skipped_dirs {
+                    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {} [no git — needs git init]", name),
+                    };
+                }
+            }
 
             // ── Infer org and forges for unconfigured repos ──
             let inferred_org: Option<String> = org.clone().or_else(|| {
