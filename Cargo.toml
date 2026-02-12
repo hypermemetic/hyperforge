@@ -23,8 +23,8 @@ path = "src/bin/hyperforge-ssh.rs"
 
 [dependencies]
 # Hub framework integration
-plexus-core = "0.2.1"
-plexus-macros = "0.2.2"
+plexus-core = "0.3.0"
+plexus-macros = "0.3.0"
 plexus-transport = "0.1.0"
 
 # Async
