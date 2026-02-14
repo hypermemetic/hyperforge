@@ -14,8 +14,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::adapters::{ForgePort, LocalForge};
+use chrono::Utc;
+use std::collections::HashMap;
+
+use crate::adapters::{ForgePort, ForgeSyncState, LocalForge};
+use crate::config::HyperforgeConfig;
+use crate::hubs::workspace::make_adapter;
 use crate::hubs::{ConfigHub, HyperforgeState, PackageHub, RepoHub, WorkspaceHub};
+use crate::types::repo::RepoRecord;
 use crate::types::{Forge, Repo, Visibility};
 
 /// Hyperforge event types
@@ -233,6 +239,185 @@ impl HyperforgeHub {
                         message: format!("Diff failed: {}", e),
                     };
                 }
+            }
+        }
+    }
+
+    /// Bootstrap an org — import all repos from remote forges into LocalForge
+    #[plexus_macros::hub_method(
+        description = "Bootstrap an org — import all repos from remote forges into LocalForge, creating the canonical state mirror",
+        params(
+            org = "Organization name",
+            forges = "Forges to import from (e.g. github,codeberg)",
+            dry_run = "Preview without writing state (optional, default: false)"
+        )
+    )]
+    pub async fn begin(
+        &self,
+        org: String,
+        forges: Vec<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+
+            // Parse and validate forge strings
+            let mut parsed_forges: Vec<(String, Forge)> = Vec::new();
+            for forge_str in &forges {
+                for part in forge_str.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    match HyperforgeConfig::parse_forge(part) {
+                        Some(forge) => parsed_forges.push((part.to_lowercase().to_string(), forge)),
+                        None => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", part),
+                            };
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if parsed_forges.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: "No forges specified. Provide at least one forge (github, codeberg, gitlab).".to_string(),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Begin: bootstrapping org '{}' from {} forge(s): {}",
+                    dry_prefix,
+                    org,
+                    parsed_forges.len(),
+                    parsed_forges.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", "),
+                ),
+            };
+
+            // Phase 1: Verify auth by creating adapters
+            let mut adapters: Vec<(String, Forge, Arc<dyn ForgePort>)> = Vec::new();
+
+            for (forge_str, forge_enum) in &parsed_forges {
+                match make_adapter(forge_str, &org) {
+                    Ok(adapter) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  Authenticated with {}", forge_str),
+                        };
+                        adapters.push((forge_str.clone(), forge_enum.clone(), adapter));
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to authenticate with {}: {}", forge_str, e),
+                        };
+                        return;
+                    }
+                }
+            }
+
+            // Phase 2: Import repos from each forge
+            let local = state.get_local_forge(&org).await;
+            let mut per_forge_counts: HashMap<String, usize> = HashMap::new();
+            let mut total_upserted = 0usize;
+
+            for (forge_str, forge_enum, adapter) in &adapters {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}Importing repos from {}...", dry_prefix, forge_str),
+                };
+
+                let list_result = match adapter.list_repos_incremental(&org, None).await {
+                    Ok(lr) => lr,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to list repos from {}: {}", forge_str, e),
+                        };
+                        continue;
+                    }
+                };
+
+                let mut forge_count = 0usize;
+
+                if list_result.modified {
+                    if let Some(repos) = &list_result.repos {
+                        for repo in repos {
+                            let record = RepoRecord::from_repo(repo);
+
+                            if !is_dry_run {
+                                if let Err(e) = local.upsert_record(record) {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("  Failed to upsert {}: {}", repo.name, e),
+                                    };
+                                    continue;
+                                }
+                            }
+
+                            forge_count += 1;
+                            total_upserted += 1;
+                        }
+
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}Found {} repos on {}", dry_prefix, forge_count, forge_str),
+                        };
+                    }
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {} returned not-modified (no repos to import)", forge_str),
+                    };
+                }
+
+                per_forge_counts.insert(forge_str.clone(), forge_count);
+
+                // Store ETags
+                if !is_dry_run {
+                    if let Err(e) = local.set_forge_state(forge_enum.clone(), ForgeSyncState {
+                        last_synced: Utc::now(),
+                        etag: list_result.etag.clone(),
+                    }) {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to store sync state for {}: {}", forge_str, e),
+                        };
+                    }
+                }
+            }
+
+            // Save LocalForge to disk
+            if !is_dry_run && total_upserted > 0 {
+                if let Err(e) = local.save_to_yaml().await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save LocalForge for {}: {}", org, e),
+                    };
+                }
+            }
+
+            // Summary
+            let unique_count = match local.all_records() {
+                Ok(records) => records.len(),
+                Err(_) => total_upserted,
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Begin complete: {} unique repos in LocalForge for '{}'",
+                    dry_prefix, unique_count, org,
+                ),
+            };
+
+            for (forge_str, count) in &per_forge_counts {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}: {} repos imported", forge_str, count),
+                };
+            }
+
+            if is_dry_run {
+                yield HyperforgeEvent::Info {
+                    message: "Dry run — no changes written to disk.".to_string(),
+                };
             }
         }
     }

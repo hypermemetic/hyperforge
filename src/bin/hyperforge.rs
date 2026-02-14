@@ -15,16 +15,16 @@ struct Args {
     stdio: bool,
 
     /// Port for WebSocket server (ignored in stdio mode)
-    #[arg(short, long, default_value = "4446")]
+    #[arg(short, long, default_value = "44104")]
     port: u16,
 
     /// Enable MCP HTTP server (on port + 1)
     #[arg(long)]
     mcp: bool,
 
-    /// Register with Plexus registry on startup (ignored in stdio mode)
+    /// Skip registry registration on startup
     #[arg(long)]
-    register: bool,
+    no_register: bool,
 
     /// Port where the Plexus registry is listening
     #[arg(long, default_value = "4444")]
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  Description: Multi-forge repository management");
 
     // Registry registration (non-fatal — server starts regardless)
-    let registry_client = if args.register && !args.stdio {
+    let registry_client = if !args.no_register && !args.stdio {
         let config = RegistryConfig {
             registry_port: args.registry_port,
             name: args.registry_name.clone(),

@@ -147,7 +147,49 @@ impl RegistryClient {
     }
 
     /// Register this backend with the Plexus registry.
+    ///
+    /// If an entry with the same name already exists:
+    /// - Check if the old backend is alive (TCP connect). If alive, abort.
+    /// - If dead, delete the stale entry and register ourselves.
     pub async fn register(&self) -> Result<(), RegistryError> {
+        // Check if an entry already exists with our name
+        if let Ok(entry) = self.get(&self.config.name).await {
+            let old_host = entry.host.as_deref().unwrap_or("127.0.0.1");
+            let old_port = entry.port.unwrap_or(0);
+
+            let needs_replace = old_host != self.config.host || old_port != self.config.port;
+
+            if needs_replace {
+                // TCP connect to old backend to see if it's actually alive
+                let addr = format!("{}:{}", old_host, old_port);
+                let old_alive = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(&addr),
+                ).await {
+                    Ok(Ok(_)) => true,
+                    _ => false,
+                };
+
+                if old_alive {
+                    return Err(RegistryError::CommandFailed {
+                        code: 1,
+                        stderr: format!(
+                            "another '{}' instance is already running at {}:{} — refusing to start",
+                            self.config.name, old_host, old_port,
+                        ),
+                    });
+                }
+
+                // Old instance is dead — remove stale entry
+                tracing::info!(
+                    "old '{}' at {}:{} is unreachable — replacing stale registration",
+                    self.config.name, old_host, old_port,
+                );
+                let _ = self.deregister().await;
+            }
+        }
+
+        // Register ourselves
         let port_str = self.config.port.to_string();
         self.run_synapse(&[
             "register",
@@ -156,15 +198,13 @@ impl RegistryClient {
             "--port", &port_str,
             "--description", &self.config.description,
             "--namespace", &self.config.namespace,
-        ])
-        .await?;
+        ]).await?;
 
         tracing::info!(
             "registered '{}' with registry at port {}",
             self.config.name,
             self.config.registry_port,
         );
-
         Ok(())
     }
 

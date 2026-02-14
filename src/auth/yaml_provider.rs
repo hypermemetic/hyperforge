@@ -1,92 +1,66 @@
-//! RPC-based auth provider
+//! YAML-file auth provider
 //!
-//! Calls the auth hub via synapse to get secrets.
-//! This is a workaround that demonstrates proper separation - hyperforge
-//! doesn't know about YAML storage, it just calls the auth service via RPC.
+//! Reads secrets directly from ~/.config/hyperforge/secrets.yaml.
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::process::Command;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::AuthProvider;
 
-/// Auth event from auth hub
+/// A single secret entry in the YAML file
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum AuthEvent {
-    #[serde(rename = "secret")]
-    Secret {
-        #[allow(dead_code)]
-        path: String,
-        value: String,
-    },
-    #[serde(rename = "error")]
-    Error {
-        message: String,
-    },
+struct SecretEntry {
+    value: String,
 }
 
-/// RPC-based auth provider that calls auth hub via synapse
+/// Top-level secrets file structure
+#[derive(Debug, Deserialize)]
+struct SecretsFile {
+    secrets: HashMap<String, SecretEntry>,
+}
+
+/// Auth provider that reads secrets directly from YAML on disk
 pub struct YamlAuthProvider {
-    auth_port: u16,
+    secrets_path: PathBuf,
 }
 
 impl YamlAuthProvider {
-    /// Create a new RPC auth provider
+    /// Create a new YAML auth provider using the default secrets path
     pub fn new() -> anyhow::Result<Self> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         Ok(Self {
-            auth_port: 4445,
+            secrets_path: home.join(".config/hyperforge/secrets.yaml"),
         })
     }
 
-    /// Create with custom auth port
-    pub fn with_port(port: u16) -> anyhow::Result<Self> {
-        Ok(Self {
-            auth_port: port,
-        })
+    /// Create with a custom secrets file path
+    pub fn with_path(path: PathBuf) -> Self {
+        Self {
+            secrets_path: path,
+        }
     }
 }
 
 #[async_trait]
 impl AuthProvider for YamlAuthProvider {
     async fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
-        // Call auth hub via synapse (uses PATH to find synapse binary)
-        // synapse --raw secrets auth get_secret --secret-key <key>
-        let output = Command::new("synapse")
-            .args(&[
-                "--raw",
-                "secrets",
-                "auth",
-                "get_secret",
-                "--secret-key",
-                key,
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Check if it's a "not found" error
-            if stderr.contains("Secret not found") || stderr.contains("Not found") {
-                return Ok(None);
+        let content = match std::fs::read_to_string(&self.secrets_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow::anyhow!(
+                    "Secrets file not found at {}. Run the secrets hub to configure tokens.",
+                    self.secrets_path.display()
+                ));
             }
-            return Err(anyhow::anyhow!("Failed to get secret from auth hub: {}", stderr));
-        }
+            Err(e) => return Err(e.into()),
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let file: SecretsFile = serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", self.secrets_path.display(), e))?;
 
-        // Parse the JSON response
-        let event: AuthEvent = serde_json::from_str(stdout.trim())
-            .map_err(|e| anyhow::anyhow!("Failed to parse auth response: {}", e))?;
-
-        match event {
-            AuthEvent::Secret { value, .. } => Ok(Some(value)),
-            AuthEvent::Error { message } => {
-                if message.contains("not found") {
-                    Ok(None)
-                } else {
-                    Err(anyhow::anyhow!("Auth error: {}", message))
-                }
-            }
-        }
+        Ok(file.secrets.get(key).map(|entry| entry.value.clone()))
     }
 }
