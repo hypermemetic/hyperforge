@@ -12,17 +12,21 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::adapters::{CodebergAdapter, ForgePort, GitHubAdapter, GitLabAdapter};
+use chrono::Utc;
+
+use crate::adapters::{CodebergAdapter, ForgePort, ForgeSyncState, GitHubAdapter, GitLabAdapter};
 use crate::auth::YamlAuthProvider;
 use crate::commands::init::{init, InitOptions};
 use crate::commands::push::{push, PushOptions};
 use crate::commands::workspace::{discover_workspace, repo_from_config};
+use crate::config::HyperforgeConfig;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::services::SyncOp;
+use crate::types::repo::RepoRecord;
 use crate::types::{Forge, Visibility};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Sub-hub for multi-repo workspace orchestration
 #[derive(Clone)]
@@ -58,6 +62,27 @@ fn make_adapter(forge: &str, org: &str) -> Result<Arc<dyn ForgePort>, String> {
         }
     };
     Ok(adapter)
+}
+
+/// Simple glob matching for repo name filtering
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return name.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    if pattern.contains('*') {
+        // Simple prefix*suffix matching
+        let parts: Vec<&str> = pattern.splitn(2, '*').collect();
+        if parts.len() == 2 {
+            return name.starts_with(parts[0]) && name.ends_with(parts[1]);
+        }
+    }
+    name == pattern
 }
 
 #[plexus_macros::hub_methods(
@@ -98,11 +123,12 @@ impl WorkspaceHub {
                 let org = repo.org().unwrap_or("(none)");
                 let forges = repo.forges().join(", ");
                 let git_status = if repo.is_git_repo { "git" } else { "no-git" };
+                let bs_label = format!("{}", repo.build_system);
 
                 yield HyperforgeEvent::Info {
                     message: format!(
-                        "  {} [{}] org={} forges=[{}]",
-                        repo.dir_name, git_status, org, forges
+                        "  {} [{}] org={} forges=[{}] build=[{}]",
+                        repo.dir_name, git_status, org, forges, bs_label
                     ),
                 };
             }
@@ -115,12 +141,228 @@ impl WorkspaceHub {
                 };
             }
 
-            // Report orgs and forges
+            // Report orgs, forges, and build systems
             yield HyperforgeEvent::Info {
                 message: format!("Orgs: {}", ctx.orgs.join(", ")),
             };
             yield HyperforgeEvent::Info {
                 message: format!("Forges: {}", ctx.forges.join(", ")),
+            };
+            let bs_list: Vec<String> = ctx.build_systems().iter().map(|bs| format!("{}", bs)).collect();
+            if !bs_list.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!("Build systems: {}", bs_list.join(", ")),
+                };
+            }
+
+            yield HyperforgeEvent::WorkspaceSummary {
+                total_repos: ctx.repos.len() + ctx.unconfigured_repos.len(),
+                configured_repos: ctx.repos.len(),
+                unconfigured_repos: ctx.unconfigured_repos.len(),
+                clean_repos: None,
+                dirty_repos: None,
+                wrong_branch_repos: None,
+                push_success: None,
+                push_failed: None,
+                validation_passed: None,
+            };
+        }
+    }
+
+    /// Initialize unconfigured repos in a workspace
+    #[plexus_macros::hub_method(
+        description = "Initialize hyperforge config for unconfigured repos in a workspace directory. Discovers repos, infers org/forges from existing configs, and creates .hyperforge/config.toml for each unconfigured repo.",
+        params(
+            path = "Path to workspace directory",
+            org = "Organization name (inferred from workspace if only one org exists)",
+            forges = "Forges to configure (inferred from existing configs if not specified)",
+            dry_run = "Preview without writing configs (optional, default: false)",
+            force = "Re-init repos that already have config (optional, default: false)",
+            no_hooks = "Skip installing pre-push hook (optional, default: false)",
+            no_ssh_wrapper = "Skip configuring SSH wrapper (optional, default: false)"
+        )
+    )]
+    pub async fn init(
+        &self,
+        path: String,
+        org: Option<String>,
+        forges: Option<Vec<String>>,
+        dry_run: Option<bool>,
+        force: Option<bool>,
+        no_hooks: Option<bool>,
+        no_ssh_wrapper: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let is_dry_run = dry_run.unwrap_or(false);
+        let is_force = force.unwrap_or(false);
+        let is_no_hooks = no_hooks.unwrap_or(false);
+        let is_no_ssh_wrapper = no_ssh_wrapper.unwrap_or(false);
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+            // ── Phase 1: Discover ──
+            yield HyperforgeEvent::Info {
+                message: format!("{}Discovering workspace...", dry_prefix),
+            };
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "  Found {} configured, {} unconfigured, {} non-git dirs. Orgs: [{}], Forges: [{}]",
+                    ctx.repos.len(),
+                    ctx.unconfigured_repos.len(),
+                    ctx.skipped_dirs.len(),
+                    ctx.orgs.join(", "),
+                    ctx.forges.join(", "),
+                ),
+            };
+
+            if !ctx.skipped_dirs.is_empty() {
+                for dir in &ctx.skipped_dirs {
+                    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {} [no git — needs git init]", name),
+                    };
+                }
+            }
+
+            // ── Infer org and forges ──
+            let inferred_org: Option<String> = org.clone().or_else(|| {
+                if ctx.orgs.len() == 1 {
+                    Some(ctx.orgs[0].clone())
+                } else {
+                    None
+                }
+            });
+
+            let inferred_forges: Vec<String> = forges.clone().unwrap_or_else(|| ctx.forges.clone());
+
+            // Determine targets: unconfigured repos, plus configured repos if --force
+            let mut targets: Vec<PathBuf> = ctx.unconfigured_repos.clone();
+            if is_force {
+                for repo in &ctx.repos {
+                    targets.push(repo.path.clone());
+                }
+            }
+
+            if targets.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No repos to initialize.".to_string(),
+                };
+                yield HyperforgeEvent::WorkspaceSummary {
+                    total_repos: ctx.repos.len(),
+                    configured_repos: ctx.repos.len(),
+                    unconfigured_repos: 0,
+                    clean_repos: None,
+                    dirty_repos: None,
+                    wrong_branch_repos: None,
+                    push_success: None,
+                    push_failed: None,
+                    validation_passed: None,
+                };
+                return;
+            }
+
+            if inferred_org.is_none() {
+                yield HyperforgeEvent::Error {
+                    message: "Cannot init repos: multiple orgs found and --org not specified.".to_string(),
+                };
+                return;
+            }
+            if inferred_forges.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: "Cannot init repos: no forges found and --forges not specified.".to_string(),
+                };
+                return;
+            }
+
+            // ── Phase 2: Init ──
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Initializing {} repos (org={}, forges=[{}])...",
+                    dry_prefix,
+                    targets.len(),
+                    inferred_org.as_deref().unwrap_or("?"),
+                    inferred_forges.join(", "),
+                ),
+            };
+
+            let mut inits_performed = 0usize;
+            let mut init_failed = 0usize;
+
+            for repo_path in &targets {
+                let dir_name = repo_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?");
+
+                let mut opts = InitOptions::new(inferred_forges.clone());
+                if let Some(ref o) = inferred_org {
+                    opts = opts.with_org(o.as_str());
+                }
+                if is_dry_run {
+                    opts = opts.dry_run();
+                }
+                if is_force {
+                    opts = opts.force();
+                }
+                if is_no_hooks {
+                    opts = opts.no_hooks();
+                }
+                if is_no_ssh_wrapper {
+                    opts = opts.no_ssh_wrapper();
+                }
+
+                match init(repo_path, opts) {
+                    Ok(_report) => {
+                        inits_performed += 1;
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}Initialized {}", dry_prefix, dir_name),
+                        };
+                    }
+                    Err(e) => {
+                        init_failed += 1;
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to init {}: {}", dir_name, e),
+                        };
+                    }
+                }
+            }
+
+            // ── Phase 3: Re-discover ──
+            let ctx = if inits_performed > 0 && !is_dry_run {
+                yield HyperforgeEvent::Info {
+                    message: format!("Re-discovering after {} inits...", inits_performed),
+                };
+                match discover_workspace(&workspace_path) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Re-discovery failed: {}", e),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                ctx
+            };
+
+            // ── Summary ──
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Init complete: {} initialized, {} failed",
+                    dry_prefix, inits_performed, init_failed,
+                ),
             };
 
             yield HyperforgeEvent::WorkspaceSummary {
@@ -132,6 +374,7 @@ impl WorkspaceHub {
                 wrong_branch_repos: None,
                 push_success: None,
                 push_failed: None,
+                validation_passed: None,
             };
         }
     }
@@ -231,6 +474,7 @@ impl WorkspaceHub {
                 wrong_branch_repos: Some(wrong_branch_count),
                 push_success: None,
                 push_failed: None,
+                validation_passed: None,
             };
         }
     }
@@ -242,7 +486,8 @@ impl WorkspaceHub {
             path = "Path to workspace directory",
             branch = "Branch to push (optional, uses current branch if not specified)",
             dry_run = "Preview pushes without executing (optional, default: false)",
-            set_upstream = "Set upstream tracking (optional, default: false)"
+            set_upstream = "Set upstream tracking (optional, default: false)",
+            validate = "Run containerized validation before pushing (optional, default: false)"
         )
     )]
     pub async fn push_all(
@@ -251,11 +496,13 @@ impl WorkspaceHub {
         branch: Option<String>,
         dry_run: Option<bool>,
         set_upstream: Option<bool>,
+        validate: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             let workspace_path = PathBuf::from(&path);
             let is_dry_run = dry_run.unwrap_or(false);
             let is_set_upstream = set_upstream.unwrap_or(false);
+            let is_validate = validate.unwrap_or(false);
 
             let ctx = match discover_workspace(&workspace_path) {
                 Ok(ctx) => ctx,
@@ -266,6 +513,58 @@ impl WorkspaceHub {
                     return;
                 }
             };
+
+            // Validation gate (if --validate)
+            if is_validate {
+                yield HyperforgeEvent::Info {
+                    message: "Validation: Running containerized build check...".to_string(),
+                };
+
+                let mut dep_nodes = Vec::new();
+                let mut dep_all = Vec::new();
+                for (idx, repo) in ctx.repos.iter().enumerate() {
+                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                    dep_nodes.push(crate::build_system::dep_graph::DepNode {
+                        name,
+                        version: repo.package_version.clone(),
+                        build_system: format!("{}", repo.build_system),
+                        path: repo.dir_name.clone(),
+                    });
+                    if !repo.dependencies.is_empty() {
+                        dep_all.push((idx, repo.dependencies.clone()));
+                    }
+                }
+                let graph = crate::build_system::dep_graph::DepGraph::build(dep_nodes, &dep_all);
+                let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
+                match plan {
+                    Ok(p) => {
+                        let results = crate::build_system::validate::execute_validation(&p, &ctx.root, is_dry_run);
+                        let summary = crate::build_system::validate::summarize_results(&results);
+                        yield HyperforgeEvent::ValidateSummary {
+                            total: summary.total,
+                            passed: summary.passed,
+                            failed: summary.failed,
+                            skipped: summary.skipped,
+                            duration_ms: summary.duration_ms,
+                        };
+                        if summary.failed > 0 {
+                            yield HyperforgeEvent::Error {
+                                message: format!(
+                                    "Validation failed ({}/{} steps failed) — aborting push.",
+                                    summary.failed, summary.total
+                                ),
+                            };
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Validation plan failed: {} — aborting push.", e),
+                        };
+                        return;
+                    }
+                }
+            }
 
             if is_dry_run {
                 yield HyperforgeEvent::Info {
@@ -341,6 +640,7 @@ impl WorkspaceHub {
                 wrong_branch_repos: None,
                 push_success: Some(success_count),
                 push_failed: Some(failed_count),
+                validation_passed: None,
             };
         }
     }
@@ -457,7 +757,8 @@ impl WorkspaceHub {
             forges = "Forges for unconfigured repos (inferred from existing configs if not specified)",
             dry_run = "Preview all phases without making changes (optional, default: false)",
             no_push = "Skip the git push phase (optional, default: false)",
-            no_init = "Skip initializing unconfigured repos (optional, default: false)"
+            no_init = "Skip initializing unconfigured repos (optional, default: false)",
+            validate = "Run containerized validation before pushing (optional, default: false)"
         )
     )]
     pub async fn sync(
@@ -468,12 +769,14 @@ impl WorkspaceHub {
         dry_run: Option<bool>,
         no_push: Option<bool>,
         no_init: Option<bool>,
+        validate: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let sync_service = self.state.sync_service.clone();
         let is_dry_run = dry_run.unwrap_or(false);
         let is_no_push = no_push.unwrap_or(false);
         let is_no_init = no_init.unwrap_or(false);
+        let is_validate = validate.unwrap_or(false);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -632,6 +935,13 @@ impl WorkspaceHub {
                 match local.repo_exists(&repo_org, &repo.name).await {
                     Ok(true) => {
                         already_registered += 1;
+                        // Mark as managed even if already registered
+                        if let Ok(mut record) = local.get_record(&repo.name) {
+                            if !record.managed {
+                                record.managed = true;
+                                let _ = local.update_record(&record);
+                            }
+                        }
                         continue;
                     }
                     Ok(false) => {}
@@ -649,6 +959,12 @@ impl WorkspaceHub {
                         message: format!("  Failed to register {}: {}", repo.name, e),
                     };
                     continue;
+                }
+
+                // Mark newly registered repos as managed
+                if let Ok(mut record) = local.get_record(&repo.name) {
+                    record.managed = true;
+                    let _ = local.update_record(&record);
                 }
 
                 registered += 1;
@@ -677,7 +993,7 @@ impl WorkspaceHub {
                 ),
             };
 
-            // ── Phase 5: Import remote-only repos into LocalForge ──
+            // ── Phase 5: Import remote-only repos into LocalForge (ETag-based) ──
             let pairs = ctx.org_forge_pairs();
 
             yield HyperforgeEvent::Info {
@@ -695,8 +1011,21 @@ impl WorkspaceHub {
                     }
                 };
 
-                let remote_repos = match adapter.list_repos(org_name).await {
-                    Ok(repos) => repos,
+                let local = state.get_local_forge(org_name).await;
+
+                // Get stored ETag for this forge
+                let forge_enum = HyperforgeConfig::parse_forge(forge_name);
+                let stored_etag = if let Some(ref fe) = forge_enum {
+                    local.forge_states().ok()
+                        .and_then(|states| states.get(fe).map(|s| s.etag.clone()))
+                        .flatten()
+                } else {
+                    None
+                };
+
+                // Use incremental list with ETag
+                let list_result = match adapter.list_repos_incremental(org_name, stored_etag).await {
+                    Ok(lr) => lr,
                     Err(e) => {
                         yield HyperforgeEvent::Error {
                             message: format!("  Failed to list remote repos for {}/{}: {}", org_name, forge_name, e),
@@ -705,9 +1034,23 @@ impl WorkspaceHub {
                     }
                 };
 
-                let local = state.get_local_forge(org_name).await;
+                if !list_result.modified {
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {}/{}: not modified (ETag match)", org_name, forge_name),
+                    };
+                    // Still update last_synced timestamp
+                    if let Some(ref fe) = forge_enum {
+                        let _ = local.set_forge_state(fe.clone(), ForgeSyncState {
+                            last_synced: Utc::now(),
+                            etag: list_result.etag.clone(),
+                        });
+                    }
+                    continue;
+                }
 
-                for remote_repo in &remote_repos {
+                let remote_repos = list_result.repos.as_deref().unwrap_or_default();
+
+                for remote_repo in remote_repos {
                     match local.repo_exists(org_name, &remote_repo.name).await {
                         Ok(true) => continue,
                         Ok(false) => {}
@@ -733,6 +1076,16 @@ impl WorkspaceHub {
                     };
                 }
 
+                // Update forge sync state with new ETag
+                if let Some(ref fe) = forge_enum {
+                    if !is_dry_run {
+                        let _ = local.set_forge_state(fe.clone(), ForgeSyncState {
+                            last_synced: Utc::now(),
+                            etag: list_result.etag.clone(),
+                        });
+                    }
+                }
+
                 // Persist to disk only on real runs
                 if !is_dry_run && imported > 0 {
                     if let Err(e) = local.save_to_yaml().await {
@@ -746,6 +1099,32 @@ impl WorkspaceHub {
             yield HyperforgeEvent::Info {
                 message: format!("  {} repos imported from remotes", imported),
             };
+
+            // ── Phase 5.5: Report unmanaged repos ──
+            {
+                for org_name in &ctx.orgs {
+                    let local = state.get_local_forge(org_name).await;
+                    if let Ok(records) = local.all_records() {
+                        let unmanaged: Vec<_> = records.iter()
+                            .filter(|r| !r.managed && !r.dismissed)
+                            .collect();
+                        if !unmanaged.is_empty() {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  {} unmanaged repos in LocalForge for org '{}' (not on disk):",
+                                    unmanaged.len(), org_name),
+                            };
+                            for r in &unmanaged {
+                                let forges: Vec<String> = r.present_on.iter()
+                                    .map(|f| format!("{:?}", f).to_lowercase())
+                                    .collect();
+                                yield HyperforgeEvent::Info {
+                                    message: format!("    {} [{}]", r.name, forges.join(", ")),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
 
             // ── Phase 6: Diff ──
             yield HyperforgeEvent::Info {
@@ -870,11 +1249,80 @@ impl WorkspaceHub {
                 ),
             };
 
-            // ── Phase 8: Push git content ──
-            if is_no_push {
+            // ── Validation gate (if --validate) ──
+            let mut validation_passed_result: Option<bool> = None;
+            if is_validate {
                 yield HyperforgeEvent::Info {
-                    message: format!("{}Phase 8/8: Push skipped (--no_push).", dry_prefix),
+                    message: format!("{}Validation: Running containerized build check...", dry_prefix),
                 };
+
+                let mut dep_nodes = Vec::new();
+                let mut dep_all = Vec::new();
+                for (idx, repo) in ctx.repos.iter().enumerate() {
+                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                    dep_nodes.push(crate::build_system::dep_graph::DepNode {
+                        name,
+                        version: repo.package_version.clone(),
+                        build_system: format!("{}", repo.build_system),
+                        path: repo.dir_name.clone(),
+                    });
+                    if !repo.dependencies.is_empty() {
+                        dep_all.push((idx, repo.dependencies.clone()));
+                    }
+                }
+                let graph = crate::build_system::dep_graph::DepGraph::build(dep_nodes, &dep_all);
+                let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
+                match plan {
+                    Ok(p) => {
+                        let results = crate::build_system::validate::execute_validation(&p, &ctx.root, is_dry_run);
+                        for r in &results {
+                            yield HyperforgeEvent::ValidateStep {
+                                repo_name: r.repo_name.clone(),
+                                step: r.step.clone(),
+                                status: format!("{}", r.status),
+                                duration_ms: r.duration_ms,
+                            };
+                        }
+                        let summary = crate::build_system::validate::summarize_results(&results);
+                        let passed = summary.failed == 0;
+                        validation_passed_result = Some(passed);
+                        yield HyperforgeEvent::ValidateSummary {
+                            total: summary.total,
+                            passed: summary.passed,
+                            failed: summary.failed,
+                            skipped: summary.skipped,
+                            duration_ms: summary.duration_ms,
+                        };
+                        if !passed {
+                            yield HyperforgeEvent::Error {
+                                message: format!(
+                                    "Validation failed ({}/{} steps failed) — aborting push.",
+                                    summary.failed, summary.total
+                                ),
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        validation_passed_result = Some(false);
+                        yield HyperforgeEvent::Error {
+                            message: format!("Validation plan failed: {} — aborting push.", e),
+                        };
+                    }
+                }
+            }
+
+            // ── Phase 8: Push git content ──
+            let skip_push_for_validation = validation_passed_result == Some(false);
+            if is_no_push || skip_push_for_validation {
+                if skip_push_for_validation {
+                    yield HyperforgeEvent::Info {
+                        message: format!("{}Phase 8/8: Push skipped (validation failed).", dry_prefix),
+                    };
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: format!("{}Phase 8/8: Push skipped (--no_push).", dry_prefix),
+                    };
+                }
             } else {
                 yield HyperforgeEvent::Info {
                     message: format!("{}Phase 8/8: Pushing {} repos...", dry_prefix, ctx.repos.len()),
@@ -945,6 +1393,7 @@ impl WorkspaceHub {
                 wrong_branch_repos: None,
                 push_success: None,
                 push_failed: None,
+                validation_passed: validation_passed_result,
             };
         }
     }
@@ -1074,7 +1523,8 @@ impl WorkspaceHub {
             dry_run = "Preview all phases without making changes (optional, default: false)",
             no_push = "Skip the git push phase (optional, default: false)",
             no_init = "Skip initializing unconfigured repos (optional, default: false)",
-            purge = "Actually delete repos previously staged for deletion (optional, default: false)"
+            purge = "Actually delete repos previously staged for deletion (optional, default: false)",
+            validate = "Run containerized validation before pushing (optional, default: false)"
         )
     )]
     pub async fn reflect(
@@ -1086,6 +1536,7 @@ impl WorkspaceHub {
         no_push: Option<bool>,
         no_init: Option<bool>,
         purge: Option<bool>,
+        validate: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let sync_service = self.state.sync_service.clone();
@@ -1093,6 +1544,7 @@ impl WorkspaceHub {
         let is_no_push = no_push.unwrap_or(false);
         let is_no_init = no_init.unwrap_or(false);
         let is_purge = purge.unwrap_or(false);
+        let is_validate = validate.unwrap_or(false);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -1261,6 +1713,13 @@ impl WorkspaceHub {
                             }
                             _ => {}
                         }
+                        // Mark as managed even if already registered
+                        if let Ok(mut record) = local.get_record(&repo.name) {
+                            if !record.managed {
+                                record.managed = true;
+                                let _ = local.update_record(&record);
+                            }
+                        }
                         already_registered += 1;
                         continue;
                     }
@@ -1278,6 +1737,12 @@ impl WorkspaceHub {
                         message: format!("  Failed to register {}: {}", repo.name, e),
                     };
                     continue;
+                }
+
+                // Mark newly registered repos as managed
+                if let Ok(mut record) = local.get_record(&repo.name) {
+                    record.managed = true;
+                    let _ = local.update_record(&record);
                 }
 
                 registered += 1;
@@ -1437,8 +1902,21 @@ impl WorkspaceHub {
                     }
                 };
 
-                let remote_repos = match adapter.list_repos(org_name).await {
-                    Ok(repos) => repos,
+                let local = state.get_local_forge(org_name).await;
+
+                // Get stored ETag for this forge
+                let forge_enum = HyperforgeConfig::parse_forge(forge_name);
+                let stored_etag = if let Some(ref fe) = forge_enum {
+                    local.forge_states().ok()
+                        .and_then(|states| states.get(fe).map(|s| s.etag.clone()))
+                        .flatten()
+                } else {
+                    None
+                };
+
+                // Use incremental list with ETag
+                let list_result = match adapter.list_repos_incremental(org_name, stored_etag).await {
+                    Ok(lr) => lr,
                     Err(e) => {
                         yield HyperforgeEvent::Error {
                             message: format!("  Failed to list remote repos for {}/{}: {}", org_name, forge_name, e),
@@ -1447,9 +1925,23 @@ impl WorkspaceHub {
                     }
                 };
 
-                let local = state.get_local_forge(org_name).await;
+                if !list_result.modified {
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {}/{}: not modified (ETag match)", org_name, forge_name),
+                    };
+                    // Still update last_synced timestamp
+                    if let Some(ref fe) = forge_enum {
+                        let _ = local.set_forge_state(fe.clone(), ForgeSyncState {
+                            last_synced: Utc::now(),
+                            etag: list_result.etag.clone(),
+                        });
+                    }
+                    continue;
+                }
 
-                for remote_repo in &remote_repos {
+                let remote_repos = list_result.repos.as_deref().unwrap_or_default();
+
+                for remote_repo in remote_repos {
                     if local_names.contains(&remote_repo.name) {
                         continue;
                     }
@@ -1547,6 +2039,16 @@ impl WorkspaceHub {
                     }
                 }
 
+                // Update forge sync state with new ETag
+                if let Some(ref fe) = forge_enum {
+                    if !is_dry_run {
+                        let _ = local.set_forge_state(fe.clone(), ForgeSyncState {
+                            last_synced: Utc::now(),
+                            etag: list_result.etag.clone(),
+                        });
+                    }
+                }
+
                 // Persist LocalForge changes
                 if !is_dry_run {
                     if let Err(e) = local.save_to_yaml().await {
@@ -1564,11 +2066,80 @@ impl WorkspaceHub {
                 ),
             };
 
-            // ── Phase 7: Push git content ──
-            if is_no_push {
+            // ── Validation gate (if --validate) ──
+            let mut validation_passed_result: Option<bool> = None;
+            if is_validate {
                 yield HyperforgeEvent::Info {
-                    message: format!("{}Phase 7/7: Push skipped (--no_push).", dry_prefix),
+                    message: format!("{}Validation: Running containerized build check...", dry_prefix),
                 };
+
+                let mut dep_nodes = Vec::new();
+                let mut dep_all = Vec::new();
+                for (idx, repo) in ctx.repos.iter().enumerate() {
+                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                    dep_nodes.push(crate::build_system::dep_graph::DepNode {
+                        name,
+                        version: repo.package_version.clone(),
+                        build_system: format!("{}", repo.build_system),
+                        path: repo.dir_name.clone(),
+                    });
+                    if !repo.dependencies.is_empty() {
+                        dep_all.push((idx, repo.dependencies.clone()));
+                    }
+                }
+                let graph = crate::build_system::dep_graph::DepGraph::build(dep_nodes, &dep_all);
+                let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
+                match plan {
+                    Ok(p) => {
+                        let results = crate::build_system::validate::execute_validation(&p, &ctx.root, is_dry_run);
+                        for r in &results {
+                            yield HyperforgeEvent::ValidateStep {
+                                repo_name: r.repo_name.clone(),
+                                step: r.step.clone(),
+                                status: format!("{}", r.status),
+                                duration_ms: r.duration_ms,
+                            };
+                        }
+                        let summary = crate::build_system::validate::summarize_results(&results);
+                        let passed = summary.failed == 0;
+                        validation_passed_result = Some(passed);
+                        yield HyperforgeEvent::ValidateSummary {
+                            total: summary.total,
+                            passed: summary.passed,
+                            failed: summary.failed,
+                            skipped: summary.skipped,
+                            duration_ms: summary.duration_ms,
+                        };
+                        if !passed {
+                            yield HyperforgeEvent::Error {
+                                message: format!(
+                                    "Validation failed ({}/{} steps failed) — aborting push.",
+                                    summary.failed, summary.total
+                                ),
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        validation_passed_result = Some(false);
+                        yield HyperforgeEvent::Error {
+                            message: format!("Validation plan failed: {} — aborting push.", e),
+                        };
+                    }
+                }
+            }
+
+            // ── Phase 7: Push git content ──
+            let skip_push_for_validation = validation_passed_result == Some(false);
+            if is_no_push || skip_push_for_validation {
+                if skip_push_for_validation {
+                    yield HyperforgeEvent::Info {
+                        message: format!("{}Phase 7/7: Push skipped (validation failed).", dry_prefix),
+                    };
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: format!("{}Phase 7/7: Push skipped (--no_push).", dry_prefix),
+                    };
+                }
             } else {
                 yield HyperforgeEvent::Info {
                     message: format!("{}Phase 7/7: Pushing {} repos...", dry_prefix, ctx.repos.len()),
@@ -1639,6 +2210,144 @@ impl WorkspaceHub {
                 wrong_branch_repos: None,
                 push_success: None,
                 push_failed: None,
+                validation_passed: validation_passed_result,
+            };
+        }
+    }
+
+    /// Set default branch on all repos in a workspace
+    #[plexus_macros::hub_method(
+        description = "Set the default branch on all remote forges for every repo in a workspace, and optionally git checkout locally",
+        params(
+            path = "Path to workspace directory",
+            branch = "Branch to set as default",
+            checkout = "Also run git checkout locally in each repo (optional, default: false)",
+            dry_run = "Preview changes without applying (optional, default: false)"
+        )
+    )]
+    pub async fn set_default_branch(
+        &self,
+        path: String,
+        branch: String,
+        checkout: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let is_dry_run = dry_run.unwrap_or(false);
+        let is_checkout = checkout.unwrap_or(false);
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Setting default branch to '{}' for {} repos...",
+                    dry_prefix, branch, ctx.repos.len(),
+                ),
+            };
+
+            let mut success_count = 0usize;
+            let mut error_count = 0usize;
+
+            for repo in &ctx.repos {
+                let config = match &repo.config {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                let org = match repo.org() {
+                    Some(o) => o.to_string(),
+                    None => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  {}: no org configured, skipping", repo.dir_name),
+                        };
+                        continue;
+                    }
+                };
+
+                let repo_name = config.repo_name.clone()
+                    .unwrap_or_else(|| repo.dir_name.clone());
+
+                // Set default branch on each forge
+                let mut repo_errors = Vec::new();
+                for forge_name in repo.forges() {
+                    if is_dry_run {
+                        yield HyperforgeEvent::Info {
+                            message: format!(
+                                "  {}Would set default branch on {}/{} ({})",
+                                dry_prefix, repo_name, forge_name, branch,
+                            ),
+                        };
+                        continue;
+                    }
+
+                    let adapter = match make_adapter(&forge_name, &org) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            repo_errors.push(format!("{}: {}", forge_name, e));
+                            continue;
+                        }
+                    };
+
+                    match adapter.set_default_branch(&org, &repo_name, &branch).await {
+                        Ok(_) => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  {} → {} default branch set to '{}'", repo_name, forge_name, branch),
+                            };
+                        }
+                        Err(e) => {
+                            repo_errors.push(format!("{}: {}", forge_name, e));
+                        }
+                    }
+                }
+
+                // Optionally checkout locally
+                if is_checkout && repo.is_git_repo {
+                    if is_dry_run {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}Would checkout '{}' in {}", dry_prefix, branch, repo.dir_name),
+                        };
+                    } else {
+                        match Git::checkout(&repo.path, &branch) {
+                            Ok(_) => {
+                                yield HyperforgeEvent::Info {
+                                    message: format!("  {} → checked out '{}'", repo.dir_name, branch),
+                                };
+                            }
+                            Err(e) => {
+                                repo_errors.push(format!("checkout: {}", e));
+                            }
+                        }
+                    }
+                }
+
+                if repo_errors.is_empty() {
+                    success_count += 1;
+                } else {
+                    error_count += 1;
+                    for err in &repo_errors {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  {} error: {}", repo.dir_name, err),
+                        };
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Set default branch complete: {} succeeded, {} failed",
+                    dry_prefix, success_count, error_count,
+                ),
             };
         }
     }
@@ -1816,6 +2525,1039 @@ impl WorkspaceHub {
                     message: format!("✗ Found {} issues that need attention", total_issues),
                 };
             }
+        }
+    }
+
+    /// Generate/update native workspace manifests (Cargo.toml, cabal.project)
+    #[plexus_macros::hub_method(
+        description = "Generate workspace config files (.cargo/config.toml with [patch.crates-io], cabal.project) from detected build systems. Each repo stays independent while sibling crates resolve locally.",
+        params(
+            path = "Path to workspace directory",
+            dry_run = "Preview without writing files (optional, default: false)"
+        )
+    )]
+    pub async fn unify(
+        &self,
+        path: String,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+            // Discover workspace
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}Workspace unify: {} repos discovered", dry_prefix, ctx.repos.len()),
+            };
+
+            // Collect Rust crates
+            let rust_repos = ctx.repos_for_build_system(&crate::build_system::BuildSystemKind::Cargo);
+            if !rust_repos.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!("  Found {} Rust crates", rust_repos.len()),
+                };
+
+                let crates: Vec<crate::build_system::cargo_config::CrateInfo> = rust_repos
+                    .iter()
+                    .filter_map(|repo| {
+                        let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                        let version = repo.package_version.clone().unwrap_or_else(|| "0.0.0".to_string());
+                        let rel_path = repo.dir_name.clone();
+                        Some(crate::build_system::cargo_config::CrateInfo {
+                            name,
+                            version,
+                            path: rel_path,
+                            dependencies: repo.dependencies.clone(),
+                        })
+                    })
+                    .collect();
+
+                match crate::build_system::cargo_config::generate_cargo_config(
+                    &ctx.root,
+                    &crates,
+                    is_dry_run,
+                ) {
+                    Ok(report) => {
+                        let action_str = match report.action {
+                            crate::build_system::cargo_config::FileAction::Created => "created",
+                            crate::build_system::cargo_config::FileAction::Updated => "updated",
+                            crate::build_system::cargo_config::FileAction::Unchanged => "unchanged",
+                            crate::build_system::cargo_config::FileAction::Removed => "removed",
+                        };
+
+                        yield HyperforgeEvent::UnifyResult {
+                            language: "rust".to_string(),
+                            file_path: ctx.root.join(".cargo/config.toml").to_string_lossy().to_string(),
+                            action: action_str.to_string(),
+                        };
+
+                        yield HyperforgeEvent::Info {
+                            message: format!(
+                                "{}.cargo/config.toml: {} patches [{}]",
+                                dry_prefix,
+                                report.patches.len(),
+                                action_str
+                            ),
+                        };
+
+                        if !report.patches.is_empty() {
+                            for (name, path) in &report.patches {
+                                yield HyperforgeEvent::Info {
+                                    message: format!("  patch: {} -> {}", name, path),
+                                };
+                            }
+                        }
+
+                        for (desc, cleanup_action) in &report.cleanup {
+                            let cleanup_str = match cleanup_action {
+                                crate::build_system::cargo_config::FileAction::Removed => "removed",
+                                crate::build_system::cargo_config::FileAction::Updated => "updated",
+                                crate::build_system::cargo_config::FileAction::Created => "created",
+                                crate::build_system::cargo_config::FileAction::Unchanged => "unchanged",
+                            };
+                            yield HyperforgeEvent::UnifyResult {
+                                language: "rust".to_string(),
+                                file_path: desc.clone(),
+                                action: cleanup_str.to_string(),
+                            };
+                            yield HyperforgeEvent::Info {
+                                message: format!("  {}{} [{}]", dry_prefix, desc, cleanup_str),
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to generate .cargo/config.toml: {}", e),
+                        };
+                    }
+                }
+            }
+
+            // Collect Haskell packages
+            let cabal_repos = ctx.repos_for_build_system(&crate::build_system::BuildSystemKind::Cabal);
+            if !cabal_repos.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!("  Found {} Haskell packages", cabal_repos.len()),
+                };
+
+                let packages: Vec<crate::build_system::cabal_project::CabalPackageInfo> = cabal_repos
+                    .iter()
+                    .map(|repo| crate::build_system::cabal_project::CabalPackageInfo {
+                        name: repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone()),
+                        path: repo.dir_name.clone(),
+                    })
+                    .collect();
+
+                match crate::build_system::cabal_project::generate_cabal_project(
+                    &ctx.root,
+                    &packages,
+                    is_dry_run,
+                ) {
+                    Ok(report) => {
+                        let action_str = match report.action {
+                            crate::build_system::cabal_project::FileAction::Created => "created",
+                            crate::build_system::cabal_project::FileAction::Updated => "updated",
+                            crate::build_system::cabal_project::FileAction::Unchanged => "unchanged",
+                        };
+
+                        yield HyperforgeEvent::UnifyResult {
+                            language: "haskell".to_string(),
+                            file_path: ctx.root.join("cabal.project").to_string_lossy().to_string(),
+                            action: action_str.to_string(),
+                        };
+
+                        yield HyperforgeEvent::Info {
+                            message: format!(
+                                "{}cabal.project: {} packages [{}]",
+                                dry_prefix,
+                                report.packages.len(),
+                                action_str
+                            ),
+                        };
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to generate cabal.project: {}", e),
+                        };
+                    }
+                }
+            }
+
+            if rust_repos.is_empty() && cabal_repos.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No Rust or Haskell projects found — nothing to unify.".to_string(),
+                };
+            }
+        }
+    }
+
+    /// Analyze workspace dependency graph and detect version mismatches
+    #[plexus_macros::hub_method(
+        description = "Analyze workspace dependency graph: show build tiers, dependency relationships, and version mismatches between pinned and local versions.",
+        params(
+            path = "Path to workspace directory",
+            format = "Output format: 'summary' (default), 'graph', or 'mismatches'"
+        )
+    )]
+    pub async fn analyze(
+        &self,
+        path: String,
+        format: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let output_format = format.unwrap_or_else(|| "summary".to_string());
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Build dep graph from all discovered repos
+            let mut nodes = Vec::new();
+            let mut all_deps = Vec::new();
+
+            for (idx, repo) in ctx.repos.iter().enumerate() {
+                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                let version = repo.package_version.clone();
+
+                nodes.push(crate::build_system::dep_graph::DepNode {
+                    name,
+                    version,
+                    build_system: format!("{}", repo.build_system),
+                    path: repo.dir_name.clone(),
+                });
+
+                if !repo.dependencies.is_empty() {
+                    all_deps.push((idx, repo.dependencies.clone()));
+                }
+            }
+
+            if nodes.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No packages found in workspace.".to_string(),
+                };
+                return;
+            }
+
+            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
+
+            match output_format.as_str() {
+                "summary" => {
+                    // Build tiers
+                    match graph.build_tiers() {
+                        Ok(tiers) => {
+                            yield HyperforgeEvent::Info {
+                                message: format!(
+                                    "Workspace: {} packages, {} internal deps, {} build tiers",
+                                    graph.nodes.len(),
+                                    graph.edges.len(),
+                                    tiers.len()
+                                ),
+                            };
+
+                            for (tier_idx, tier) in tiers.iter().enumerate() {
+                                let names: Vec<&str> = tier
+                                    .iter()
+                                    .map(|&i| graph.nodes[i].name.as_str())
+                                    .collect();
+                                yield HyperforgeEvent::Info {
+                                    message: format!("  Tier {}: {}", tier_idx, names.join(", ")),
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Cycle detected: {}", e),
+                            };
+                        }
+                    }
+
+                    // Show mismatches summary
+                    let mismatches = graph.version_mismatches();
+                    if !mismatches.is_empty() {
+                        yield HyperforgeEvent::Info {
+                            message: format!("\n{} version mismatches:", mismatches.len()),
+                        };
+                        for m in &mismatches {
+                            yield HyperforgeEvent::DepMismatch {
+                                repo: m.repo_name.clone(),
+                                dependency: m.dependency.clone(),
+                                pinned_version: m.pinned_version.clone(),
+                                local_version: m.local_version.clone(),
+                            };
+                        }
+                    } else {
+                        yield HyperforgeEvent::Info {
+                            message: "No version mismatches detected.".to_string(),
+                        };
+                    }
+                }
+
+                "graph" => {
+                    for (i, node) in graph.nodes.iter().enumerate() {
+                        let deps = graph.direct_deps(i);
+                        let rdeps = graph.reverse_deps(i);
+
+                        let dep_names: Vec<&str> = deps
+                            .iter()
+                            .map(|&j| graph.nodes[j].name.as_str())
+                            .collect();
+                        let rdep_names: Vec<&str> = rdeps
+                            .iter()
+                            .map(|&j| graph.nodes[j].name.as_str())
+                            .collect();
+
+                        let version_str = node
+                            .version
+                            .as_deref()
+                            .unwrap_or("?");
+
+                        yield HyperforgeEvent::Info {
+                            message: format!(
+                                "{} v{} [{}] deps=[{}] rdeps=[{}]",
+                                node.name,
+                                version_str,
+                                node.build_system,
+                                dep_names.join(", "),
+                                rdep_names.join(", ")
+                            ),
+                        };
+                    }
+                }
+
+                "mismatches" => {
+                    let mismatches = graph.version_mismatches();
+                    if mismatches.is_empty() {
+                        yield HyperforgeEvent::Info {
+                            message: "No version mismatches detected.".to_string(),
+                        };
+                    } else {
+                        yield HyperforgeEvent::Info {
+                            message: format!("{} version mismatches:", mismatches.len()),
+                        };
+                        for m in &mismatches {
+                            yield HyperforgeEvent::DepMismatch {
+                                repo: m.repo_name.clone(),
+                                dependency: m.dependency.clone(),
+                                pinned_version: m.pinned_version.clone(),
+                                local_version: m.local_version.clone(),
+                            };
+                        }
+                    }
+                }
+
+                other => {
+                    yield HyperforgeEvent::Error {
+                        message: format!(
+                            "Unknown format '{}'. Valid: summary, graph, mismatches",
+                            other
+                        ),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Validate workspace builds in Docker containers
+    #[plexus_macros::hub_method(
+        description = "Run containerized builds and tests in dependency order. Uses Docker to validate the entire workspace compiles before pushing.",
+        params(
+            path = "Path to workspace directory",
+            test = "Also run tests after builds (optional, default: false)",
+            dry_run = "Preview validation plan without running Docker (optional, default: false)",
+            image = "Docker image to use (optional, default: rust:latest)"
+        )
+    )]
+    pub async fn validate(
+        &self,
+        path: String,
+        test: Option<bool>,
+        dry_run: Option<bool>,
+        image: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let is_dry_run = dry_run.unwrap_or(false);
+        let run_tests = test.unwrap_or(false);
+        let docker_image = image.unwrap_or_else(|| "rust:latest".to_string());
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Build dep graph
+            let mut nodes = Vec::new();
+            let mut all_deps = Vec::new();
+
+            for (idx, repo) in ctx.repos.iter().enumerate() {
+                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                let version = repo.package_version.clone();
+
+                nodes.push(crate::build_system::dep_graph::DepNode {
+                    name,
+                    version,
+                    build_system: format!("{}", repo.build_system),
+                    path: repo.dir_name.clone(),
+                });
+
+                if !repo.dependencies.is_empty() {
+                    all_deps.push((idx, repo.dependencies.clone()));
+                }
+            }
+
+            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
+
+            // Build CI configs from per-repo .hyperforge/config.toml [ci] sections
+            let ci_configs: Vec<(String, crate::build_system::validate::RepoCiConfig)> = ctx
+                .repos
+                .iter()
+                .filter_map(|repo| {
+                    let config = repo.config.as_ref()?;
+                    let ci = config.ci.as_ref()?;
+                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+
+                    let mut cfg = crate::build_system::validate::RepoCiConfig::default();
+                    cfg.repo_name = name.clone();
+                    if !ci.build.is_empty() {
+                        cfg.build_command = ci.build.clone();
+                    }
+                    if !ci.test.is_empty() {
+                        cfg.test_command = ci.test.clone();
+                    }
+                    cfg.dockerfile = ci.dockerfile.clone();
+                    cfg.skip = ci.skip_validate;
+                    cfg.timeout_secs = ci.timeout_secs;
+                    cfg.env = ci.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+                    Some((name, cfg))
+                })
+                .collect();
+
+            // Build validation plan
+            let plan = match crate::build_system::validate::build_validation_plan(
+                &graph,
+                &ci_configs,
+                run_tests,
+            ) {
+                Ok(mut p) => {
+                    p.default_image = docker_image;
+                    p
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to build validation plan: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Validation plan: {} steps, tests={}",
+                    dry_prefix,
+                    plan.steps.len(),
+                    run_tests
+                ),
+            };
+
+            // Execute validation
+            let results = crate::build_system::validate::execute_validation(
+                &plan,
+                &ctx.root,
+                is_dry_run,
+            );
+
+            for result in &results {
+                yield HyperforgeEvent::ValidateStep {
+                    repo_name: result.repo_name.clone(),
+                    step: result.step.clone(),
+                    status: format!("{}", result.status),
+                    duration_ms: result.duration_ms,
+                };
+            }
+
+            let summary = crate::build_system::validate::summarize_results(&results);
+            yield HyperforgeEvent::ValidateSummary {
+                total: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                duration_ms: summary.duration_ms,
+            };
+
+            if summary.failed > 0 {
+                yield HyperforgeEvent::Error {
+                    message: format!(
+                        "Validation failed: {}/{} steps failed",
+                        summary.failed, summary.total
+                    ),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "{}Validation passed: {}/{} steps succeeded",
+                        dry_prefix, summary.passed, summary.total
+                    ),
+                };
+            }
+        }
+    }
+
+    /// Run a command across all workspace repos
+    #[plexus_macros::hub_method(
+        description = "Execute an arbitrary shell command in every workspace repo directory. Runs in parallel by default.",
+        params(
+            path = "Path to workspace directory",
+            command = "Shell command to execute in each repo",
+            filter = "Glob pattern to filter repos by name (optional)",
+            sequential = "Run sequentially instead of in parallel (optional, default: false)"
+        )
+    )]
+    pub async fn exec(
+        &self,
+        path: String,
+        command: String,
+        filter: Option<String>,
+        sequential: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let is_sequential = sequential.unwrap_or(false);
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Filter repos by name glob if provided
+            let repos: Vec<&crate::commands::workspace::DiscoveredRepo> = if let Some(ref pattern) = filter {
+                ctx.repos.iter().filter(|r| {
+                    glob_match(pattern, &r.dir_name)
+                }).collect()
+            } else {
+                ctx.repos.iter().collect()
+            };
+
+            if repos.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No repos matched filter.".to_string(),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Executing `{}` across {} repos{}...",
+                    command,
+                    repos.len(),
+                    if is_sequential { " (sequential)" } else { " (parallel)" }
+                ),
+            };
+
+            if is_sequential {
+                for repo in &repos {
+                    let output = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .current_dir(&repo.path)
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                            let exit_code = output.status.code().unwrap_or(-1);
+
+                            yield HyperforgeEvent::ExecResult {
+                                repo_name: repo.dir_name.clone(),
+                                exit_code,
+                                stdout,
+                                stderr,
+                            };
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::ExecResult {
+                                repo_name: repo.dir_name.clone(),
+                                exit_code: -1,
+                                stdout: String::new(),
+                                stderr: format!("Failed to execute: {}", e),
+                            };
+                        }
+                    }
+                }
+            } else {
+                // Parallel execution
+                use tokio::task::JoinSet;
+
+                let mut join_set = JoinSet::new();
+
+                for repo in &repos {
+                    let repo_name = repo.dir_name.clone();
+                    let repo_path = repo.path.clone();
+                    let cmd = command.clone();
+
+                    join_set.spawn(async move {
+                        let output = tokio::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&cmd)
+                            .current_dir(&repo_path)
+                            .output()
+                            .await;
+
+                        match output {
+                            Ok(output) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                                let exit_code = output.status.code().unwrap_or(-1);
+                                (repo_name, exit_code, stdout, stderr)
+                            }
+                            Err(e) => {
+                                (repo_name, -1, String::new(), format!("Failed to execute: {}", e))
+                            }
+                        }
+                    });
+                }
+
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok((repo_name, exit_code, stdout, stderr)) => {
+                            yield HyperforgeEvent::ExecResult {
+                                repo_name,
+                                exit_code,
+                                stdout,
+                                stderr,
+                            };
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Task join error: {}", e),
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Summary
+            let total = repos.len();
+            yield HyperforgeEvent::Info {
+                message: format!("Exec complete: ran across {} repos", total),
+            };
+        }
+    }
+
+    /// Bootstrap workspace — import all repos from remote forges into LocalForge
+    #[plexus_macros::hub_method(
+        description = "Bootstrap workspace — import all repos from remote forges into LocalForge, creating unified state mirror",
+        params(
+            org = "Organization name",
+            forges = "Forges to import from (comma-separated string or vec, e.g. github,codeberg)",
+            dry_run = "Preview without writing state (optional, default: false)"
+        )
+    )]
+    pub async fn begin(
+        &self,
+        org: String,
+        forges: Vec<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+
+            // Parse and validate forge strings
+            let mut parsed_forges: Vec<(String, Forge)> = Vec::new();
+            for forge_str in &forges {
+                // Support comma-separated values within a single string
+                for part in forge_str.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    match HyperforgeConfig::parse_forge(part) {
+                        Some(forge) => parsed_forges.push((part.to_lowercase().to_string(), forge)),
+                        None => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", part),
+                            };
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if parsed_forges.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: "No forges specified. Provide at least one forge (github, codeberg, gitlab).".to_string(),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Begin: bootstrapping workspace for org '{}' from {} forge(s): {}",
+                    dry_prefix,
+                    org,
+                    parsed_forges.len(),
+                    parsed_forges.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", "),
+                ),
+            };
+
+            // Phase 1: Verify auth by creating adapters
+            let mut adapters: Vec<(String, Forge, Arc<dyn ForgePort>)> = Vec::new();
+
+            for (forge_str, forge_enum) in &parsed_forges {
+                match make_adapter(forge_str, &org) {
+                    Ok(adapter) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  Authenticated with {}", forge_str),
+                        };
+                        adapters.push((forge_str.clone(), forge_enum.clone(), adapter));
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to authenticate with {}: {}", forge_str, e),
+                        };
+                        return;
+                    }
+                }
+            }
+
+            // Phase 2: Import repos from each forge
+            let local = state.get_local_forge(&org).await;
+            let mut per_forge_counts: HashMap<String, usize> = HashMap::new();
+            let mut total_upserted = 0usize;
+
+            for (forge_str, forge_enum, adapter) in &adapters {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}Importing repos from {}...", dry_prefix, forge_str),
+                };
+
+                let list_result = match adapter.list_repos_incremental(&org, None).await {
+                    Ok(lr) => lr,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to list repos from {}: {}", forge_str, e),
+                        };
+                        continue;
+                    }
+                };
+
+                let mut forge_count = 0usize;
+
+                if list_result.modified {
+                    if let Some(repos) = &list_result.repos {
+                        for repo in repos {
+                            let record = RepoRecord::from_repo(repo);
+
+                            if !is_dry_run {
+                                if let Err(e) = local.upsert_record(record) {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("  Failed to upsert {}: {}", repo.name, e),
+                                    };
+                                    continue;
+                                }
+                            }
+
+                            forge_count += 1;
+                            total_upserted += 1;
+                        }
+
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}Found {} repos on {}", dry_prefix, forge_count, forge_str),
+                        };
+                    }
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {} returned not-modified (no repos to import)", forge_str),
+                    };
+                }
+
+                per_forge_counts.insert(forge_str.clone(), forge_count);
+
+                // Phase 3: Store ETags
+                if !is_dry_run {
+                    if let Err(e) = local.set_forge_state(forge_enum.clone(), ForgeSyncState {
+                        last_synced: Utc::now(),
+                        etag: list_result.etag.clone(),
+                    }) {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to store sync state for {}: {}", forge_str, e),
+                        };
+                    }
+                }
+            }
+
+            // Phase 4: Save LocalForge to disk
+            if !is_dry_run && total_upserted > 0 {
+                if let Err(e) = local.save_to_yaml().await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save LocalForge for {}: {}", org, e),
+                    };
+                }
+            }
+
+            // Phase 5: Summary
+            let unique_count = match local.all_records() {
+                Ok(records) => records.len(),
+                Err(_) => total_upserted, // fallback
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Begin complete: {} unique repos in LocalForge for '{}'",
+                    dry_prefix, unique_count, org,
+                ),
+            };
+
+            for (forge_str, count) in &per_forge_counts {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}: {} repos imported", forge_str, count),
+                };
+            }
+
+            if is_dry_run {
+                yield HyperforgeEvent::Info {
+                    message: "Dry run — no changes written to disk.".to_string(),
+                };
+            }
+        }
+    }
+
+    /// Clone all repos for an org from LocalForge into a workspace directory
+    #[plexus_macros::hub_method(
+        description = "Clone all repos for an org from LocalForge into a workspace directory. Skips repos already on disk.",
+        params(
+            org = "Organization name (must have repos in LocalForge)",
+            path = "Target workspace directory",
+            filter = "Filter repos by name glob (optional, e.g. 'plexus-*')",
+            forge = "Preferred forge to clone from (optional, defaults to first in present_on)",
+            concurrency = "Max parallel clones (optional, default: 4)"
+        )
+    )]
+    pub async fn clone(
+        &self,
+        org: String,
+        path: String,
+        filter: Option<String>,
+        forge: Option<String>,
+        concurrency: Option<u32>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let max_concurrent = concurrency.unwrap_or(4) as usize;
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            // 1. Load LocalForge
+            let local = state.get_local_forge(&org).await;
+
+            // 2. Get all records
+            let records = match local.all_records() {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to load repos: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            if records.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: format!("No repos found in LocalForge for org '{}'", org),
+                };
+                return;
+            }
+
+            // 3. Filter by glob
+            let filtered: Vec<_> = if let Some(ref pattern) = filter {
+                records.into_iter().filter(|r| glob_match(pattern, &r.name)).collect()
+            } else {
+                records
+            };
+
+            // 4. Create workspace dir if needed
+            if let Err(e) = std::fs::create_dir_all(&workspace_path) {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to create workspace directory: {}", e),
+                };
+                return;
+            }
+
+            // 5. Skip repos already on disk
+            let total_filtered = filtered.len();
+            let to_clone: Vec<_> = filtered.into_iter().filter(|r| {
+                !workspace_path.join(&r.name).exists()
+            }).collect();
+
+            let skipped_count = total_filtered - to_clone.len();
+
+            if to_clone.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "All {} repos already exist on disk. Nothing to clone.",
+                        total_filtered,
+                    ),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Cloning {} repos (skipping {} already on disk, concurrency: {})...",
+                    to_clone.len(), skipped_count, max_concurrent,
+                ),
+            };
+
+            // Validate forge preference if provided
+            if let Some(ref f) = forge {
+                if HyperforgeConfig::parse_forge(f).is_none() {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", f),
+                    };
+                    return;
+                }
+            }
+
+            // 6. Clone in batches using JoinSet for concurrency control
+            let mut success_count = 0usize;
+            let mut failed_count = 0usize;
+
+            for chunk in to_clone.chunks(max_concurrent) {
+                use tokio::task::JoinSet;
+                let mut join_set = JoinSet::new();
+
+                for record in chunk {
+                    let record = record.clone();
+                    let org = org.clone();
+                    let forge_pref = forge.clone();
+                    let ws_path = workspace_path.clone();
+
+                    join_set.spawn(async move {
+                        // Pick forge to clone from
+                        let clone_forge = if let Some(ref f) = forge_pref {
+                            f.to_lowercase()
+                        } else {
+                            match record.present_on.iter().next() {
+                                Some(f) => format!("{:?}", f).to_lowercase(),
+                                None => {
+                                    return (record.name.clone(), Err("No forges in present_on".to_string()));
+                                }
+                            }
+                        };
+
+                        let clone_url = crate::git::build_remote_url(&clone_forge, &org, &record.name);
+                        let target = ws_path.join(&record.name);
+                        let target_str = target.display().to_string();
+
+                        // Clone
+                        if let Err(e) = crate::git::Git::clone(&clone_url, &target_str) {
+                            return (record.name.clone(), Err(format!("Clone failed: {}", e)));
+                        }
+
+                        // Generate .hyperforge/config.toml if missing
+                        if !crate::config::HyperforgeConfig::exists(&target) {
+                            let forges: Vec<String> = record.present_on.iter()
+                                .map(|f| format!("{:?}", f).to_lowercase())
+                                .collect();
+                            let mut config = crate::config::HyperforgeConfig::new(forges)
+                                .with_org(&org)
+                                .with_repo_name(&record.name)
+                                .with_visibility(record.visibility.clone());
+                            if let Some(ref desc) = record.description {
+                                config = config.with_description(desc);
+                            }
+                            let _ = config.save(&target);
+                        }
+
+                        // Add remotes for other forges in present_on
+                        let clone_forge_parsed = crate::config::HyperforgeConfig::parse_forge(&clone_forge);
+                        for f in &record.present_on {
+                            if Some(f.clone()) == clone_forge_parsed {
+                                continue; // Already set as "origin" by git clone
+                            }
+                            let f_str = format!("{:?}", f).to_lowercase();
+                            let remote_url = crate::git::build_remote_url(&f_str, &org, &record.name);
+                            let _ = crate::git::Git::add_remote(&target, &f_str, &remote_url);
+                        }
+
+                        (record.name.clone(), Ok(()))
+                    });
+                }
+
+                // Collect results from this batch
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok((name, Ok(()))) => {
+                            success_count += 1;
+                            yield HyperforgeEvent::Info {
+                                message: format!("  Cloned: {}", name),
+                            };
+                        }
+                        Ok((name, Err(e))) => {
+                            failed_count += 1;
+                            yield HyperforgeEvent::Error {
+                                message: format!("  Failed: {} — {}", name, e),
+                            };
+                        }
+                        Err(e) => {
+                            failed_count += 1;
+                            yield HyperforgeEvent::Error {
+                                message: format!("  Task join error: {}", e),
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Summary
+            yield HyperforgeEvent::WorkspaceSummary {
+                total_repos: success_count + failed_count + skipped_count,
+                configured_repos: success_count,
+                unconfigured_repos: 0,
+                clean_repos: None,
+                dirty_repos: None,
+                wrong_branch_repos: None,
+                push_success: Some(success_count),
+                push_failed: Some(failed_count),
+                validation_passed: None,
+            };
         }
     }
 }

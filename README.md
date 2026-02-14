@@ -213,6 +213,10 @@ Each repo has one **origin** forge and optional **mirrors**:
 2. Updates repos where metadata differs
 3. Deletes repos marked for removal
 
+## Guides
+
+- **[Workspace Sync Guide](docs/workspace-sync-guide.md)** — How to push an entire workspace to remote forges, create missing repos, and keep everything in sync.
+
 ## Known Issues
 
 ### User vs Org Accounts

@@ -65,6 +65,12 @@ pub struct InitOptions {
 
     /// Dry run - don't actually make changes
     pub dry_run: bool,
+
+    /// Skip installing hooks
+    pub no_hooks: bool,
+
+    /// Skip configuring SSH wrapper
+    pub no_ssh_wrapper: bool,
 }
 
 impl Default for InitOptions {
@@ -78,6 +84,8 @@ impl Default for InitOptions {
             ssh_keys: Vec::new(),
             force: false,
             dry_run: false,
+            no_hooks: false,
+            no_ssh_wrapper: false,
         }
     }
 }
@@ -124,6 +132,16 @@ impl InitOptions {
         self.dry_run = true;
         self
     }
+
+    pub fn no_hooks(mut self) -> Self {
+        self.no_hooks = true;
+        self
+    }
+
+    pub fn no_ssh_wrapper(mut self) -> Self {
+        self.no_ssh_wrapper = true;
+        self
+    }
 }
 
 /// Result of init operation
@@ -143,6 +161,12 @@ pub struct InitReport {
 
     /// Whether this was a dry run
     pub dry_run: bool,
+
+    /// Whether hooks were installed
+    pub hooks_installed: bool,
+
+    /// Whether SSH wrapper was configured
+    pub ssh_configured: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +207,8 @@ pub fn init(path: &Path, options: InitOptions) -> InitResult<InitReport> {
         config: HyperforgeConfig::default(),
         remotes_added: Vec::new(),
         dry_run: options.dry_run,
+        hooks_installed: false,
+        ssh_configured: false,
     };
 
     // Initialize git if needed
@@ -261,6 +287,34 @@ pub fn init(path: &Path, options: InitOptions) -> InitResult<InitReport> {
     // Save config
     if !options.dry_run {
         config.save(path)?;
+    }
+
+    // Install pre-push hook
+    if !options.no_hooks {
+        if !options.dry_run {
+            match crate::commands::hooks::install_pre_push_hook(path, false) {
+                Ok(installed) => {
+                    if installed {
+                        // Set git hooksPath to .hyperforge/hooks
+                        let _ = Git::config_set(path, "core.hooksPath", ".hyperforge/hooks");
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal: log but continue
+                    eprintln!("Warning: failed to install pre-push hook: {}", e);
+                }
+            }
+        }
+        report.hooks_installed = true;
+    }
+
+    // Configure SSH wrapper (skip if per-forge SSH keys were explicitly configured,
+    // since those set core.sshCommand to a more specific value)
+    if !options.no_ssh_wrapper && options.ssh_keys.is_empty() {
+        if !options.dry_run {
+            let _ = Git::config_set(path, "core.sshCommand", "hyperforge-ssh");
+        }
+        report.ssh_configured = true;
     }
 
     report.config = config;

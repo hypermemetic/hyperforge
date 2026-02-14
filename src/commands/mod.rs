@@ -2,6 +2,7 @@
 //!
 //! This module contains the implementation of hyperforge CLI commands.
 
+pub mod hooks;
 pub mod init;
 pub mod push;
 pub mod status;

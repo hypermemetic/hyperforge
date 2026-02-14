@@ -4,11 +4,12 @@ pub mod repo;
 
 use serde::{Deserialize, Serialize};
 
-// Re-export Repo type
+// Re-export Repo types
 pub use repo::Repo;
+pub use repo::RepoRecord;
 
 /// Supported git forges
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Forge {
     GitHub,

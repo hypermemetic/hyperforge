@@ -40,6 +40,51 @@ pub enum ConfigError {
 
 pub type ConfigResult<T> = Result<T, ConfigError>;
 
+/// CI/validation configuration for a repo
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CiConfig {
+    /// Path to Dockerfile for containerized builds (relative to repo root)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<String>,
+
+    /// Build command (default: inferred from build system)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build: Vec<String>,
+
+    /// Test command (default: inferred from build system)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test: Vec<String>,
+
+    /// Skip validation for this repo
+    #[serde(default)]
+    pub skip_validate: bool,
+
+    /// Timeout in seconds for validation steps
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+
+    /// Environment variables for CI
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+}
+
+fn default_timeout() -> u64 {
+    300
+}
+
+impl Default for CiConfig {
+    fn default() -> Self {
+        Self {
+            dockerfile: None,
+            build: Vec::new(),
+            test: Vec::new(),
+            skip_validate: false,
+            timeout_secs: 300,
+            env: HashMap::new(),
+        }
+    }
+}
+
 /// Per-forge configuration overrides
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForgeConfig {
@@ -82,6 +127,14 @@ pub struct HyperforgeConfig {
     /// Per-forge configuration overrides
     #[serde(default, rename = "forge", skip_serializing_if = "HashMap::is_empty")]
     pub forge_config: HashMap<String, ForgeConfig>,
+
+    /// Default branch name (defaults to "main" if not specified)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+
+    /// CI/validation configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiConfig>,
 }
 
 impl Default for HyperforgeConfig {
@@ -94,6 +147,8 @@ impl Default for HyperforgeConfig {
             description: None,
             ssh: HashMap::new(),
             forge_config: HashMap::new(),
+            default_branch: None,
+            ci: None,
         }
     }
 }
@@ -129,6 +184,17 @@ impl HyperforgeConfig {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
+    }
+
+    /// Builder method: set default branch
+    pub fn with_default_branch(mut self, branch: impl Into<String>) -> Self {
+        self.default_branch = Some(branch.into());
+        self
+    }
+
+    /// Get the effective default branch (falls back to "main")
+    pub fn effective_default_branch(&self) -> &str {
+        self.default_branch.as_deref().unwrap_or("main")
     }
 
     /// Builder method: add SSH key for a forge

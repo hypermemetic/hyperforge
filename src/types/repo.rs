@@ -1,5 +1,7 @@
 //! Repository types for LFORGE2
 
+use std::collections::HashSet;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use super::{Forge, Visibility};
 
@@ -94,6 +96,73 @@ impl Repo {
         let mut forges = vec![self.origin.clone()];
         forges.extend(self.mirrors.clone());
         forges
+    }
+}
+
+/// Annotated state-mirror type for LocalForge internal storage.
+///
+/// Unlike `Repo` (which uses origin/mirrors model for ForgePort compatibility),
+/// `RepoRecord` tracks the full lifecycle state of a repository: which forges
+/// it's present on, whether it's managed, soft-deletion state, and rename history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoRecord {
+    pub name: String,
+    pub description: Option<String>,
+    pub visibility: Visibility,
+    #[serde(default = "default_branch")]
+    pub default_branch: String,
+    pub present_on: HashSet<Forge>,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub dismissed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_from: Vec<Forge>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_names: Vec<String>,
+}
+
+fn default_branch() -> String {
+    "main".to_string()
+}
+
+impl RepoRecord {
+    /// Create from an existing Repo (forward compat)
+    pub fn from_repo(repo: &Repo) -> Self {
+        let mut present_on = HashSet::new();
+        present_on.insert(repo.origin.clone());
+        for m in &repo.mirrors {
+            present_on.insert(m.clone());
+        }
+        Self {
+            name: repo.name.clone(),
+            description: repo.description.clone(),
+            visibility: repo.visibility.clone(),
+            default_branch: "main".to_string(),
+            present_on,
+            managed: false,
+            dismissed: false,
+            deleted_from: Vec::new(),
+            deleted_at: None,
+            previous_names: Vec::new(),
+        }
+    }
+
+    /// Convert back to Repo for ForgePort compatibility
+    pub fn to_repo(&self) -> Repo {
+        let forges: Vec<Forge> = self.present_on.iter().cloned().collect();
+        let origin = forges.first().cloned().unwrap_or(Forge::GitHub);
+        let mirrors: Vec<Forge> = forges.into_iter().filter(|f| *f != origin).collect();
+
+        let mut repo = Repo::new(self.name.clone(), origin)
+            .with_visibility(self.visibility.clone())
+            .with_mirrors(mirrors);
+        if let Some(ref desc) = self.description {
+            repo = repo.with_description(desc);
+        }
+        repo
     }
 }
 

@@ -7,7 +7,7 @@ pub mod gitlab;
 pub mod local_forge;
 
 pub use codeberg::CodebergAdapter;
-pub use forge_port::{ForgeError, ForgePort, ForgeResult};
+pub use forge_port::{ForgeError, ForgePort, ForgeResult, ListResult};
 pub use github::GitHubAdapter;
 pub use gitlab::GitLabAdapter;
-pub use local_forge::LocalForge;
+pub use local_forge::{ForgeSyncState, LocalForge};

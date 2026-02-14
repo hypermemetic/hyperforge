@@ -84,6 +84,43 @@ pub enum HyperforgeEvent {
         wrong_branch_repos: Option<usize>,
         push_success: Option<usize>,
         push_failed: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        validation_passed: Option<bool>,
+    },
+    /// Result of workspace unify (native workspace file generation)
+    UnifyResult {
+        language: String,
+        file_path: String,
+        action: String, // "created", "updated", "unchanged"
+    },
+    /// Dependency version mismatch between pinned and local
+    DepMismatch {
+        repo: String,
+        dependency: String,
+        pinned_version: String,
+        local_version: String,
+    },
+    /// Validation step result
+    ValidateStep {
+        repo_name: String,
+        step: String, // "build" or "test"
+        status: String, // "passed", "failed", "skipped"
+        duration_ms: u64,
+    },
+    /// Validation summary
+    ValidateSummary {
+        total: usize,
+        passed: usize,
+        failed: usize,
+        skipped: usize,
+        duration_ms: u64,
+    },
+    /// Result of workspace exec command for a single repo
+    ExecResult {
+        repo_name: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
     },
 }
 
@@ -121,7 +158,7 @@ impl HyperforgeHub {
         stream! {
             yield HyperforgeEvent::Status {
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                description: "Multi-forge repository management (LFORGE2)".to_string(),
+                description: "Multi-forge repository management (FORGE4: state mirror + SSH safety)".to_string(),
             };
         }
     }
@@ -132,7 +169,7 @@ impl HyperforgeHub {
         stream! {
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "hyperforge {} (LFORGE2 - repo-local, git-native)",
+                    "hyperforge {} (FORGE4 - state mirror + SSH safety)",
                     env!("CARGO_PKG_VERSION")
                 ),
             };

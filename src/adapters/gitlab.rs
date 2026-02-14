@@ -3,13 +3,14 @@
 //! Uses the GitLab REST API v4 to manage repositories.
 
 use async_trait::async_trait;
-use reqwest::{Client, header};
+use reqwest::{Client, header, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::task::JoinSet;
 
 use crate::auth::AuthProvider;
 use crate::types::{Forge, Repo, Visibility};
-use super::{ForgeError, ForgePort, ForgeResult};
+use super::{ForgeError, ForgePort, ForgeResult, ListResult};
 
 /// GitLab API base URL
 const GITLAB_API_URL: &str = "https://gitlab.com/api/v4";
@@ -22,6 +23,8 @@ struct GitLabProject {
     visibility: String, // "public", "internal", "private"
     #[serde(default)]
     archived: bool,
+    #[serde(default)]
+    default_branch: Option<String>,
 }
 
 /// Request body for creating a project
@@ -160,6 +163,85 @@ impl GitLabAdapter {
             Visibility::Private => "private".to_string(),
         }
     }
+
+    /// Parse X-Total-Pages header from GitLab response.
+    /// Returns the total number of pages.
+    fn parse_total_pages(response: &Response) -> Option<u32> {
+        let total_pages_str = response.headers().get("x-total-pages")?.to_str().ok()?;
+        total_pages_str.parse().ok()
+    }
+
+    /// Fetch all pages of GitLab projects from a paginated endpoint.
+    /// The first response is provided (already fetched serially).
+    /// Remaining pages are fetched in parallel using X-Total-Pages header.
+    async fn fetch_all_pages(
+        &self,
+        first_response: Response,
+        base_url: &str,
+    ) -> ForgeResult<Vec<Repo>> {
+        let total_pages = Self::parse_total_pages(&first_response);
+
+        let first_projects: Vec<GitLabProject> = first_response.json().await
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        let mut all_repos: Vec<Repo> = first_projects.into_iter().map(Self::to_repo).collect();
+
+        // If there's only one page or we couldn't determine total, we're done
+        let total_pages = match total_pages {
+            Some(tp) if tp > 1 => tp,
+            _ => return Ok(all_repos),
+        };
+
+        // Fetch remaining pages in parallel (pages 2..=total_pages)
+        let headers = self.auth_headers().await?;
+        let mut join_set = JoinSet::new();
+
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        for page in 2..=total_pages {
+            let client = self.client.clone();
+            let hdrs = headers.clone();
+            let url = format!("{}{separator}page={page}", base_url);
+
+            join_set.spawn(async move {
+                let response = client.get(&url)
+                    .headers(hdrs)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(ForgeError::ApiError(format!(
+                        "GitLab API error {}: {}", status, body
+                    )));
+                }
+
+                let projects: Vec<GitLabProject> = response.json().await
+                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+                Ok(projects)
+            });
+
+            // Limit concurrency: if we have 10 in-flight, wait for one to complete
+            if join_set.len() >= 10 {
+                if let Some(result) = join_set.join_next().await {
+                    let projects = result
+                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                    all_repos.extend(projects.into_iter().map(Self::to_repo));
+                }
+            }
+        }
+
+        // Collect remaining results
+        while let Some(result) = join_set.join_next().await {
+            let projects = result
+                .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+            all_repos.extend(projects.into_iter().map(Self::to_repo));
+        }
+
+        Ok(all_repos)
+    }
 }
 
 #[async_trait]
@@ -167,9 +249,9 @@ impl ForgePort for GitLabAdapter {
     async fn list_repos(&self, org: &str) -> ForgeResult<Vec<Repo>> {
         let headers = self.auth_headers().await?;
         // Try as group first
-        let url = format!("{}/groups/{}/projects?per_page=100", self.api_url, org);
+        let base_url = format!("{}/groups/{}/projects?per_page=100", self.api_url, org);
 
-        let response = self.client.get(&url)
+        let response = self.client.get(&base_url)
             .headers(headers)
             .send()
             .await
@@ -188,10 +270,7 @@ impl ForgePort for GitLabAdapter {
             )));
         }
 
-        let gl_projects: Vec<GitLabProject> = response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
-
-        Ok(gl_projects.into_iter().map(Self::to_repo).collect())
+        self.fetch_all_pages(response, &base_url).await
     }
 
     async fn get_repo(&self, org: &str, name: &str) -> ForgeResult<Repo> {
@@ -331,6 +410,36 @@ impl ForgePort for GitLabAdapter {
         )))
     }
 
+    async fn set_default_branch(&self, org: &str, name: &str, branch: &str) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let project_path = format!("{}/{}", org, name);
+        let encoded_path = urlencoding::encode(&project_path);
+        let url = format!("{}/projects/{}", self.api_url, encoded_path);
+
+        let body = serde_json::json!({ "default_branch": branch });
+
+        let response = self.client.put(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: name.to_string() });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitLab API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()> {
         let headers = self.auth_headers().await?;
         let project_path = format!("{}/{}", org, old_name);
@@ -364,15 +473,78 @@ impl ForgePort for GitLabAdapter {
 
         Ok(())
     }
+
+    async fn list_repos_incremental(
+        &self, org: &str, etag: Option<String>,
+    ) -> ForgeResult<ListResult> {
+        let mut headers = self.auth_headers().await?;
+        if let Some(ref etag_value) = etag {
+            headers.insert(
+                header::IF_NONE_MATCH,
+                header::HeaderValue::from_str(etag_value)
+                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {}", e)))?,
+            );
+        }
+
+        // Try as group first
+        let url = format!("{}/groups/{}/projects?per_page=100", self.api_url, org);
+
+        let response = self.client.get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        // 304 Not Modified — nothing changed since the provided ETag
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(ListResult {
+                repos: None,
+                etag: etag,
+                modified: false,
+            });
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // Fallback to user repos (no ETag support for fallback)
+            let repos = self.list_user_repos(org).await?;
+            return Ok(ListResult {
+                repos: Some(repos),
+                etag: None,
+                modified: true,
+            });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitLab API error {}: {}", status, body
+            )));
+        }
+
+        let new_etag = response.headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let base_url = format!("{}/groups/{}/projects?per_page=100", self.api_url, org);
+        let repos = self.fetch_all_pages(response, &base_url).await?;
+
+        Ok(ListResult {
+            repos: Some(repos),
+            etag: new_etag,
+            modified: true,
+        })
+    }
 }
 
 impl GitLabAdapter {
     /// List repos for a user (fallback when group doesn't exist)
     async fn list_user_repos(&self, username: &str) -> ForgeResult<Vec<Repo>> {
         let headers = self.auth_headers().await?;
-        let url = format!("{}/users/{}/projects?per_page=100", self.api_url, username);
+        let base_url = format!("{}/users/{}/projects?per_page=100", self.api_url, username);
 
-        let response = self.client.get(&url)
+        let response = self.client.get(&base_url)
             .headers(headers)
             .send()
             .await
@@ -386,10 +558,7 @@ impl GitLabAdapter {
             )));
         }
 
-        let gl_projects: Vec<GitLabProject> = response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
-
-        Ok(gl_projects.into_iter().map(Self::to_repo).collect())
+        self.fetch_all_pages(response, &base_url).await
     }
 }
 
@@ -426,6 +595,7 @@ mod tests {
             description: Some("A test repo".to_string()),
             visibility: "public".to_string(),
             archived: false,
+            default_branch: None,
         };
 
         let repo = GitLabAdapter::to_repo(gl_project);
@@ -443,6 +613,7 @@ mod tests {
             description: None,
             visibility: "private".to_string(),
             archived: true,
+            default_branch: None,
         };
 
         let repo = GitLabAdapter::to_repo(gl_project);
@@ -457,6 +628,7 @@ mod tests {
             description: None,
             visibility: "internal".to_string(),
             archived: false,
+            default_branch: None,
         };
 
         let repo = GitLabAdapter::to_repo(gl_project);

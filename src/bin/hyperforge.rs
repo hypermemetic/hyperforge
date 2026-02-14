@@ -2,6 +2,7 @@ use clap::Parser;
 use plexus_core::plexus::DynamicHub;
 use plexus_transport::TransportServer;
 use hyperforge::HyperforgeHub;
+use hyperforge::registry::{RegistryClient, RegistryConfig};
 use std::sync::Arc;
 
 /// CLI arguments for hyperforge standalone server
@@ -20,6 +21,18 @@ struct Args {
     /// Enable MCP HTTP server (on port + 1)
     #[arg(long)]
     mcp: bool,
+
+    /// Register with Plexus registry on startup (ignored in stdio mode)
+    #[arg(long)]
+    register: bool,
+
+    /// Port where the Plexus registry is listening
+    #[arg(long, default_value = "4444")]
+    registry_port: u16,
+
+    /// Name to register as in the registry
+    #[arg(long, default_value = "lforge")]
+    registry_name: String,
 }
 
 #[tokio::main]
@@ -63,6 +76,36 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  Version: {}", env!("CARGO_PKG_VERSION"));
     tracing::info!("  Description: Multi-forge repository management");
 
+    // Registry registration (non-fatal — server starts regardless)
+    let registry_client = if args.register && !args.stdio {
+        let config = RegistryConfig {
+            registry_port: args.registry_port,
+            name: args.registry_name.clone(),
+            host: "127.0.0.1".into(),
+            port: args.port,
+            description: "Multi-forge repository management".into(),
+            namespace: "lforge".into(),
+        };
+        let client = RegistryClient::new(config);
+
+        match client.register().await {
+            Ok(()) => {
+                tracing::info!(
+                    "registered as '{}' with registry at port {}",
+                    args.registry_name,
+                    args.registry_port,
+                );
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("registry registration failed (non-fatal): {e}");
+                Some(client)
+            }
+        }
+    } else {
+        None
+    };
+
     // Configure transport server
     let rpc_converter = |arc: Arc<DynamicHub>| {
         DynamicHub::arc_into_rpc_module(arc)
@@ -91,12 +134,32 @@ async fn main() -> anyhow::Result<()> {
         if args.mcp {
             tracing::info!("  MCP HTTP:  http://127.0.0.1:{}/mcp", args.port + 1);
         }
+        if registry_client.is_some() {
+            tracing::info!("  Registry:  port {} as '{}'", args.registry_port, args.registry_name);
+        }
         tracing::info!("");
         tracing::info!("Usage:");
         tracing::info!("  synapse -p {} lforge hyperforge status", args.port);
         tracing::info!("  synapse -p {} lforge hyperforge version", args.port);
     }
 
-    // Start the transport server
-    builder.build().await?.serve().await
+    // Start the transport server with graceful shutdown
+    let server = builder.build().await?;
+
+    let result = tokio::select! {
+        res = server.serve() => res,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received ctrl-c, shutting down");
+            Ok(())
+        }
+    };
+
+    // Best-effort deregistration on shutdown
+    if let Some(client) = registry_client {
+        if let Err(e) = client.deregister().await {
+            tracing::warn!("registry deregistration failed: {e}");
+        }
+    }
+
+    result
 }

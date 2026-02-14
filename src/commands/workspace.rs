@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use crate::build_system::{self, BuildSystemKind, DepRef};
 use crate::config::HyperforgeConfig;
 use crate::git::Git;
 use crate::types::Repo;
@@ -40,6 +41,16 @@ pub struct DiscoveredRepo {
     pub is_git_repo: bool,
     /// Whether the directory has .hyperforge/config.toml
     pub is_hyperforge_repo: bool,
+    /// Detected build system (Cargo, Cabal, Node, Unknown)
+    pub build_system: BuildSystemKind,
+    /// All detected build systems (a repo may have multiple)
+    pub build_systems: Vec<BuildSystemKind>,
+    /// Dependencies parsed from the build manifest
+    pub dependencies: Vec<DepRef>,
+    /// Package name from the build manifest
+    pub package_name: Option<String>,
+    /// Package version from the build manifest
+    pub package_version: Option<String>,
 }
 
 impl DiscoveredRepo {
@@ -94,6 +105,33 @@ impl WorkspaceContext {
                         .map(|c| c.forges.iter().any(|f| f == forge))
                         .unwrap_or(false)
             })
+            .collect()
+    }
+
+    /// Get all unique build systems across all repos
+    pub fn build_systems(&self) -> Vec<BuildSystemKind> {
+        let mut systems = BTreeSet::new();
+        for repo in &self.repos {
+            for bs in &repo.build_systems {
+                systems.insert(format!("{}", bs));
+            }
+        }
+        systems
+            .into_iter()
+            .filter_map(|s| match s.as_str() {
+                "cargo" => Some(BuildSystemKind::Cargo),
+                "cabal" => Some(BuildSystemKind::Cabal),
+                "node" => Some(BuildSystemKind::Node),
+                _ => Some(BuildSystemKind::Unknown),
+            })
+            .collect()
+    }
+
+    /// Get repos filtered by build system
+    pub fn repos_for_build_system(&self, kind: &BuildSystemKind) -> Vec<&DiscoveredRepo> {
+        self.repos
+            .iter()
+            .filter(|r| r.build_systems.contains(kind))
             .collect()
     }
 
@@ -214,12 +252,24 @@ pub fn discover_workspace(workspace_path: &Path) -> WorkspaceResult<WorkspaceCon
             }
         }
 
+        // Detect build system
+        let primary_bs = build_system::detect_build_system(&path);
+        let all_bs = build_system::detect_all_build_systems(&path);
+        let deps = build_system::parse_dependencies(&path, &primary_bs);
+        let pkg_name = build_system::package_name(&path, &primary_bs);
+        let pkg_version = build_system::package_version(&path, &primary_bs);
+
         repos.push(DiscoveredRepo {
             path,
             dir_name,
             config,
             is_git_repo,
             is_hyperforge_repo,
+            build_system: primary_bs,
+            build_systems: all_bs,
+            dependencies: deps,
+            package_name: pkg_name,
+            package_version: pkg_version,
         });
     }
 
@@ -365,6 +415,11 @@ mod tests {
             config: None,
             is_git_repo: true,
             is_hyperforge_repo: false,
+            build_system: BuildSystemKind::Unknown,
+            build_systems: vec![],
+            dependencies: vec![],
+            package_name: None,
+            package_version: None,
         };
         assert!(repo_from_config(&discovered).is_none());
     }
@@ -377,6 +432,11 @@ mod tests {
             config: Some(HyperforgeConfig::new(vec!["github".to_string()])),
             is_git_repo: true,
             is_hyperforge_repo: true,
+            build_system: BuildSystemKind::Unknown,
+            build_systems: vec![],
+            dependencies: vec![],
+            package_name: None,
+            package_version: None,
         };
         // No org set → returns None
         assert!(repo_from_config(&discovered).is_none());

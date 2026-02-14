@@ -390,6 +390,24 @@ impl Git {
         Ok(())
     }
 
+    /// Checkout a branch
+    pub fn checkout(path: &Path, branch: &str) -> GitResult<()> {
+        Self::ensure_repo(path)?;
+
+        let output = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Fetch from all remotes
     pub fn fetch_all(path: &Path) -> GitResult<()> {
         Self::ensure_repo(path)?;

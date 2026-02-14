@@ -23,7 +23,7 @@ async fn test_hyperforge_as_plugin() {
                 match event {
                     HyperforgeEvent::Status { version, description } => {
                         assert_eq!(version, env!("CARGO_PKG_VERSION"));
-                        assert!(description.contains("LFORGE2"));
+                        assert!(description.contains("FORGE4"));
                         found_status = true;
                     }
                     _ => {}
@@ -53,7 +53,7 @@ async fn test_hyperforge_version_method() {
                 match event {
                     HyperforgeEvent::Info { message } => {
                         assert!(message.contains(env!("CARGO_PKG_VERSION")));
-                        assert!(message.contains("LFORGE2"));
+                        assert!(message.contains("FORGE4"));
                         found_version = true;
                     }
                     _ => {}

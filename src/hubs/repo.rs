@@ -438,6 +438,147 @@ impl RepoHub {
         }
     }
 
+    /// Set the default branch on remote forges and optionally checkout locally
+    #[plexus_macros::hub_method(
+        description = "Set the default branch on remote forges for a repository, and optionally git checkout locally",
+        params(
+            org = "Organization name",
+            name = "Repository name",
+            branch = "Branch to set as default",
+            checkout = "Also run git checkout locally (optional, default: false)",
+            path = "Local repo path for checkout (required if --checkout is true)"
+        )
+    )]
+    pub async fn set_default_branch(
+        &self,
+        org: String,
+        name: String,
+        branch: String,
+        checkout: Option<bool>,
+        path: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            // Get local forge to find repo config (forges)
+            let local = state.get_local_forge(&org).await;
+
+            let repo = match local.get_repo(&org, &name).await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repository not found in local config: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Collect all forges (origin + mirrors)
+            let mut target_forges = vec![repo.origin.clone()];
+            for mirror in &repo.mirrors {
+                if !target_forges.contains(mirror) {
+                    target_forges.push(mirror.clone());
+                }
+            }
+
+            // Get auth provider
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Set default branch on each forge
+            let mut errors = Vec::new();
+            for forge in &target_forges {
+                let adapter: Box<dyn ForgePort> = match forge {
+                    Forge::GitHub => {
+                        match GitHubAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                errors.push(format!("GitHub: {}", e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::Codeberg => {
+                        match CodebergAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                errors.push(format!("Codeberg: {}", e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::GitLab => {
+                        match GitLabAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                errors.push(format!("GitLab: {}", e));
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                match adapter.set_default_branch(&org, &name, &branch).await {
+                    Ok(_) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Set default branch to '{}' on {:?}", branch, forge),
+                        };
+                    }
+                    Err(e) => {
+                        errors.push(format!("{:?}: {}", forge, e));
+                    }
+                }
+            }
+
+            // Report errors
+            for error in &errors {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to set default branch - {}", error),
+                };
+            }
+
+            // Optionally checkout locally
+            if checkout.unwrap_or(false) {
+                if let Some(ref repo_path) = path {
+                    let repo_path = std::path::Path::new(repo_path);
+                    match crate::git::Git::checkout(repo_path, &branch) {
+                        Ok(_) => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("Checked out '{}' locally", branch),
+                            };
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Git checkout failed: {}", e),
+                            };
+                        }
+                    }
+                } else {
+                    yield HyperforgeEvent::Error {
+                        message: "--path is required when --checkout is true".to_string(),
+                    };
+                }
+            }
+
+            if errors.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!("Default branch set to '{}' on all forges", branch),
+                };
+            } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Completed with {} error(s)", errors.len()),
+                };
+            }
+        }
+    }
+
     /// Import repositories from a remote forge
     #[plexus_macros::hub_method(
         description = "Import repository configurations from a remote forge (GitHub, Codeberg, GitLab)",
@@ -612,7 +753,9 @@ impl RepoHub {
             description = "Repository description (optional)",
             ssh_keys = "SSH keys per forge in format 'forge:path,forge:path' (optional)",
             force = "Force reinitialize even if config exists (optional, default: false)",
-            dry_run = "Preview changes without applying (optional, default: false)"
+            dry_run = "Preview changes without applying (optional, default: false)",
+            no_hooks = "Skip installing pre-push hook (optional, default: false)",
+            no_ssh_wrapper = "Skip configuring SSH wrapper (optional, default: false)"
         )
     )]
     pub async fn init(
@@ -626,6 +769,8 @@ impl RepoHub {
         ssh_keys: Option<String>,
         force: Option<bool>,
         dry_run: Option<bool>,
+        no_hooks: Option<bool>,
+        no_ssh_wrapper: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             // Parse forges
@@ -689,6 +834,14 @@ impl RepoHub {
                 options = options.dry_run();
             }
 
+            if no_hooks.unwrap_or(false) {
+                options = options.no_hooks();
+            }
+
+            if no_ssh_wrapper.unwrap_or(false) {
+                options = options.no_ssh_wrapper();
+            }
+
             // Run init
             let repo_path = std::path::Path::new(&path);
             match init::init(repo_path, options) {
@@ -712,6 +865,18 @@ impl RepoHub {
                     for remote in report.remotes_added {
                         yield HyperforgeEvent::Info {
                             message: format!("Added remote {} → {}", remote.name, remote.url),
+                        };
+                    }
+
+                    if report.hooks_installed {
+                        yield HyperforgeEvent::Info {
+                            message: "Installed pre-push hook".to_string(),
+                        };
+                    }
+
+                    if report.ssh_configured {
+                        yield HyperforgeEvent::Info {
+                            message: "Configured SSH wrapper (hyperforge-ssh)".to_string(),
                         };
                     }
 
@@ -889,6 +1054,156 @@ impl RepoHub {
                     };
                 }
             }
+        }
+    }
+
+    /// Clone a repository from LocalForge
+    #[plexus_macros::hub_method(
+        description = "Clone a repository by name from LocalForge, auto-initialize with hyperforge config",
+        params(
+            org = "Organization name",
+            name = "Repository name (must exist in LocalForge)",
+            path = "Target directory path (optional, defaults to ./<name>)",
+            forge = "Preferred forge to clone from (optional, defaults to first in present_on)"
+        )
+    )]
+    pub async fn clone(
+        &self,
+        org: String,
+        name: String,
+        path: Option<String>,
+        forge: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            // 1. Lookup repo in LocalForge
+            let local = state.get_local_forge(&org).await;
+
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repository not found in LocalForge: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // 2. Pick clone forge
+            let clone_forge = if let Some(ref forge_str) = forge {
+                match crate::config::HyperforgeConfig::parse_forge(forge_str) {
+                    Some(f) => {
+                        if !record.present_on.contains(&f) {
+                            yield HyperforgeEvent::Error {
+                                message: format!("Repository not present on forge: {}", forge_str),
+                            };
+                            return;
+                        }
+                        f
+                    }
+                    None => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge_str),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                // Use first forge from present_on
+                match record.present_on.iter().next() {
+                    Some(f) => f.clone(),
+                    None => {
+                        yield HyperforgeEvent::Error {
+                            message: "Repository has no forges in present_on".to_string(),
+                        };
+                        return;
+                    }
+                }
+            };
+
+            // 3. Build clone URL
+            let forge_str = format!("{:?}", clone_forge).to_lowercase();
+            let clone_url = crate::git::build_remote_url(&forge_str, &org, &name);
+
+            // 4. Determine target path
+            let target_path = path.unwrap_or_else(|| name.clone());
+
+            yield HyperforgeEvent::Info {
+                message: format!("Cloning {} from {} into {}", name, forge_str, target_path),
+            };
+
+            // 5. Clone
+            if let Err(e) = crate::git::Git::clone(&clone_url, &target_path) {
+                yield HyperforgeEvent::Error {
+                    message: format!("Git clone failed: {}", e),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: "Clone successful".to_string(),
+            };
+
+            // 6. Check for .hyperforge/config.toml in clone
+            let clone_path = std::path::Path::new(&target_path);
+            let has_config = crate::config::HyperforgeConfig::exists(clone_path);
+
+            if !has_config {
+                // Generate config from RepoRecord metadata
+                let forges: Vec<String> = record.present_on.iter()
+                    .map(|f| format!("{:?}", f).to_lowercase())
+                    .collect();
+
+                let mut config = crate::config::HyperforgeConfig::new(forges.clone())
+                    .with_org(&org)
+                    .with_repo_name(&name)
+                    .with_visibility(record.visibility.clone());
+
+                if let Some(ref desc) = record.description {
+                    config = config.with_description(desc);
+                }
+
+                if let Err(e) = config.save(clone_path) {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create .hyperforge/config.toml: {}", e),
+                    };
+                    // Continue anyway - clone succeeded
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: "Generated .hyperforge/config.toml from LocalForge metadata".to_string(),
+                    };
+                }
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: "Found existing .hyperforge/config.toml".to_string(),
+                };
+            }
+
+            // 7. Add remotes for all forges in present_on
+            for f in &record.present_on {
+                if *f == clone_forge {
+                    continue; // Already set as "origin" by git clone
+                }
+                let f_str = format!("{:?}", f).to_lowercase();
+                let remote_url = crate::git::build_remote_url(&f_str, &org, &name);
+                match crate::git::Git::add_remote(clone_path, &f_str, &remote_url) {
+                    Ok(_) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Added remote {} → {}", f_str, remote_url),
+                        };
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to add remote {}: {}", f_str, e),
+                        };
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("Repository {} cloned and configured", name),
+            };
         }
     }
 }
