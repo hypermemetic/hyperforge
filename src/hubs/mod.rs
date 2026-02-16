@@ -2,8 +2,6 @@
 //!
 //! Each sub-hub is a leaf plugin under the root `hyperforge` hub.
 
-pub mod config;
-pub mod package;
 pub mod repo;
 pub mod workspace;
 
@@ -14,8 +12,6 @@ use std::sync::{Arc, RwLock};
 use crate::adapters::LocalForge;
 use crate::services::SymmetricSyncService;
 
-pub use config::ConfigHub;
-pub use package::PackageHub;
 pub use repo::RepoHub;
 pub use workspace::WorkspaceHub;
 

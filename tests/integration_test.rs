@@ -36,36 +36,6 @@ async fn test_hyperforge_as_plugin() {
 }
 
 #[tokio::test]
-async fn test_hyperforge_version_method() {
-    // Create hyperforge activation
-    let hyperforge = HyperforgeHub::new();
-
-    // Register in DynamicHub
-    let hub = Arc::new(DynamicHub::new("testhub").register(hyperforge));
-
-    // Call hyperforge.version via DynamicHub routing
-    let mut stream = hub.route("hyperforge.version", serde_json::json!({})).await.unwrap();
-
-    let mut found_version = false;
-    while let Some(item) = stream.next().await {
-        if let plexus_core::plexus::PlexusStreamItem::Data { content, .. } = item {
-            if let Ok(event) = serde_json::from_value::<HyperforgeEvent>(content) {
-                match event {
-                    HyperforgeEvent::Info { message } => {
-                        assert!(message.contains(env!("CARGO_PKG_VERSION")));
-                        assert!(message.contains("FORGE4"));
-                        found_version = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    assert!(found_version, "Should have received version info event");
-}
-
-#[tokio::test]
 async fn test_dynamic_hub_lists_hyperforge() {
     // Create hyperforge activation
     let hyperforge = HyperforgeHub::new();
@@ -85,5 +55,4 @@ async fn test_dynamic_hub_lists_hyperforge() {
 
     // Check that methods are listed
     assert!(hyperforge_activation.methods.contains(&"status".to_string()));
-    assert!(hyperforge_activation.methods.contains(&"version".to_string()));
 }

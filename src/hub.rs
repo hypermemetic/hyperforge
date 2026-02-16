@@ -3,8 +3,6 @@
 //! This is a hub plugin that routes to child sub-hubs:
 //! - repo: Single-repo operations and registry CRUD
 //! - workspace: Multi-repo workspace orchestration
-//! - package: Package publishing lifecycle
-//! - config: Org-level configuration
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -17,12 +15,12 @@ use std::sync::Arc;
 use chrono::Utc;
 use std::collections::HashMap;
 
-use crate::adapters::{ForgePort, ForgeSyncState, LocalForge};
+use crate::adapters::{ForgePort, ForgeSyncState};
 use crate::config::HyperforgeConfig;
 use crate::hubs::workspace::make_adapter;
-use crate::hubs::{ConfigHub, HyperforgeState, PackageHub, RepoHub, WorkspaceHub};
+use crate::hubs::{HyperforgeState, RepoHub, WorkspaceHub};
 use crate::types::repo::RepoRecord;
-use crate::types::{Forge, Repo, Visibility};
+use crate::types::Forge;
 
 /// Hyperforge event types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -166,80 +164,6 @@ impl HyperforgeHub {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 description: "Multi-forge repository management (FORGE4: state mirror + SSH safety)".to_string(),
             };
-        }
-    }
-
-    /// Show version info
-    #[plexus_macros::hub_method(description = "Show version information")]
-    pub async fn version(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        stream! {
-            yield HyperforgeEvent::Info {
-                message: format!(
-                    "hyperforge {} (FORGE4 - state mirror + SSH safety)",
-                    env!("CARGO_PKG_VERSION")
-                ),
-            };
-        }
-    }
-
-    /// Test workspace diff (demonstration)
-    #[plexus_macros::hub_method(description = "Test workspace diff with sample data")]
-    pub async fn test_diff(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        let sync_service = self.state.sync_service.clone();
-
-        stream! {
-            // Create test local and target forges
-            let local = Arc::new(LocalForge::new("testorg"));
-            let target = Arc::new(LocalForge::new("testorg"));
-
-            // Add some test repos to local
-            let repo1 = Repo::new("test-repo-1", Forge::GitHub)
-                .with_description("Test repository 1");
-            let repo2 = Repo::new("test-repo-2", Forge::Codeberg)
-                .with_visibility(Visibility::Private);
-
-            if let Err(e) = local.create_repo("testorg", &repo1).await {
-                yield HyperforgeEvent::Error {
-                    message: format!("Failed to create test repo: {}", e),
-                };
-                return;
-            }
-
-            if let Err(e) = local.create_repo("testorg", &repo2).await {
-                yield HyperforgeEvent::Error {
-                    message: format!("Failed to create test repo: {}", e),
-                };
-                return;
-            }
-
-            // Compute diff
-            match sync_service.diff(local, target, "testorg").await {
-                Ok(diff) => {
-                    // Yield summary
-                    yield HyperforgeEvent::SyncSummary {
-                        forge: "test".to_string(),
-                        total: diff.ops.len(),
-                        to_create: diff.to_create().len(),
-                        to_update: diff.to_update().len(),
-                        to_delete: diff.to_delete().len(),
-                        in_sync: diff.in_sync().len(),
-                    };
-
-                    // Yield individual operations
-                    for op in diff.ops {
-                        yield HyperforgeEvent::SyncOp {
-                            repo_name: op.repo.name.clone(),
-                            operation: format!("{:?}", op.op).to_lowercase(),
-                            forge: "test".to_string(),
-                        };
-                    }
-                }
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Diff failed: {}", e),
-                    };
-                }
-            }
         }
     }
 
@@ -426,14 +350,10 @@ impl HyperforgeHub {
     pub fn plugin_children(&self) -> Vec<ChildSummary> {
         let repo = RepoHub::new(self.state.clone());
         let workspace = WorkspaceHub::new(self.state.clone());
-        let package = PackageHub::new(self.state.clone());
-        let config = ConfigHub::new(self.state.clone());
 
         vec![
             child_summary(&repo),
             child_summary(&workspace),
-            child_summary(&package),
-            child_summary(&config),
         ]
     }
 }
@@ -463,8 +383,6 @@ impl ChildRouter for HyperforgeHub {
         match name {
             "repo" => Some(Box::new(RepoHub::new(self.state.clone()))),
             "workspace" => Some(Box::new(WorkspaceHub::new(self.state.clone()))),
-            "package" => Some(Box::new(PackageHub::new(self.state.clone()))),
-            "config" => Some(Box::new(ConfigHub::new(self.state.clone()))),
             _ => None,
         }
     }
