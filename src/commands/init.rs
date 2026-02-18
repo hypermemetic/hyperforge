@@ -250,6 +250,22 @@ pub fn init(path: &Path, options: InitOptions) -> InitResult<InitReport> {
     if let Some(org) = org {
         let repo_name = config.get_repo_name(path);
 
+        // Clean up stale remotes on force-reinit
+        if options.force && !options.dry_run {
+            if let Ok(remotes) = Git::list_remotes(path) {
+                let expected_remotes: Vec<String> = options
+                    .forges
+                    .iter()
+                    .map(|f| config.remote_for_forge(f))
+                    .collect();
+                for remote in &remotes {
+                    if !expected_remotes.contains(&remote.name) {
+                        let _ = Git::remove_remote(path, &remote.name);
+                    }
+                }
+            }
+        }
+
         for forge in &options.forges {
             let remote_name = config.remote_for_forge(forge);
             let remote_url = git::build_remote_url(forge, org, &repo_name);
@@ -313,6 +329,9 @@ pub fn init(path: &Path, options: InitOptions) -> InitResult<InitReport> {
     if !options.no_ssh_wrapper && options.ssh_keys.is_empty() {
         if !options.dry_run {
             let _ = Git::config_set(path, "core.sshCommand", "hyperforge-ssh");
+            if let Some(org) = org {
+                let _ = Git::config_set(path, "hyperforge.org", org);
+            }
         }
         report.ssh_configured = true;
     }

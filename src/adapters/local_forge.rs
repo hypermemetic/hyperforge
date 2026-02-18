@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::adapters::forge_port::{ForgeError, ForgePort, ForgeResult};
-use crate::types::{Forge, Repo};
+use crate::types::{Forge, OwnerType, Repo};
 use crate::types::repo::RepoRecord;
 
 /// Sync state tracked per remote forge
@@ -34,6 +34,8 @@ pub struct LocalForge {
     forges: Arc<RwLock<HashMap<Forge, ForgeSyncState>>>,
     /// Path to repos.yaml file
     config_path: Option<PathBuf>,
+    /// Whether the org is a user account or an organization
+    owner_type: Arc<RwLock<Option<OwnerType>>>,
 }
 
 impl LocalForge {
@@ -44,6 +46,7 @@ impl LocalForge {
             repos: Arc::new(RwLock::new(HashMap::new())),
             forges: Arc::new(RwLock::new(HashMap::new())),
             config_path: None,
+            owner_type: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -54,12 +57,25 @@ impl LocalForge {
             repos: Arc::new(RwLock::new(HashMap::new())),
             forges: Arc::new(RwLock::new(HashMap::new())),
             config_path: Some(path),
+            owner_type: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Get the organization name
     pub fn org(&self) -> &str {
         &self.org
+    }
+
+    /// Get the owner type (user vs org)
+    pub fn owner_type(&self) -> Option<OwnerType> {
+        self.owner_type.read().ok().and_then(|ot| ot.clone())
+    }
+
+    /// Set the owner type
+    pub fn set_owner_type(&self, ot: OwnerType) {
+        if let Ok(mut guard) = self.owner_type.write() {
+            *guard = Some(ot);
+        }
     }
 
     /// Add a repository to local state (converts Repo to RepoRecord internally)
@@ -196,6 +212,12 @@ impl LocalForge {
                     states.insert(forge, state);
                 }
             }
+            // Load owner type
+            if let Some(ot) = config.owner_type {
+                if let Ok(mut guard) = self.owner_type.write() {
+                    *guard = Some(ot);
+                }
+            }
             return Ok(());
         }
 
@@ -223,11 +245,14 @@ impl LocalForge {
             .ok_or_else(|| ForgeError::ApiError("No config path set".to_string()))?;
 
         // Clone data while holding lock, then release before async operations
-        let (yaml_repos, forge_states) = {
+        let (yaml_repos, forge_states, owner_type) = {
             let repos = self.repos.read().map_err(|e| {
                 ForgeError::ApiError(format!("Lock poisoned: {}", e))
             })?;
             let states = self.forges.read().map_err(|e| {
+                ForgeError::ApiError(format!("Lock poisoned: {}", e))
+            })?;
+            let ot = self.owner_type.read().map_err(|e| {
                 ForgeError::ApiError(format!("Lock poisoned: {}", e))
             })?;
 
@@ -237,12 +262,13 @@ impl LocalForge {
             let state_map: HashMap<String, ForgeSyncState> = states.iter()
                 .map(|(forge, state)| (format!("{:?}", forge).to_lowercase(), state.clone()))
                 .collect();
-            (repo_map, state_map)
+            (repo_map, state_map, ot.clone())
         }; // Locks are dropped here
 
         let config = ReposYaml {
             repos: yaml_repos,
             forge_states,
+            owner_type,
         };
 
         let yaml = serde_yaml::to_string(&config)
@@ -379,6 +405,8 @@ struct ReposYaml {
     repos: HashMap<String, RepoRecord>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     forge_states: HashMap<String, ForgeSyncState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_type: Option<OwnerType>,
 }
 
 /// Old YAML format for migration from pre-state-mirror versions

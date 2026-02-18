@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 use crate::auth::AuthProvider;
-use crate::types::{Forge, Repo, Visibility};
+use crate::types::{Forge, OwnerType, Repo, Visibility};
 use super::{ForgeError, ForgePort, ForgeResult, ListResult};
 
 /// GitLab API base URL
@@ -65,6 +65,7 @@ pub struct GitLabAdapter {
     auth: Arc<dyn AuthProvider>,
     api_url: String,
     org: String,
+    owner_type: Option<OwnerType>,
 }
 
 impl GitLabAdapter {
@@ -80,7 +81,13 @@ impl GitLabAdapter {
             .build()
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        Ok(Self { client, auth, api_url, org: org.into() })
+        Ok(Self { client, auth, api_url, org: org.into(), owner_type: None })
+    }
+
+    /// Set the owner type for this adapter (user vs org)
+    pub fn with_owner_type(mut self, ot: OwnerType) -> Self {
+        self.owner_type = Some(ot);
+        self
     }
 
     /// Get authorization headers with token from auth provider
@@ -247,6 +254,11 @@ impl GitLabAdapter {
 #[async_trait]
 impl ForgePort for GitLabAdapter {
     async fn list_repos(&self, org: &str) -> ForgeResult<Vec<Repo>> {
+        // If we know this is a user account, skip the group endpoint entirely
+        if self.owner_type == Some(OwnerType::User) {
+            return self.list_user_repos(org).await;
+        }
+
         let headers = self.auth_headers().await?;
         // Try as group first
         let base_url = format!("{}/groups/{}/projects?per_page=100", self.api_url, org);
@@ -258,7 +270,7 @@ impl ForgePort for GitLabAdapter {
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            // Try user repos if group not found
+            // Try user repos if group not found (only when owner_type is None/unknown)
             return self.list_user_repos(org).await;
         }
 
@@ -307,10 +319,14 @@ impl ForgePort for GitLabAdapter {
     async fn create_repo(&self, org: &str, repo: &Repo) -> ForgeResult<()> {
         let headers = self.auth_headers().await?;
 
-        // Get group/namespace ID
-        let namespace_id = match self.get_group_id(org).await {
-            Ok(id) => Some(id),
-            Err(_) => None, // Will create under user if group not found
+        // Get group/namespace ID (skip if we know this is a user account)
+        let namespace_id = if self.owner_type == Some(OwnerType::User) {
+            None
+        } else {
+            match self.get_group_id(org).await {
+                Ok(id) => Some(id),
+                Err(_) => None, // Will create under user if group not found
+            }
         };
 
         let url = format!("{}/projects", self.api_url);
@@ -477,6 +493,16 @@ impl ForgePort for GitLabAdapter {
     async fn list_repos_incremental(
         &self, org: &str, etag: Option<String>,
     ) -> ForgeResult<ListResult> {
+        // If we know this is a user account, skip the group endpoint entirely
+        if self.owner_type == Some(OwnerType::User) {
+            let repos = self.list_user_repos(org).await?;
+            return Ok(ListResult {
+                repos: Some(repos),
+                etag: None,
+                modified: true,
+            });
+        }
+
         let mut headers = self.auth_headers().await?;
         if let Some(ref etag_value) = etag {
             headers.insert(

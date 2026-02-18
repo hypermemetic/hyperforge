@@ -167,6 +167,24 @@ impl HyperforgeHub {
         }
     }
 
+    /// Reload cached state from disk (repos.yaml for all known orgs)
+    #[plexus_macros::hub_method(description = "Reload all cached LocalForge state from disk")]
+    pub async fn reload(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        stream! {
+            let reloaded = state.reload().await;
+            if reloaded.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No cached orgs to reload. Run a command first to populate the cache.".to_string(),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("Reloaded {} org(s): {}", reloaded.len(), reloaded.join(", ")),
+                };
+            }
+        }
+    }
+
     /// Bootstrap an org — import all repos from remote forges into LocalForge
     #[plexus_macros::hub_method(
         description = "Bootstrap an org — import all repos from remote forges into LocalForge, creating the canonical state mirror",
@@ -228,8 +246,9 @@ impl HyperforgeHub {
             // Phase 1: Verify auth by creating adapters
             let mut adapters: Vec<(String, Forge, Arc<dyn ForgePort>)> = Vec::new();
 
+            let ot = state.get_local_forge(&org).await.owner_type();
             for (forge_str, forge_enum) in &parsed_forges {
-                match make_adapter(forge_str, &org) {
+                match make_adapter(forge_str, &org, ot.clone()) {
                     Ok(adapter) => {
                         yield HyperforgeEvent::Info {
                             message: format!("  Authenticated with {}", forge_str),

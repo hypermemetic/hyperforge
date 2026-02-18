@@ -64,6 +64,27 @@ impl HyperforgeState {
 
         forge
     }
+
+    /// Reload all cached LocalForge instances from disk
+    pub async fn reload(&self) -> Vec<String> {
+        let org_names: Vec<String> = {
+            let forges = self.local_forges.read().unwrap();
+            forges.keys().cloned().collect()
+        };
+
+        let mut reloaded = Vec::new();
+        for org in &org_names {
+            let yaml_path = self.config_dir.join("orgs").join(org).join("repos.yaml");
+            let forge = Arc::new(LocalForge::with_config_path(org, yaml_path));
+            let _ = forge.load_from_yaml().await;
+            {
+                let mut forges = self.local_forges.write().unwrap();
+                forges.insert(org.clone(), forge);
+            }
+            reloaded.push(org.clone());
+        }
+        reloaded
+    }
 }
 
 impl Default for HyperforgeState {

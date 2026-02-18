@@ -26,6 +26,14 @@ pub enum Visibility {
     Private,
 }
 
+/// Whether the org name refers to a user account or an organization
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerType {
+    User,
+    Org,
+}
+
 /// Version bump type for package publishing
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionBump {

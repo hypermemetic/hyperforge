@@ -137,6 +137,12 @@ pub struct RepoStatusReport {
 
     /// Whether there are untracked files
     pub has_untracked: bool,
+
+    /// Value of core.sshCommand git config
+    pub ssh_command: Option<String>,
+
+    /// Value of hyperforge.org git config
+    pub hyperforge_org: Option<String>,
 }
 
 impl RepoStatusReport {
@@ -276,6 +282,14 @@ pub fn status(path: &Path) -> StatusResult<RepoStatusReport> {
         forge_statuses.push(forge_status);
     }
 
+    // Read SSH config
+    let ssh_command = Git::config_get(path, "core.sshCommand")
+        .ok()
+        .flatten();
+    let hyperforge_org = Git::config_get(path, "hyperforge.org")
+        .ok()
+        .flatten();
+
     Ok(RepoStatusReport {
         repo_path: path.display().to_string(),
         branch: repo_status.branch,
@@ -283,6 +297,8 @@ pub fn status(path: &Path) -> StatusResult<RepoStatusReport> {
         has_changes: repo_status.has_changes,
         has_staged: repo_status.has_staged,
         has_untracked: repo_status.has_untracked,
+        ssh_command,
+        hyperforge_org,
     })
 }
 
@@ -504,6 +520,8 @@ mod tests {
             has_changes: false,
             has_staged: false,
             has_untracked: false,
+            ssh_command: None,
+            hyperforge_org: None,
         };
 
         let formatted = report.format();

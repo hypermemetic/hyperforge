@@ -24,7 +24,7 @@ use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::services::SyncOp;
-use crate::types::{Forge, Visibility};
+use crate::types::{Forge, OwnerType, Visibility};
 use std::collections::HashSet;
 
 /// Sub-hub for multi-repo workspace orchestration
@@ -40,7 +40,7 @@ impl WorkspaceHub {
 }
 
 /// Create a forge adapter from a forge name string
-pub(crate) fn make_adapter(forge: &str, org: &str) -> Result<Arc<dyn ForgePort>, String> {
+pub(crate) fn make_adapter(forge: &str, org: &str, owner_type: Option<OwnerType>) -> Result<Arc<dyn ForgePort>, String> {
     let auth = YamlAuthProvider::new().map_err(|e| format!("Failed to create auth provider: {}", e))?;
     let auth = Arc::new(auth);
     let target_forge = match forge.to_lowercase().as_str() {
@@ -51,13 +51,16 @@ pub(crate) fn make_adapter(forge: &str, org: &str) -> Result<Arc<dyn ForgePort>,
     };
     let adapter: Arc<dyn ForgePort> = match target_forge {
         Forge::GitHub => {
-            Arc::new(GitHubAdapter::new(auth, org).map_err(|e| format!("Failed to create GitHub adapter: {}", e))?)
+            let a = GitHubAdapter::new(auth, org).map_err(|e| format!("Failed to create GitHub adapter: {}", e))?;
+            Arc::new(match owner_type { Some(ot) => a.with_owner_type(ot), None => a })
         }
         Forge::Codeberg => {
-            Arc::new(CodebergAdapter::new(auth, org).map_err(|e| format!("Failed to create Codeberg adapter: {}", e))?)
+            let a = CodebergAdapter::new(auth, org).map_err(|e| format!("Failed to create Codeberg adapter: {}", e))?;
+            Arc::new(match owner_type { Some(ot) => a.with_owner_type(ot), None => a })
         }
         Forge::GitLab => {
-            Arc::new(GitLabAdapter::new(auth, org).map_err(|e| format!("Failed to create GitLab adapter: {}", e))?)
+            let a = GitLabAdapter::new(auth, org).map_err(|e| format!("Failed to create GitLab adapter: {}", e))?;
+            Arc::new(match owner_type { Some(ot) => a.with_owner_type(ot), None => a })
         }
     };
     Ok(adapter)
@@ -462,6 +465,16 @@ impl WorkspaceHub {
                     is_clean,
                     on_correct_branch,
                 };
+
+                // Check SSH config health
+                let ssh_cmd = Git::config_get(&repo.path, "core.sshCommand").ok().flatten();
+                let hf_org = Git::config_get(&repo.path, "hyperforge.org").ok().flatten();
+
+                if ssh_cmd.as_deref() == Some("hyperforge-ssh") && hf_org.is_none() {
+                    yield HyperforgeEvent::Error {
+                        message: format!("{}: SSH misconfigured — hyperforge-ssh set but hyperforge.org missing", repo.dir_name),
+                    };
+                }
             }
 
             yield HyperforgeEvent::WorkspaceSummary {
@@ -701,17 +714,18 @@ impl WorkspaceHub {
             }
 
             for (org_name, forge_name) in &pairs {
+                // Get local forge
+                let local = state.get_local_forge(org_name).await;
+                let ot = local.owner_type();
+
                 // Get forge adapter
-                let adapter = match make_adapter(forge_name, org_name) {
+                let adapter = match make_adapter(forge_name, org_name, ot) {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Error { message: e };
                         continue;
                     }
                 };
-
-                // Get local forge
-                let local = state.get_local_forge(org_name).await;
 
                 yield HyperforgeEvent::Info {
                     message: format!("Computing diff for {}/{}", org_name, forge_name),
@@ -1031,15 +1045,16 @@ impl WorkspaceHub {
                 let mut imported = 0usize;
 
                 for (org_name, forge_name) in &pairs {
-                    let adapter = match make_adapter(forge_name, org_name) {
+                    let local = state.get_local_forge(org_name).await;
+                    let ot = local.owner_type();
+
+                    let adapter = match make_adapter(forge_name, org_name, ot) {
                         Ok(a) => a,
                         Err(e) => {
                             yield HyperforgeEvent::Error { message: e };
                             continue;
                         }
                     };
-
-                    let local = state.get_local_forge(org_name).await;
 
                     // Get stored ETag for this forge
                     let forge_enum = HyperforgeConfig::parse_forge(forge_name);
@@ -1168,15 +1183,16 @@ impl WorkspaceHub {
             let mut all_diffs: Vec<(String, String, crate::services::SyncDiff)> = Vec::new();
 
             for (org_name, forge_name) in &pairs {
-                let adapter = match make_adapter(forge_name, org_name) {
+                let local = state.get_local_forge(org_name).await;
+                let ot = local.owner_type();
+
+                let adapter = match make_adapter(forge_name, org_name, ot) {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Error { message: e };
                         continue;
                     }
                 };
-
-                let local = state.get_local_forge(org_name).await;
 
                 match sync_service.diff(local, adapter, org_name).await {
                     Ok(diff) => {
@@ -1218,7 +1234,8 @@ impl WorkspaceHub {
             let mut total_updated = 0usize;
 
             for (org_name, forge_name, diff) in &all_diffs {
-                let adapter = match make_adapter(forge_name, org_name) {
+                let ot = state.get_local_forge(org_name).await.owner_type();
+                let adapter = match make_adapter(forge_name, org_name, ot) {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Error { message: e };
@@ -1302,15 +1319,16 @@ impl WorkspaceHub {
                     .collect();
 
                 for (org_name, forge_name) in &pairs {
-                    let adapter = match make_adapter(forge_name, org_name) {
+                    let local = state.get_local_forge(org_name).await;
+                    let ot = local.owner_type();
+
+                    let adapter = match make_adapter(forge_name, org_name, ot) {
                         Ok(a) => a,
                         Err(e) => {
                             yield HyperforgeEvent::Error { message: e };
                             continue;
                         }
                     };
-
-                    let local = state.get_local_forge(org_name).await;
 
                     // Get stored ETag for this forge
                     let forge_enum = HyperforgeConfig::parse_forge(forge_name);
@@ -1698,7 +1716,7 @@ impl WorkspaceHub {
                         continue;
                     }
 
-                    let adapter = match make_adapter(&forge_name, &org) {
+                    let adapter = match make_adapter(&forge_name, &org, None) {
                         Ok(a) => a,
                         Err(e) => {
                             repo_errors.push(format!("{}: {}", forge_name, e));
@@ -2444,7 +2462,8 @@ impl WorkspaceHub {
             path = "Path to workspace directory",
             command = "Shell command to execute in each repo",
             filter = "Glob pattern to filter repos by name (optional)",
-            sequential = "Run sequentially instead of in parallel (optional, default: false)"
+            sequential = "Run sequentially instead of in parallel (optional, default: false)",
+            dirty = "Only run on repos with uncommitted changes (optional, default: false)"
         )
     )]
     pub async fn exec(
@@ -2453,8 +2472,10 @@ impl WorkspaceHub {
         command: String,
         filter: Option<String>,
         sequential: Option<bool>,
+        dirty: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let is_sequential = sequential.unwrap_or(false);
+        let only_dirty = dirty.unwrap_or(false);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -2470,13 +2491,23 @@ impl WorkspaceHub {
             };
 
             // Filter repos by name glob if provided
-            let repos: Vec<&crate::commands::workspace::DiscoveredRepo> = if let Some(ref pattern) = filter {
+            let mut repos: Vec<&crate::commands::workspace::DiscoveredRepo> = if let Some(ref pattern) = filter {
                 ctx.repos.iter().filter(|r| {
                     glob_match(pattern, &r.dir_name)
                 }).collect()
             } else {
                 ctx.repos.iter().collect()
             };
+
+            // Filter to dirty repos only
+            if only_dirty {
+                repos.retain(|r| {
+                    match Git::repo_status(&r.path) {
+                        Ok(s) => s.has_changes || s.has_staged || s.has_untracked,
+                        Err(_) => false,
+                    }
+                });
+            }
 
             if repos.is_empty() {
                 yield HyperforgeEvent::Info {

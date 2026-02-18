@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 use crate::auth::AuthProvider;
-use crate::types::{Forge, Repo, Visibility};
+use crate::types::{Forge, OwnerType, Repo, Visibility};
 use super::{ForgeError, ForgePort, ForgeResult, ListResult};
 
 /// GitHub API base URL
@@ -57,6 +57,7 @@ pub struct GitHubAdapter {
     auth: Arc<dyn AuthProvider>,
     api_url: String,
     org: String,
+    owner_type: Option<OwnerType>,
 }
 
 impl GitHubAdapter {
@@ -72,7 +73,13 @@ impl GitHubAdapter {
             .build()
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        Ok(Self { client, auth, api_url, org: org.into() })
+        Ok(Self { client, auth, api_url, org: org.into(), owner_type: None })
+    }
+
+    /// Set the owner type for this adapter (user vs org)
+    pub fn with_owner_type(mut self, ot: OwnerType) -> Self {
+        self.owner_type = Some(ot);
+        self
     }
 
     /// Get authorization headers with token from auth provider
@@ -218,6 +225,11 @@ impl GitHubAdapter {
 #[async_trait]
 impl ForgePort for GitHubAdapter {
     async fn list_repos(&self, org: &str) -> ForgeResult<Vec<Repo>> {
+        // If we know this is a user account, skip the org endpoint entirely
+        if self.owner_type == Some(OwnerType::User) {
+            return self.list_user_repos(org).await;
+        }
+
         let headers = self.auth_headers().await?;
         let base_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, org);
 
@@ -228,7 +240,7 @@ impl ForgePort for GitHubAdapter {
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            // Try user repos if org not found
+            // Try user repos if org not found (only when owner_type is None/unknown)
             return self.list_user_repos(org).await;
         }
 
@@ -272,6 +284,11 @@ impl ForgePort for GitHubAdapter {
     }
 
     async fn create_repo(&self, org: &str, repo: &Repo) -> ForgeResult<()> {
+        // If we know this is a user account, go directly to user endpoint
+        if self.owner_type == Some(OwnerType::User) {
+            return self.create_user_repo(repo).await;
+        }
+
         let headers = self.auth_headers().await?;
         let url = format!("{}/orgs/{}/repos", self.api_url, org);
 
@@ -288,7 +305,7 @@ impl ForgePort for GitHubAdapter {
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        // If org create fails with 404, try user create
+        // If org create fails with 404, try user create (only when owner_type is None/unknown)
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return self.create_user_repo(repo).await;
         }
@@ -430,6 +447,16 @@ impl ForgePort for GitHubAdapter {
     async fn list_repos_incremental(
         &self, org: &str, etag: Option<String>,
     ) -> ForgeResult<ListResult> {
+        // If we know this is a user account, skip the org endpoint entirely
+        if self.owner_type == Some(OwnerType::User) {
+            let repos = self.list_user_repos(org).await?;
+            return Ok(ListResult {
+                repos: Some(repos),
+                etag: None,
+                modified: true,
+            });
+        }
+
         let mut headers = self.auth_headers().await?;
         if let Some(ref etag_value) = etag {
             headers.insert(

@@ -955,6 +955,30 @@ impl RepoHub {
 
                         yield HyperforgeEvent::Info { message: msg };
                     }
+
+                    // SSH configuration health
+                    match (&report.ssh_command, &report.hyperforge_org) {
+                        (Some(cmd), Some(org)) if cmd == "hyperforge-ssh" => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("SSH: hyperforge-ssh (org: {})", org),
+                            };
+                        }
+                        (Some(cmd), None) if cmd == "hyperforge-ssh" => {
+                            yield HyperforgeEvent::Error {
+                                message: "SSH: hyperforge-ssh configured but hyperforge.org NOT SET — pushes will use wrong key".to_string(),
+                            };
+                        }
+                        (Some(cmd), _) => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("SSH: custom ({})", cmd),
+                            };
+                        }
+                        (None, _) => {
+                            yield HyperforgeEvent::Info {
+                                message: "SSH: system default".to_string(),
+                            };
+                        }
+                    }
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
