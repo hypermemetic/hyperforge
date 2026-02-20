@@ -253,9 +253,9 @@ impl RepoHub {
         }
     }
 
-    /// Delete a repository
+    /// Soft-delete a repository: privatize on remote forges, then mark dismissed locally
     #[plexus_macros::hub_method(
-        description = "Delete a repository from local configuration",
+        description = "Soft-delete a repository: privatize on remotes, mark dismissed locally (record preserved in repos.yaml)",
         params(
             org = "Organization name",
             name = "Repository name"
@@ -271,8 +271,104 @@ impl RepoHub {
         stream! {
             let local = state.get_local_forge(&org).await;
 
+            // Get the record to find which forges it's on
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repository not found: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Protected repos cannot be deleted
+            if record.protected {
+                yield HyperforgeEvent::Error {
+                    message: format!("Cannot delete '{}': repo is protected. Remove protection first with: repo update --org {} --name {} --protected false", name, org, name),
+                };
+                return;
+            }
+
+            // Privatize on each remote forge
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            let mut privatize_errors = Vec::new();
+            let mut privatized_forges = Vec::new();
+            for forge in &record.present_on {
+                let adapter: Box<dyn ForgePort> = match forge {
+                    Forge::GitHub => {
+                        match GitHubAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                privatize_errors.push(format!("{:?}: {}", forge, e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::Codeberg => {
+                        match CodebergAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                privatize_errors.push(format!("{:?}: {}", forge, e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::GitLab => {
+                        match GitLabAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                privatize_errors.push(format!("{:?}: {}", forge, e));
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                // Make private on remote
+                let private_repo = Repo::new(&name, forge.clone())
+                    .with_visibility(Visibility::Private);
+                match adapter.update_repo(&org, &private_repo).await {
+                    Ok(_) => {
+                        privatized_forges.push(forge.clone());
+                        yield HyperforgeEvent::Info {
+                            message: format!("Made private on {:?}", forge),
+                        };
+                    }
+                    Err(e) => {
+                        privatize_errors.push(format!("{:?}: {}", forge, e));
+                    }
+                }
+            }
+
+            for error in &privatize_errors {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to privatize - {}", error),
+                };
+            }
+
+            // Soft-delete locally (always, even if remote privatization had errors)
             match local.delete_repo(&org, &name).await {
                 Ok(_) => {
+                    // Record which forges were successfully privatized
+                    if !privatized_forges.is_empty() {
+                        if let Ok(mut rec) = local.get_record(&name) {
+                            for f in &privatized_forges {
+                                rec.privatized_on.insert(f.clone());
+                            }
+                            let _ = local.update_record(&rec);
+                        }
+                    }
+
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
                             message: format!("Failed to save repos.yaml: {}", e),
@@ -281,7 +377,10 @@ impl RepoHub {
                     }
 
                     yield HyperforgeEvent::Info {
-                        message: format!("Deleted repository: {}", name),
+                        message: format!(
+                            "Soft-deleted repository: {} (privatized on remotes, record preserved in repos.yaml)",
+                            name
+                        ),
                     };
                 }
                 Err(e) => {
@@ -289,6 +388,145 @@ impl RepoHub {
                         message: format!("Failed to delete repo: {}", e),
                     };
                 }
+            }
+
+            if !privatize_errors.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Completed with {} privatization error(s)", privatize_errors.len()),
+                };
+            }
+        }
+    }
+
+    /// Purge a soft-deleted repository: hard-delete from remote forges and remove from repos.yaml
+    ///
+    /// Only works on dismissed (soft-deleted) repos that have been privatized.
+    /// Protected repos cannot be purged — remove protection first.
+    #[plexus_macros::hub_method(
+        description = "Hard-delete a dismissed repo from remote forges and remove from repos.yaml. Requires repo to be dismissed and not protected.",
+        params(
+            org = "Organization name",
+            name = "Repository name (must be dismissed)"
+        )
+    )]
+    pub async fn purge(
+        &self,
+        org: String,
+        name: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            let local = state.get_local_forge(&org).await;
+
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repository not found: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Must be dismissed first
+            if !record.dismissed {
+                yield HyperforgeEvent::Error {
+                    message: format!("Cannot purge '{}': repo is not dismissed. Run 'repo delete' first.", name),
+                };
+                return;
+            }
+
+            // Protected repos cannot be purged
+            if record.protected {
+                yield HyperforgeEvent::Error {
+                    message: format!("Cannot purge '{}': repo is protected. Remove protection first with: repo update --org {} --name {} --protected false", name, org, name),
+                };
+                return;
+            }
+
+            // Delete from each remote forge
+            let auth = match YamlAuthProvider::new() {
+                Ok(provider) => Arc::new(provider),
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            let mut delete_errors = Vec::new();
+            for forge in &record.present_on {
+                let adapter: Box<dyn ForgePort> = match forge {
+                    Forge::GitHub => {
+                        match GitHubAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                delete_errors.push(format!("{:?}: {}", forge, e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::Codeberg => {
+                        match CodebergAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                delete_errors.push(format!("{:?}: {}", forge, e));
+                                continue;
+                            }
+                        }
+                    }
+                    Forge::GitLab => {
+                        match GitLabAdapter::new(auth.clone(), &org) {
+                            Ok(a) => Box::new(a),
+                            Err(e) => {
+                                delete_errors.push(format!("{:?}: {}", forge, e));
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                match adapter.delete_repo(&org, &name).await {
+                    Ok(_) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Deleted from {:?}", forge),
+                        };
+                    }
+                    Err(e) => {
+                        delete_errors.push(format!("{:?}: {}", forge, e));
+                    }
+                }
+            }
+
+            for error in &delete_errors {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to delete - {}", error),
+                };
+            }
+
+            // Hard-delete locally (remove record from repos.yaml entirely)
+            if delete_errors.is_empty() {
+                if let Err(e) = local.remove_repo(&name) {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to remove local record: {}", e),
+                    };
+                } else {
+                    if let Err(e) = local.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save repos.yaml: {}", e),
+                        };
+                        return;
+                    }
+                    yield HyperforgeEvent::Info {
+                        message: format!("Purged repository: {} (deleted from all remotes, removed from repos.yaml)", name),
+                    };
+                }
+            } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Purge incomplete: {} remote deletion error(s). Local record preserved.", delete_errors.len()),
+                };
             }
         }
     }

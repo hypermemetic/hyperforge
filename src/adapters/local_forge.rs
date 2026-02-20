@@ -79,13 +79,18 @@ impl LocalForge {
     }
 
     /// Add a repository to local state (converts Repo to RepoRecord internally)
+    ///
+    /// If a dismissed (soft-deleted) record exists with the same name, it will be
+    /// overwritten, allowing re-creation of previously deleted repos.
     pub fn add_repo(&self, repo: Repo) -> ForgeResult<()> {
         let mut repos = self.repos.write().map_err(|e| {
             ForgeError::ApiError(format!("Lock poisoned: {}", e))
         })?;
 
-        if repos.contains_key(&repo.name) {
-            return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
+        if let Some(existing) = repos.get(&repo.name) {
+            if !existing.dismissed {
+                return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
+            }
         }
 
         let record = RepoRecord::from_repo(&repo);
@@ -350,7 +355,18 @@ impl ForgePort for LocalForge {
             )));
         }
 
-        self.remove_repo(name)
+        let mut repos = self.repos.write().map_err(|e| {
+            ForgeError::ApiError(format!("Lock poisoned: {}", e))
+        })?;
+
+        let record = repos.get_mut(name)
+            .ok_or_else(|| ForgeError::RepoNotFound { name: name.to_string() })?;
+
+        record.dismissed = true;
+        record.managed = false;
+        record.deleted_at = Some(Utc::now());
+
+        Ok(())
     }
 
     async fn set_default_branch(&self, _org: &str, name: &str, branch: &str) -> ForgeResult<()> {
@@ -471,8 +487,36 @@ mod tests {
 
         forge.delete_repo("testorg", "test-repo").await.unwrap();
 
-        let result = forge.get_repo("testorg", "test-repo").await;
-        assert!(matches!(result, Err(ForgeError::RepoNotFound { .. })));
+        // Still visible through ForgePort API, but as private + staged_for_deletion
+        let result = forge.get_repo("testorg", "test-repo").await.unwrap();
+        assert_eq!(result.visibility, Visibility::Private);
+        assert!(result.staged_for_deletion);
+
+        // Record preserved with dismissed=true
+        let record = forge.get_record("test-repo").unwrap();
+        assert!(record.dismissed);
+        assert!(record.deleted_at.is_some());
+        assert!(!record.managed);
+    }
+
+    #[tokio::test]
+    async fn test_local_forge_recreate_dismissed_repo() {
+        let forge = LocalForge::new("testorg");
+        let repo = Repo::new("test-repo", Forge::GitHub);
+        forge.create_repo("testorg", &repo).await.unwrap();
+        forge.delete_repo("testorg", "test-repo").await.unwrap();
+
+        // Re-create overwrites dismissed record
+        let repo2 = Repo::new("test-repo", Forge::GitHub).with_description("Recreated");
+        forge.create_repo("testorg", &repo2).await.unwrap();
+
+        let retrieved = forge.get_repo("testorg", "test-repo").await.unwrap();
+        assert_eq!(retrieved.description, Some("Recreated".to_string()));
+
+        // Verify the record is no longer dismissed
+        let record = forge.get_record("test-repo").unwrap();
+        assert!(!record.dismissed);
+        assert!(record.deleted_at.is_none());
     }
 
     #[tokio::test]
@@ -706,10 +750,12 @@ mod tests {
             visibility: Visibility::Private,
             default_branch: "main".to_string(),
             present_on,
+            protected: false,
             managed: true,
             dismissed: false,
             deleted_from: Vec::new(),
             deleted_at: None,
+            privatized_on: std::collections::HashSet::new(),
             previous_names: Vec::new(),
         };
         forge.upsert_record(record).unwrap();

@@ -246,7 +246,7 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
                 match output {
                     Ok(out) if out.status.success() => Ok(()),
                     Ok(out) => Err(GitError::CommandFailed {
-                        message: String::from_utf8_lossy(&out.stderr).to_string(),
+                        message: crate::git::command_error_message(&out),
                     }),
                     Err(e) => Err(GitError::IoError(e)),
                 }

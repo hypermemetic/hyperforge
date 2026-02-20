@@ -112,6 +112,9 @@ pub struct RepoRecord {
     #[serde(default = "default_branch")]
     pub default_branch: String,
     pub present_on: HashSet<Forge>,
+    /// Whether this repo is protected from deletion (soft-delete, privatize, purge)
+    #[serde(default)]
+    pub protected: bool,
     #[serde(default)]
     pub managed: bool,
     #[serde(default)]
@@ -120,6 +123,10 @@ pub struct RepoRecord {
     pub deleted_from: Vec<Forge>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Forges where the repo has been privatized as part of staged deletion.
+    /// Populated by `repo delete` and `workspace sync` so we don't re-privatize.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub privatized_on: HashSet<Forge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_names: Vec<String>,
 }
@@ -142,25 +149,34 @@ impl RepoRecord {
             visibility: repo.visibility.clone(),
             default_branch: "main".to_string(),
             present_on,
+            protected: repo.protected,
             managed: false,
             dismissed: false,
             deleted_from: Vec::new(),
             deleted_at: None,
+            privatized_on: HashSet::new(),
             previous_names: Vec::new(),
         }
     }
 
     /// Convert back to Repo for ForgePort compatibility
+    ///
+    /// Dismissed records are surfaced as private + staged_for_deletion so they
+    /// remain visible in listings but clearly marked as soft-deleted.
     pub fn to_repo(&self) -> Repo {
         let forges: Vec<Forge> = self.present_on.iter().cloned().collect();
         let origin = forges.first().cloned().unwrap_or(Forge::GitHub);
         let mirrors: Vec<Forge> = forges.into_iter().filter(|f| *f != origin).collect();
 
         let mut repo = Repo::new(self.name.clone(), origin)
-            .with_visibility(self.visibility.clone())
-            .with_mirrors(mirrors);
+            .with_visibility(if self.dismissed { Visibility::Private } else { self.visibility.clone() })
+            .with_mirrors(mirrors)
+            .with_protected(self.protected);
         if let Some(ref desc) = self.description {
             repo = repo.with_description(desc);
+        }
+        if self.dismissed {
+            repo.staged_for_deletion = true;
         }
         repo
     }

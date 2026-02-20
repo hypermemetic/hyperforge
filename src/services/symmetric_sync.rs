@@ -124,6 +124,17 @@ impl SymmetricSyncService {
 
         // Check each source repo
         for source_repo in source_repos {
+            // Staged for deletion: delete from target if present, otherwise skip
+            if source_repo.staged_for_deletion {
+                if target_map.remove(&source_repo.name).is_some() {
+                    ops.push(RepoOp {
+                        repo: source_repo,
+                        op: SyncOp::Delete,
+                    });
+                }
+                continue;
+            }
+
             if let Some(target_repo) = target_map.remove(&source_repo.name) {
                 // Repo exists on both - check if update needed
                 if repos_differ(&source_repo, &target_repo) {
@@ -234,11 +245,12 @@ impl SymmetricSyncService {
                 _ => continue, // Skip unknown forges
             };
 
-            // Filter repos that should be on this forge
+            // Filter repos that should be on this forge (exclude staged for deletion)
             let repos_for_forge: Vec<_> = all_repos
                 .iter()
                 .filter(|r| {
-                    r.origin == forge_type || r.mirrors.contains(&forge_type)
+                    !r.staged_for_deletion
+                        && (r.origin == forge_type || r.mirrors.contains(&forge_type))
                 })
                 .cloned()
                 .collect();
@@ -432,6 +444,43 @@ mod tests {
         let repo1 = Repo::new("test", Forge::GitHub).with_description("Same");
         let repo2 = Repo::new("test", Forge::GitHub).with_description("Same");
         assert!(!repos_differ(&repo1, &repo2));
+    }
+
+    #[tokio::test]
+    async fn test_diff_staged_for_deletion_on_target() {
+        let service = SymmetricSyncService::new();
+        let source = Arc::new(LocalForge::new("testorg"));
+        let target = Arc::new(LocalForge::new("testorg"));
+
+        // Create then soft-delete on source (sets dismissed → staged_for_deletion)
+        let repo = Repo::new("dying-repo", Forge::GitHub);
+        source.create_repo("testorg", &repo).await.unwrap();
+        source.delete_repo("testorg", "dying-repo").await.unwrap();
+
+        // Also exists on target
+        let target_repo = Repo::new("dying-repo", Forge::GitHub);
+        target.create_repo("testorg", &target_repo).await.unwrap();
+
+        let diff = service.diff(source, target, "testorg").await.unwrap();
+        assert_eq!(diff.to_delete().len(), 1);
+        assert_eq!(diff.to_delete()[0].name, "dying-repo");
+        assert_eq!(diff.to_create().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_diff_staged_for_deletion_not_on_target() {
+        let service = SymmetricSyncService::new();
+        let source = Arc::new(LocalForge::new("testorg"));
+        let target = Arc::new(LocalForge::new("testorg"));
+
+        // Create then soft-delete on source, not on target
+        let repo = Repo::new("already-gone", Forge::GitHub);
+        source.create_repo("testorg", &repo).await.unwrap();
+        source.delete_repo("testorg", "already-gone").await.unwrap();
+
+        let diff = service.diff(source, target, "testorg").await.unwrap();
+        // Should be completely absent from diff — nothing to do
+        assert_eq!(diff.ops.len(), 0);
     }
 
     #[tokio::test]

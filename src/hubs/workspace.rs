@@ -1278,12 +1278,65 @@ impl WorkspaceHub {
                             };
                         }
                         SyncOp::Delete => {
-                            // Explicitly skip deletes in the safe pipeline
-                            yield HyperforgeEvent::SyncOp {
-                                repo_name: repo_op.repo.name.clone(),
-                                operation: "skip_delete".to_string(),
-                                forge: forge_name.clone(),
-                            };
+                            // Staged deletion: privatize on remote if not already done
+                            let local = state.get_local_forge(org_name).await;
+                            let record_info = local.get_record(&repo_op.repo.name).ok();
+
+                            // Protected repos cannot be privatized or deleted
+                            if record_info.as_ref().map_or(false, |r| r.protected) {
+                                yield HyperforgeEvent::SyncOp {
+                                    repo_name: repo_op.repo.name.clone(),
+                                    operation: "skip_protected".to_string(),
+                                    forge: forge_name.clone(),
+                                };
+                                continue;
+                            }
+
+                            let already_privatized = record_info.as_ref()
+                                .and_then(|rec| {
+                                    crate::config::HyperforgeConfig::parse_forge(forge_name)
+                                        .map(|fe| rec.privatized_on.contains(&fe))
+                                })
+                                .unwrap_or(false);
+
+                            if already_privatized {
+                                yield HyperforgeEvent::SyncOp {
+                                    repo_name: repo_op.repo.name.clone(),
+                                    operation: "already_privatized".to_string(),
+                                    forge: forge_name.clone(),
+                                };
+                            } else {
+                                let private_repo = crate::types::Repo::new(
+                                    &repo_op.repo.name,
+                                    repo_op.repo.origin.clone(),
+                                ).with_visibility(crate::types::Visibility::Private);
+
+                                if !is_dry_run {
+                                    match adapter.update_repo(org_name, &private_repo).await {
+                                        Ok(_) => {
+                                            // Record privatization
+                                            if let Some(forge_enum) = crate::config::HyperforgeConfig::parse_forge(forge_name) {
+                                                if let Ok(mut rec) = local.get_record(&repo_op.repo.name) {
+                                                    rec.privatized_on.insert(forge_enum);
+                                                    let _ = local.update_record(&rec);
+                                                    let _ = local.save_to_yaml().await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            yield HyperforgeEvent::Error {
+                                                message: format!("  Failed to privatize {} on {}: {}",
+                                                    repo_op.repo.name, forge_name, e),
+                                            };
+                                        }
+                                    }
+                                }
+                                yield HyperforgeEvent::SyncOp {
+                                    repo_name: repo_op.repo.name.clone(),
+                                    operation: "privatize".to_string(),
+                                    forge: forge_name.clone(),
+                                };
+                            }
                         }
                         SyncOp::InSync => {
                             // Nothing to do
@@ -1415,7 +1468,22 @@ impl WorkspaceHub {
                                 continue;
                             }
 
-                            // Actually delete
+                            // Check protection before purging
+                            let is_protected = local.get_record(&remote_repo.name)
+                                .ok()
+                                .map_or(false, |r| r.protected);
+                            if is_protected {
+                                protected_skipped += 1;
+                                yield HyperforgeEvent::Info {
+                                    message: format!(
+                                        "  Skipping purge of {} on {} (protected)",
+                                        remote_repo.name, forge_name,
+                                    ),
+                                };
+                                continue;
+                            }
+
+                            // Actually delete from remote
                             if !is_dry_run {
                                 if let Err(e) = adapter.delete_repo(org_name, &remote_repo.name).await {
                                     yield HyperforgeEvent::Error {
@@ -1423,7 +1491,9 @@ impl WorkspaceHub {
                                     };
                                     continue;
                                 }
+                                // Soft-delete locally (record preserved)
                                 let _ = local.delete_repo(org_name, &remote_repo.name).await;
+                                let _ = local.save_to_yaml().await;
                             }
 
                             purged_count += 1;

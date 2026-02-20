@@ -35,6 +35,22 @@ pub enum GitError {
 
 pub type GitResult<T> = Result<T, GitError>;
 
+/// Build an error message from a failed command's stderr and stdout.
+/// Includes stdout when non-empty (e.g. pre-push hook output).
+pub(crate) fn command_error_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = stderr.trim();
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        stderr.to_string()
+    } else if stderr.is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{}\n{}", stderr, stdout)
+    }
+}
+
 /// Information about a git remote
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInfo {
@@ -342,7 +358,7 @@ impl Git {
 
         if !output.status.success() {
             return Err(GitError::CommandFailed {
-                message: String::from_utf8_lossy(&output.stderr).to_string(),
+                message: command_error_message(&output),
             });
         }
 
@@ -360,7 +376,7 @@ impl Git {
 
         if !output.status.success() {
             return Err(GitError::CommandFailed {
-                message: String::from_utf8_lossy(&output.stderr).to_string(),
+                message: command_error_message(&output),
             });
         }
 
