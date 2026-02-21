@@ -79,11 +79,30 @@ impl Ord for SemVer {
     }
 }
 
-/// Compare two version strings. Returns None if either fails to parse.
+/// Compare two version strings. Handles both 3-part semver (1.2.3) and
+/// 4-part PVP (0.3.0.0) by comparing numeric parts left-to-right,
+/// padding the shorter version with zeros.
 pub fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
-    let va = SemVer::parse(a)?;
-    let vb = SemVer::parse(b)?;
-    Some(va.cmp(&vb))
+    let a = a.strip_prefix('v').unwrap_or(a).trim();
+    let b = b.strip_prefix('v').unwrap_or(b).trim();
+
+    let a_parts: Vec<u64> = a.split('.').map(|p| p.parse().ok()).collect::<Option<Vec<_>>>()?;
+    let b_parts: Vec<u64> = b.split('.').map(|p| p.parse().ok()).collect::<Option<Vec<_>>>()?;
+
+    if a_parts.is_empty() || b_parts.is_empty() {
+        return None;
+    }
+
+    let max_len = a_parts.len().max(b_parts.len());
+    for i in 0..max_len {
+        let a_val = a_parts.get(i).copied().unwrap_or(0);
+        let b_val = b_parts.get(i).copied().unwrap_or(0);
+        match a_val.cmp(&b_val) {
+            Ordering::Equal => continue,
+            other => return Some(other),
+        }
+    }
+    Some(Ordering::Equal)
 }
 
 /// Edit the version field in a Cargo.toml, preserving formatting via toml_edit.

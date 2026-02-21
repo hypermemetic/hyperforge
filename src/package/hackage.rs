@@ -1,7 +1,8 @@
 //! Hackage registry client.
 //!
 //! Queries Hackage API for published versions and shells out to
-//! `cabal upload --publish` for publishing.
+//! `cabal upload --publish` for publishing. Fetches auth token from
+//! cabal's `password-command` config or `HACKAGE_TOKEN` env var.
 
 use super::{PublishResult, PublishedVersion, RegistryClient};
 use crate::build_system::BuildSystemKind;
@@ -21,6 +22,46 @@ impl HackageClient {
             .build()
             .expect("failed to build HTTP client");
         Self { http }
+    }
+
+    /// Resolve the Hackage auth token. Tries in order:
+    /// 1. `HACKAGE_TOKEN` env var
+    /// 2. `password-command` from `~/.cabal/config`
+    async fn resolve_token(&self) -> Option<String> {
+        // 1. Env var
+        if let Ok(token) = std::env::var("HACKAGE_TOKEN") {
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+
+        // 2. Parse password-command from cabal config
+        let config_path = dirs::home_dir()?.join(".cabal/config");
+        let config = tokio::fs::read_to_string(&config_path).await.ok()?;
+        let cmd = config
+            .lines()
+            .find(|l| l.starts_with("password-command:"))?
+            .trim_start_matches("password-command:")
+            .trim();
+
+        if cmd.is_empty() {
+            return None;
+        }
+
+        let output = tokio::process::Command::new("sh")
+            .args(["-c", cmd])
+            .output()
+            .await
+            .ok()?;
+
+        if output.status.success() {
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+
+        None
     }
 }
 
@@ -80,7 +121,7 @@ impl RegistryClient for HackageClient {
         if dry_run {
             // Dry-run: build source distribution to validate
             let output = tokio::process::Command::new("cabal")
-                .args(["sdist"])
+                .args(["sdist", "--ignore-project"])
                 .current_dir(path)
                 .output()
                 .await?;
@@ -103,9 +144,12 @@ impl RegistryClient for HackageClient {
             });
         }
 
+        // Resolve auth token before publishing
+        let token = self.resolve_token().await;
+
         // Step 1: build source distribution tarball
         let sdist_output = tokio::process::Command::new("cabal")
-            .args(["sdist"])
+            .args(["sdist", "--ignore-project"])
             .current_dir(path)
             .output()
             .await?;
@@ -146,9 +190,14 @@ impl RegistryClient for HackageClient {
             }
         };
 
-        // Step 2: upload the tarball
+        // Step 2: upload the tarball with --token to bypass interactive username prompt
+        let mut upload_args = vec!["upload".to_string(), "--publish".to_string()];
+        if let Some(ref tok) = token {
+            upload_args.push(format!("--token={}", tok));
+        }
+        upload_args.push(tarball);
         let output = tokio::process::Command::new("cabal")
-            .args(["upload", "--publish", &tarball])
+            .args(&upload_args)
             .current_dir(path)
             .output()
             .await?;
