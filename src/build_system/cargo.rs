@@ -31,8 +31,8 @@ pub fn cargo_package_version(path: &Path) -> Option<String> {
 
 /// Parse dependencies from Cargo.toml
 ///
-/// Reads both `[dependencies]` and `[dev-dependencies]` sections.
-/// Handles both simple version strings and table-form deps.
+/// Reads `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]`.
+/// Dev-dependencies are tagged with `is_dev = true`.
 pub fn parse_cargo_deps(path: &Path) -> Vec<DepRef> {
     let cargo_path = path.join("Cargo.toml");
     let content = match std::fs::read_to_string(&cargo_path) {
@@ -49,23 +49,23 @@ pub fn parse_cargo_deps(path: &Path) -> Vec<DepRef> {
 
     // Parse [dependencies]
     if let Some(dep_table) = doc.get("dependencies").and_then(|v| v.as_table()) {
-        deps.extend(parse_dep_table(dep_table));
+        deps.extend(parse_dep_table(dep_table, false));
     }
 
     // Parse [dev-dependencies]
     if let Some(dep_table) = doc.get("dev-dependencies").and_then(|v| v.as_table()) {
-        deps.extend(parse_dep_table(dep_table));
+        deps.extend(parse_dep_table(dep_table, true));
     }
 
     // Parse [build-dependencies]
     if let Some(dep_table) = doc.get("build-dependencies").and_then(|v| v.as_table()) {
-        deps.extend(parse_dep_table(dep_table));
+        deps.extend(parse_dep_table(dep_table, false));
     }
 
     deps
 }
 
-fn parse_dep_table(table: &toml::map::Map<String, toml::Value>) -> Vec<DepRef> {
+fn parse_dep_table(table: &toml::map::Map<String, toml::Value>, is_dev: bool) -> Vec<DepRef> {
     let mut deps = Vec::new();
 
     for (name, value) in table {
@@ -77,6 +77,7 @@ fn parse_dep_table(table: &toml::map::Map<String, toml::Value>) -> Vec<DepRef> {
                     version_req: Some(version.clone()),
                     is_path_dep: false,
                     path: None,
+                    is_dev,
                 });
             }
             // Table form: dep = { version = "1.0", path = "../dep", ... }
@@ -90,6 +91,7 @@ fn parse_dep_table(table: &toml::map::Map<String, toml::Value>) -> Vec<DepRef> {
                     version_req: version,
                     is_path_dep: is_path,
                     path: dep_path,
+                    is_dev,
                 });
             }
             _ => {}

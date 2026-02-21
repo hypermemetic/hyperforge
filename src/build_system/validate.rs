@@ -349,6 +349,7 @@ mod tests {
             version_req: Some("0.1.0".to_string()),
             is_path_dep: false,
             path: None,
+            is_dev: false,
         }])];
 
         let graph = DepGraph::build(nodes, &deps);

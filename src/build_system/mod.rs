@@ -10,7 +10,9 @@ pub mod cargo;
 pub mod cargo_config;
 pub mod dep_graph;
 pub mod node;
+pub mod publish;
 pub mod validate;
+pub mod version;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -48,6 +50,9 @@ pub struct DepRef {
     /// Path to the dependency (if path dep)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Whether this is a dev/test-only dependency
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_dev: bool,
 }
 
 /// Detect the build system for a directory by checking filesystem markers.
@@ -87,12 +92,23 @@ pub fn detect_all_build_systems(path: &Path) -> Vec<BuildSystemKind> {
 /// Parse dependencies from a project manifest.
 ///
 /// Delegates to the appropriate parser based on `kind`.
+/// When `include_dev` is false (default for publish), dev/test dependencies are excluded.
 pub fn parse_dependencies(path: &Path, kind: &BuildSystemKind) -> Vec<DepRef> {
-    match kind {
+    parse_dependencies_filtered(path, kind, true)
+}
+
+/// Parse dependencies with control over dev-dependency inclusion.
+pub fn parse_dependencies_filtered(path: &Path, kind: &BuildSystemKind, include_dev: bool) -> Vec<DepRef> {
+    let deps = match kind {
         BuildSystemKind::Cargo => cargo::parse_cargo_deps(path),
         BuildSystemKind::Cabal => cabal::parse_cabal_deps(path),
         BuildSystemKind::Node => node::parse_node_deps(path),
         BuildSystemKind::Unknown => Vec::new(),
+    };
+    if include_dev {
+        deps
+    } else {
+        deps.into_iter().filter(|d| !d.is_dev).collect()
     }
 }
 

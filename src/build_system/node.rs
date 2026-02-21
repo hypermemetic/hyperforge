@@ -41,6 +41,7 @@ pub fn parse_node_deps(path: &Path) -> Vec<DepRef> {
     let mut deps = Vec::new();
 
     for section in &["dependencies", "devDependencies", "peerDependencies"] {
+        let is_dev = *section == "devDependencies";
         if let Some(obj) = doc.get(section).and_then(|v| v.as_object()) {
             for (name, value) in obj {
                 let version_str = value.as_str().unwrap_or("*").to_string();
@@ -63,6 +64,7 @@ pub fn parse_node_deps(path: &Path) -> Vec<DepRef> {
                     version_req: Some(version_str),
                     is_path_dep: is_path,
                     path,
+                    is_dev,
                 });
             }
         }

@@ -3061,6 +3061,627 @@ impl WorkspaceHub {
             };
         }
     }
+
+    /// Compare local package versions against their registries
+    #[plexus_macros::hub_method(
+        description = "Show local vs published versions for workspace packages",
+        params(
+            path = "Path to workspace root directory",
+            filter = "Glob pattern to filter packages by name (optional)"
+        )
+    )]
+    pub async fn package_diff(
+        &self,
+        path: String,
+        filter: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Build dep graph
+            let mut nodes = Vec::new();
+            let mut all_deps = Vec::new();
+
+            for (idx, repo) in ctx.repos.iter().enumerate() {
+                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                let version = repo.package_version.clone();
+
+                nodes.push(crate::build_system::dep_graph::DepNode {
+                    name,
+                    version,
+                    build_system: format!("{}", repo.build_system),
+                    path: repo.dir_name.clone(),
+                });
+
+                // Exclude dev-deps for publish graph
+                let non_dev_deps: Vec<_> = repo.dependencies.iter()
+                    .filter(|d| !d.is_dev)
+                    .cloned()
+                    .collect();
+                if !non_dev_deps.is_empty() {
+                    all_deps.push((idx, non_dev_deps));
+                }
+            }
+
+            if nodes.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No packages found in workspace.".to_string(),
+                };
+                return;
+            }
+
+            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
+
+            // Filter packages
+            let indices: Vec<usize> = graph.nodes.iter().enumerate()
+                .filter(|(_, node)| {
+                    if let Some(ref pat) = filter {
+                        glob_match(pat, &node.name)
+                    } else {
+                        true
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if indices.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No packages matched filter.".to_string(),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("Checking {} packages against registries...", indices.len()),
+            };
+
+            // Query registries for each package
+            for &idx in &indices {
+                let node = &graph.nodes[idx];
+                let build_system = match node.build_system.as_str() {
+                    "cargo" => crate::build_system::BuildSystemKind::Cargo,
+                    "cabal" => crate::build_system::BuildSystemKind::Cabal,
+                    "node" => crate::build_system::BuildSystemKind::Node,
+                    _ => crate::build_system::BuildSystemKind::Unknown,
+                };
+
+                let registry = match crate::package::registry_for(&build_system) {
+                    Some(r) => r,
+                    None => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}: skipped (no registry for {})", node.name, node.build_system),
+                        };
+                        continue;
+                    }
+                };
+
+                let local_version = match &node.version {
+                    Some(v) => v.clone(),
+                    None => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}: skipped (no version)", node.name),
+                        };
+                        continue;
+                    }
+                };
+
+                let registry_kind = registry.registry_kind();
+
+                let published = match registry.published_version(&node.name).await {
+                    Ok(pv) => pv,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  {}: registry query failed: {}", node.name, e),
+                        };
+                        continue;
+                    }
+                };
+
+                let published_version = published.as_ref().map(|p| p.version.clone());
+
+                let status = match &published_version {
+                    None => crate::hub::PackageStatus::Unpublished,
+                    Some(pub_v) => {
+                        match crate::build_system::version::compare_versions(&local_version, pub_v) {
+                            Some(std::cmp::Ordering::Greater) => crate::hub::PackageStatus::Ahead,
+                            Some(std::cmp::Ordering::Equal) => crate::hub::PackageStatus::UpToDate,
+                            Some(std::cmp::Ordering::Less) => crate::hub::PackageStatus::Stale,
+                            None => crate::hub::PackageStatus::Stale,
+                        }
+                    }
+                };
+
+                yield HyperforgeEvent::PackageDiff {
+                    package_name: node.name.clone(),
+                    build_system: build_system.clone(),
+                    local_version,
+                    published_version,
+                    registry: registry_kind,
+                    status,
+                };
+            }
+        }
+    }
+
+    /// Publish packages with transitive dependency resolution
+    #[plexus_macros::hub_method(
+        description = "Publish workspace packages in dependency order, auto-publishing transitive deps first. Dry-run by default — pass --execute to actually publish.",
+        params(
+            path = "Path to workspace root directory",
+            filter = "Glob pattern to filter target packages by name (optional, default: all)",
+            execute = "Actually publish to registries (default: false, dry-run unless set)",
+            no_tag = "Skip creating git tags after publish (optional, default: false)",
+            no_commit = "Skip auto-commit after version bumps (optional, default: false)",
+            bump = "Version bump kind for auto-bump: patch, minor, major (optional, default: patch)"
+        )
+    )]
+    pub async fn publish(
+        &self,
+        path: String,
+        filter: Option<String>,
+        execute: Option<bool>,
+        no_tag: Option<bool>,
+        no_commit: Option<bool>,
+        bump: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let is_dry_run = !execute.unwrap_or(false);
+        let skip_tags = no_tag.unwrap_or(false);
+        let skip_commits = no_commit.unwrap_or(false);
+        let bump_kind = match bump.as_deref() {
+            Some("minor") => crate::types::VersionBump::Minor,
+            Some("major") => crate::types::VersionBump::Major,
+            _ => crate::types::VersionBump::Patch,
+        };
+        let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Build dep graph
+            let mut nodes = Vec::new();
+            let mut all_deps = Vec::new();
+
+            for (idx, repo) in ctx.repos.iter().enumerate() {
+                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                let version = repo.package_version.clone();
+
+                nodes.push(crate::build_system::dep_graph::DepNode {
+                    name,
+                    version,
+                    build_system: format!("{}", repo.build_system),
+                    path: repo.dir_name.clone(),
+                });
+
+                // Exclude dev-deps for publish graph
+                let non_dev_deps: Vec<_> = repo.dependencies.iter()
+                    .filter(|d| !d.is_dev)
+                    .cloned()
+                    .collect();
+                if !non_dev_deps.is_empty() {
+                    all_deps.push((idx, non_dev_deps));
+                }
+            }
+
+            if nodes.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No packages found in workspace.".to_string(),
+                };
+                return;
+            }
+
+            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
+
+            // Resolve targets from filter
+            let targets: Vec<usize> = graph.nodes.iter().enumerate()
+                .filter(|(_, node)| {
+                    if let Some(ref pat) = filter {
+                        glob_match(pat, &node.name)
+                    } else {
+                        // Default: all packages with a registry
+                        match node.build_system.as_str() {
+                            "cargo" | "cabal" => true,
+                            _ => false,
+                        }
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if targets.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No publishable packages matched filter.".to_string(),
+                };
+                return;
+            }
+
+            // Build publish plan (queries registries, computes transitive closure)
+            let plan = match crate::build_system::publish::build_publish_plan(
+                &graph,
+                &targets,
+                &workspace_path,
+                &bump_kind,
+            ).await {
+                Ok(p) => p,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to build publish plan: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Report exclusions
+            for (name, reason) in &plan.excluded {
+                yield HyperforgeEvent::Info {
+                    message: format!("{}Excluded {}: {}", dry_prefix, name, reason),
+                };
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Publish plan: {} packages in dependency order",
+                    dry_prefix,
+                    plan.steps.len()
+                ),
+            };
+
+            // Track failed nodes to skip dependents
+            let mut failed_nodes: HashSet<usize> = HashSet::new();
+            let mut published_count = 0usize;
+            let mut auto_bumped_count = 0usize;
+            let mut skipped_count = 0usize;
+            let mut failed_count = 0usize;
+            let mut tags_created = 0usize;
+
+            for step in &plan.steps {
+                // Check if any dependency failed
+                let dep_failed = graph.direct_deps(step.node_idx)
+                    .iter()
+                    .any(|dep_idx| failed_nodes.contains(dep_idx));
+
+                if dep_failed {
+                    failed_nodes.insert(step.node_idx);
+                    failed_count += 1;
+                    yield HyperforgeEvent::PublishStep {
+                        package_name: step.name.clone(),
+                        version: step.target_version.clone(),
+                        registry: crate::hub::PackageRegistry::CratesIo, // placeholder
+                        action: crate::hub::PublishActionKind::Failed,
+                        success: false,
+                        error: Some("dependency failed to publish".to_string()),
+                    };
+                    continue;
+                }
+
+                let build_system = &step.build_system;
+                let registry = match crate::package::registry_for(build_system) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let registry_kind = registry.registry_kind();
+
+                match &step.action {
+                    crate::build_system::publish::PublishAction::Skip => {
+                        skipped_count += 1;
+                        yield HyperforgeEvent::PublishStep {
+                            package_name: step.name.clone(),
+                            version: step.target_version.clone(),
+                            registry: registry_kind,
+                            action: crate::hub::PublishActionKind::Skip,
+                            success: true,
+                            error: None,
+                        };
+                    }
+                    crate::build_system::publish::PublishAction::Error(msg) => {
+                        failed_nodes.insert(step.node_idx);
+                        failed_count += 1;
+                        yield HyperforgeEvent::PublishStep {
+                            package_name: step.name.clone(),
+                            version: step.target_version.clone(),
+                            registry: registry_kind,
+                            action: crate::hub::PublishActionKind::Failed,
+                            success: false,
+                            error: Some(msg.clone()),
+                        };
+                    }
+                    action => {
+                        let is_auto_bump = matches!(action, crate::build_system::publish::PublishAction::AutoBump);
+                        let action_kind = match action {
+                            crate::build_system::publish::PublishAction::Publish => crate::hub::PublishActionKind::Publish,
+                            crate::build_system::publish::PublishAction::AutoBump => crate::hub::PublishActionKind::AutoBump,
+                            crate::build_system::publish::PublishAction::InitialPublish => crate::hub::PublishActionKind::InitialPublish,
+                            _ => unreachable!(),
+                        };
+
+                        // Auto-bump: edit manifest and optionally commit
+                        if is_auto_bump && !is_dry_run {
+                            if let Err(e) = crate::build_system::version::set_package_version(
+                                &step.path,
+                                build_system,
+                                &step.target_version,
+                            ) {
+                                failed_nodes.insert(step.node_idx);
+                                failed_count += 1;
+                                yield HyperforgeEvent::PublishStep {
+                                    package_name: step.name.clone(),
+                                    version: step.target_version.clone(),
+                                    registry: registry_kind,
+                                    action: crate::hub::PublishActionKind::Failed,
+                                    success: false,
+                                    error: Some(format!("version bump failed: {}", e)),
+                                };
+                                continue;
+                            }
+
+                            if !skip_commits {
+                                // Stage and commit the version bump
+                                let manifest_file = match build_system {
+                                    crate::build_system::BuildSystemKind::Cargo => "Cargo.toml",
+                                    crate::build_system::BuildSystemKind::Cabal => {
+                                        // Find .cabal file name
+                                        &step.name
+                                    }
+                                    _ => "package.json",
+                                };
+
+                                // For cabal, we need the actual filename
+                                if *build_system == crate::build_system::BuildSystemKind::Cabal {
+                                    // Stage all .cabal files
+                                    let _ = Git::add(&step.path, "*.cabal");
+                                } else {
+                                    let _ = Git::add(&step.path, manifest_file);
+                                }
+
+                                let commit_msg = format!(
+                                    "chore: bump {} to {}",
+                                    step.name, step.target_version
+                                );
+                                let _ = Git::commit(&step.path, &commit_msg);
+                            }
+
+                            auto_bumped_count += 1;
+                        } else if is_auto_bump {
+                            // Dry run auto-bump
+                            auto_bumped_count += 1;
+                        }
+
+                        // Publish
+                        let result = registry.publish(&step.path, &step.name, is_dry_run).await;
+
+                        match result {
+                            Ok(pr) if pr.success => {
+                                published_count += 1;
+
+                                yield HyperforgeEvent::PublishStep {
+                                    package_name: step.name.clone(),
+                                    version: step.target_version.clone(),
+                                    registry: registry_kind.clone(),
+                                    action: action_kind,
+                                    success: true,
+                                    error: None,
+                                };
+
+                                // Git tag
+                                if !skip_tags && !is_dry_run {
+                                    let tag_name = format!("{}-v{}", step.name, step.target_version);
+                                    let tag_msg = format!("Release {} v{}", step.name, step.target_version);
+                                    if let Err(e) = Git::tag(&step.path, &tag_name, Some(&tag_msg)) {
+                                        yield HyperforgeEvent::Info {
+                                            message: format!("  Warning: failed to create tag {}: {}", tag_name, e),
+                                        };
+                                    } else {
+                                        tags_created += 1;
+                                        yield HyperforgeEvent::PublishStep {
+                                            package_name: step.name.clone(),
+                                            version: step.target_version.clone(),
+                                            registry: registry_kind.clone(),
+                                            action: crate::hub::PublishActionKind::Tag,
+                                            success: true,
+                                            error: None,
+                                        };
+                                    }
+                                }
+                            }
+                            Ok(pr) => {
+                                // Publish returned but was not successful
+                                failed_nodes.insert(step.node_idx);
+                                failed_count += 1;
+                                yield HyperforgeEvent::PublishStep {
+                                    package_name: step.name.clone(),
+                                    version: step.target_version.clone(),
+                                    registry: registry_kind,
+                                    action: crate::hub::PublishActionKind::Failed,
+                                    success: false,
+                                    error: pr.error,
+                                };
+                            }
+                            Err(e) => {
+                                failed_nodes.insert(step.node_idx);
+                                failed_count += 1;
+                                yield HyperforgeEvent::PublishStep {
+                                    package_name: step.name.clone(),
+                                    version: step.target_version.clone(),
+                                    registry: registry_kind,
+                                    action: crate::hub::PublishActionKind::Failed,
+                                    success: false,
+                                    error: Some(format!("{}", e)),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::PublishSummary {
+                total: plan.steps.len(),
+                published: published_count,
+                auto_bumped: auto_bumped_count,
+                skipped: skipped_count,
+                failed: failed_count,
+                tags_created,
+            };
+        }
+    }
+
+    /// Bump versions for workspace packages
+    #[plexus_macros::hub_method(
+        description = "Bump package versions across the workspace",
+        params(
+            path = "Path to workspace root directory",
+            filter = "Glob pattern to filter packages by name (optional, default: all)",
+            bump = "Version bump kind: patch, minor, major (default: patch)",
+            commit = "Auto-commit after bumping (optional, default: false)",
+            dry_run = "Preview without writing changes (optional, default: false)"
+        )
+    )]
+    pub async fn bump(
+        &self,
+        path: String,
+        filter: Option<String>,
+        bump: Option<String>,
+        commit: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let bump_kind = match bump.as_deref() {
+            Some("minor") => crate::types::VersionBump::Minor,
+            Some("major") => crate::types::VersionBump::Major,
+            _ => crate::types::VersionBump::Patch,
+        };
+        let auto_commit = commit.unwrap_or(false);
+        let is_dry_run = dry_run.unwrap_or(false);
+        let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            let repos: Vec<_> = if let Some(ref pattern) = filter {
+                ctx.repos.iter().filter(|r| {
+                    let name = r.package_name.as_deref().unwrap_or(&r.dir_name);
+                    glob_match(pattern, name)
+                }).collect()
+            } else {
+                ctx.repos.iter().collect()
+            };
+
+            if repos.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No packages matched filter.".to_string(),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}Bumping {} packages ({:?})...", dry_prefix, repos.len(), bump_kind),
+            };
+
+            let mut bumped = 0usize;
+            let mut failed = 0usize;
+
+            for repo in &repos {
+                let name = repo.package_name.as_deref().unwrap_or(&repo.dir_name);
+                let current_version = match &repo.package_version {
+                    Some(v) => v.clone(),
+                    None => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}: skipped (no version)", name),
+                        };
+                        continue;
+                    }
+                };
+
+                let parsed = match crate::build_system::version::SemVer::parse(&current_version) {
+                    Some(v) => v,
+                    None => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}: skipped (unparseable version: {})", name, current_version),
+                        };
+                        continue;
+                    }
+                };
+
+                let new_version = parsed.bump(&bump_kind).to_string();
+
+                if !is_dry_run {
+                    match crate::build_system::version::set_package_version(
+                        &repo.path,
+                        &repo.build_system,
+                        &new_version,
+                    ) {
+                        Ok(_) => {
+                            bumped += 1;
+
+                            if auto_commit {
+                                let manifest_file = match repo.build_system {
+                                    crate::build_system::BuildSystemKind::Cargo => "Cargo.toml",
+                                    crate::build_system::BuildSystemKind::Cabal => "*.cabal",
+                                    _ => "package.json",
+                                };
+                                let _ = Git::add(&repo.path, manifest_file);
+                                let commit_msg = format!("chore: bump {} to {}", name, new_version);
+                                let _ = Git::commit(&repo.path, &commit_msg);
+                            }
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            yield HyperforgeEvent::Error {
+                                message: format!("  {}: bump failed: {}", name, e),
+                            };
+                            continue;
+                        }
+                    }
+                } else {
+                    bumped += 1;
+                }
+
+                yield HyperforgeEvent::PublishStep {
+                    package_name: name.to_string(),
+                    version: new_version.clone(),
+                    registry: match repo.build_system {
+                        crate::build_system::BuildSystemKind::Cargo => crate::hub::PackageRegistry::CratesIo,
+                        crate::build_system::BuildSystemKind::Cabal => crate::hub::PackageRegistry::Hackage,
+                        _ => crate::hub::PackageRegistry::Npm,
+                    },
+                    action: crate::hub::PublishActionKind::AutoBump,
+                    success: true,
+                    error: None,
+                };
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}Bump complete: {} bumped, {} failed", dry_prefix, bumped, failed),
+            };
+        }
+    }
 }
 
 #[async_trait]

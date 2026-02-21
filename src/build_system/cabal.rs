@@ -143,6 +143,7 @@ fn parse_dep_list(
                 version_req: version,
                 is_path_dep: false,
                 path: None,
+                is_dev: false,
             });
         }
     }

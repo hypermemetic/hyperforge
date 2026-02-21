@@ -233,6 +233,7 @@ mod tests {
                     version_req: Some("0.1.0".to_string()),
                     is_path_dep: false,
                     path: None,
+                    is_dev: false,
                 }],
             },
         ];
@@ -264,6 +265,7 @@ mod tests {
                     version_req: Some("0.1.0".to_string()),
                     is_path_dep: true,
                     path: Some("../crate-a".to_string()),
+                    is_dev: false,
                 }],
             },
         ];
@@ -292,6 +294,7 @@ mod tests {
                     version_req: Some("0.1.0".to_string()),
                     is_path_dep: false,
                     path: None,
+                    is_dev: false,
                 }],
             },
         ];
@@ -363,6 +366,7 @@ mod tests {
                     version_req: Some("0.1.0".to_string()),
                     is_path_dep: false,
                     path: None,
+                    is_dev: false,
                 }],
             },
         ];

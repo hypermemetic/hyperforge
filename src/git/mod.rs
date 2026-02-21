@@ -528,6 +528,67 @@ impl Git {
         Ok(())
     }
 
+    /// Stage a file for commit
+    pub fn add(path: &Path, file: &str) -> GitResult<()> {
+        Self::ensure_repo(path)?;
+
+        let output = Command::new("git")
+            .args(["add", file])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: command_error_message(&output),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Create a commit with the given message
+    pub fn commit(path: &Path, message: &str) -> GitResult<()> {
+        Self::ensure_repo(path)?;
+
+        let output = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: command_error_message(&output),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Create an annotated or lightweight tag
+    pub fn tag(path: &Path, name: &str, message: Option<&str>) -> GitResult<()> {
+        Self::ensure_repo(path)?;
+
+        let output = if let Some(msg) = message {
+            Command::new("git")
+                .args(["tag", "-a", name, "-m", msg])
+                .current_dir(path)
+                .output()?
+        } else {
+            Command::new("git")
+                .args(["tag", name])
+                .current_dir(path)
+                .output()?
+        };
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: command_error_message(&output),
+            });
+        }
+
+        Ok(())
+    }
+
     // --- Private helper methods ---
 
     fn ensure_repo(path: &Path) -> GitResult<()> {
@@ -905,5 +966,36 @@ mod tests {
         let branch = Git::current_branch(temp.path()).unwrap();
         // Could be "main" or "master" depending on git config
         assert!(!branch.is_empty());
+    }
+
+    #[test]
+    fn test_add_commit_tag() {
+        let temp = TempDir::new().unwrap();
+        Git::init(temp.path()).unwrap();
+        Git::config_set(temp.path(), "user.email", "test@test.com").unwrap();
+        Git::config_set(temp.path(), "user.name", "Test").unwrap();
+
+        // Create a file and stage it
+        fs::write(temp.path().join("hello.txt"), "world").unwrap();
+        Git::add(temp.path(), "hello.txt").unwrap();
+
+        // Commit
+        Git::commit(temp.path(), "initial commit").unwrap();
+
+        // Lightweight tag
+        Git::tag(temp.path(), "v0.1.0", None).unwrap();
+
+        // Annotated tag
+        Git::tag(temp.path(), "my-crate-v0.1.0", Some("release 0.1.0")).unwrap();
+
+        // Verify tags exist
+        let output = Command::new("git")
+            .args(["tag", "-l"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        let tags = String::from_utf8_lossy(&output.stdout);
+        assert!(tags.contains("v0.1.0"));
+        assert!(tags.contains("my-crate-v0.1.0"));
     }
 }

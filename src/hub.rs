@@ -22,6 +22,57 @@ use crate::hubs::{HyperforgeState, RepoHub, WorkspaceHub};
 use crate::types::repo::RepoRecord;
 use crate::types::Forge;
 
+/// Package registry identifier
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRegistry {
+    CratesIo,
+    Hackage,
+    Npm,
+}
+
+impl std::fmt::Display for PackageRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CratesIo => write!(f, "crates.io"),
+            Self::Hackage => write!(f, "hackage"),
+            Self::Npm => write!(f, "npm"),
+        }
+    }
+}
+
+/// Package status relative to its registry
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageStatus {
+    /// Local version > published version
+    Ahead,
+    /// Local version == published version, no changes needed
+    UpToDate,
+    /// Never published to registry
+    Unpublished,
+    /// Local version == published version but needs bump (code changed)
+    Stale,
+}
+
+/// Action taken or planned during publish
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishActionKind {
+    /// Local > published, publish as-is
+    Publish,
+    /// Local == published, bump patch then publish
+    AutoBump,
+    /// First publish ever
+    InitialPublish,
+    /// Already up to date, skip
+    Skip,
+    /// Git tag created
+    Tag,
+    /// Publish failed
+    Failed,
+}
+
 /// Hyperforge event types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -125,6 +176,34 @@ pub enum HyperforgeEvent {
         exit_code: i32,
         stdout: String,
         stderr: String,
+    },
+    /// Package registry diff — local vs published version
+    PackageDiff {
+        package_name: String,
+        build_system: crate::build_system::BuildSystemKind,
+        local_version: String,
+        published_version: Option<String>,
+        registry: PackageRegistry,
+        status: PackageStatus,
+    },
+    /// Per-package publish step result
+    PublishStep {
+        package_name: String,
+        version: String,
+        registry: PackageRegistry,
+        action: PublishActionKind,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Summary of a publish run
+    PublishSummary {
+        total: usize,
+        published: usize,
+        auto_bumped: usize,
+        skipped: usize,
+        failed: usize,
+        tags_created: usize,
     },
 }
 

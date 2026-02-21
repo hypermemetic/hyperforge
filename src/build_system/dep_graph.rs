@@ -290,6 +290,7 @@ mod tests {
                 version_req: Some("0.2.1".to_string()),
                 is_path_dep: false,
                 path: None,
+                is_dev: false,
             }]),
             (2, vec![
                 DepRef {
@@ -297,12 +298,14 @@ mod tests {
                     version_req: Some("0.2.1".to_string()),
                     is_path_dep: false,
                     path: None,
+                    is_dev: false,
                 },
                 DepRef {
                     name: "macros".to_string(),
                     version_req: Some("0.2.2".to_string()),
                     is_path_dep: false,
                     path: None,
+                    is_dev: false,
                 },
             ]),
         ];
@@ -365,6 +368,7 @@ mod tests {
             version_req: Some("2.0.0".to_string()),
             is_path_dep: false,
             path: None,
+            is_dev: false,
         }])];
 
         let graph = DepGraph::build(nodes, &deps);
@@ -398,12 +402,14 @@ mod tests {
                 version_req: None,
                 is_path_dep: false,
                 path: None,
+                is_dev: false,
             }]),
             (1, vec![DepRef {
                 name: "a".to_string(),
                 version_req: None,
                 is_path_dep: false,
                 path: None,
+                is_dev: false,
             }]),
         ];
 
