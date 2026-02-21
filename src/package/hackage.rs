@@ -103,15 +103,61 @@ impl RegistryClient for HackageClient {
             });
         }
 
+        // Step 1: build source distribution tarball
+        let sdist_output = tokio::process::Command::new("cabal")
+            .args(["sdist"])
+            .current_dir(path)
+            .output()
+            .await?;
+
+        if !sdist_output.status.success() {
+            let version = crate::build_system::cabal::cabal_package_version(path)
+                .unwrap_or_else(|| "unknown".to_string());
+            return Ok(PublishResult {
+                package_name: name.to_string(),
+                version,
+                success: false,
+                error: Some(format!(
+                    "cabal sdist failed: {}",
+                    String::from_utf8_lossy(&sdist_output.stderr).trim()
+                )),
+            });
+        }
+
+        // Find the tarball path from sdist output (last line is the path)
+        let sdist_stdout = String::from_utf8_lossy(&sdist_output.stdout);
+        let tarball = sdist_stdout
+            .lines()
+            .rev()
+            .find(|l| l.ends_with(".tar.gz"))
+            .map(|l| l.trim().to_string());
+
+        let tarball = match tarball {
+            Some(t) => t,
+            None => {
+                let version = crate::build_system::cabal::cabal_package_version(path)
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Ok(PublishResult {
+                    package_name: name.to_string(),
+                    version,
+                    success: false,
+                    error: Some("cabal sdist did not produce a tarball path".to_string()),
+                });
+            }
+        };
+
+        // Step 2: upload the tarball
         let output = tokio::process::Command::new("cabal")
-            .args(["upload", "--publish"])
+            .args(["upload", "--publish", &tarball])
             .current_dir(path)
             .output()
             .await?;
 
         let success = output.status.success();
         let error = if !success {
-            Some(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Some(format!("{}\n{}", stderr.trim(), stdout.trim()).trim().to_string())
         } else {
             None
         };
