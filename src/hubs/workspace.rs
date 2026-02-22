@@ -3215,11 +3215,12 @@ impl WorkspaceHub {
 
     /// Publish packages with transitive dependency resolution
     #[plexus_macros::hub_method(
-        description = "Publish workspace packages in dependency order, auto-publishing transitive deps first. Dry-run by default — pass --execute to actually publish.",
+        description = "Publish workspace packages in dependency order. Dry-run by default — pass --execute to actually publish. Only publishes packages whose local version > published version. Pass --auto-bump to bump and publish packages at local == published.",
         params(
             path = "Path to workspace root directory",
             filter = "Glob pattern to filter target packages by name (optional, default: all)",
             execute = "Actually publish to registries (default: false, dry-run unless set)",
+            auto_bump = "Auto-bump patch version when local == published (default: false, skip unless set)",
             no_tag = "Skip creating git tags after publish (optional, default: false)",
             no_commit = "Skip auto-commit after version bumps (optional, default: false)",
             bump = "Version bump kind for auto-bump: patch, minor, major (optional, default: patch)"
@@ -3230,11 +3231,13 @@ impl WorkspaceHub {
         path: String,
         filter: Option<String>,
         execute: Option<bool>,
+        auto_bump: Option<bool>,
         no_tag: Option<bool>,
         no_commit: Option<bool>,
         bump: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let is_dry_run = !execute.unwrap_or(false);
+        let do_auto_bump = auto_bump.unwrap_or(false);
         let skip_tags = no_tag.unwrap_or(false);
         let skip_commits = no_commit.unwrap_or(false);
         let bump_kind = match bump.as_deref() {
@@ -3320,6 +3323,7 @@ impl WorkspaceHub {
                 &targets,
                 &workspace_path,
                 &bump_kind,
+                do_auto_bump,
             ).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -3680,6 +3684,63 @@ impl WorkspaceHub {
             yield HyperforgeEvent::Info {
                 message: format!("{}Bump complete: {} bumped, {} failed", dry_prefix, bumped, failed),
             };
+        }
+    }
+
+    /// Detect mismatches between directory names and package names
+    #[plexus_macros::hub_method(
+        description = "Detect repos where the directory name differs from the package name in the build manifest (Cargo.toml, .cabal, package.json)",
+        params(
+            path = "Path to workspace root directory"
+        )
+    )]
+    pub async fn detect_name_mismatches(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            let mut mismatches = 0usize;
+            let mut checked = 0usize;
+
+            for repo in &ctx.repos {
+                let pkg_name = match &repo.package_name {
+                    Some(n) => n,
+                    None => continue, // no manifest, skip
+                };
+                checked += 1;
+
+                if *pkg_name != repo.dir_name {
+                    mismatches += 1;
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "MISMATCH: dir={} package={} ({})",
+                            repo.dir_name, pkg_name, repo.build_system
+                        ),
+                    };
+                }
+            }
+
+            if mismatches == 0 {
+                yield HyperforgeEvent::Info {
+                    message: format!("All {} packages match their directory names.", checked),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("{} mismatches found across {} packages.", mismatches, checked),
+                };
+            }
         }
     }
 }

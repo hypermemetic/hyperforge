@@ -90,9 +90,9 @@ pub async fn build_publish_plan(
     targets: &[usize],
     workspace_root: &Path,
     auto_bump_kind: &VersionBump,
+    auto_bump: bool,
 ) -> anyhow::Result<PublishPlan> {
     let closure = transitive_closure(graph, targets);
-    let target_set: HashSet<usize> = targets.iter().copied().collect();
 
     let mut steps = Vec::new();
     let mut excluded = Vec::new();
@@ -150,8 +150,7 @@ pub async fn build_publish_plan(
 
         let published_version = published.as_ref().map(|p| p.version.clone());
 
-        let is_direct_target = target_set.contains(&idx);
-        let (action, target_version) = determine_action(&local_version, &published_version, auto_bump_kind, is_direct_target);
+        let (action, target_version) = determine_action(&local_version, &published_version, auto_bump_kind, auto_bump);
 
         steps.push(PublishStep {
             name: node.name.clone(),
@@ -170,13 +169,13 @@ pub async fn build_publish_plan(
 
 /// Determine the publish action based on local vs published version.
 ///
-/// When `is_direct_target` is false (transitive dependency) and
-/// local == published, the package is skipped rather than auto-bumped.
+/// When `auto_bump` is false and local == published, the package is
+/// skipped. When `auto_bump` is true, the version is bumped and published.
 fn determine_action(
     local_version: &str,
     published_version: &Option<String>,
     auto_bump_kind: &VersionBump,
-    is_direct_target: bool,
+    auto_bump: bool,
 ) -> (PublishAction, String) {
     match published_version {
         None => {
@@ -190,14 +189,14 @@ fn determine_action(
                     (PublishAction::Publish, local_version.to_string())
                 }
                 Some(Ordering::Equal) => {
-                    if is_direct_target {
-                        // Direct target with same version — auto-bump
+                    if auto_bump {
+                        // Explicitly requested auto-bump
                         let bumped = SemVer::parse(local_version)
                             .map(|v| v.bump(auto_bump_kind).to_string())
                             .unwrap_or_else(|| local_version.to_string());
                         (PublishAction::AutoBump, bumped)
                     } else {
-                        // Transitive dep already published at this version — skip
+                        // Already published at this version — skip
                         (PublishAction::Skip, local_version.to_string())
                     }
                 }
@@ -318,15 +317,15 @@ mod tests {
 
     #[test]
     fn test_determine_action_auto_bump() {
-        // Direct target with same version → auto-bump
+        // auto_bump=true with same version → auto-bump
         let (action, version) = determine_action("0.3.0", &Some("0.3.0".to_string()), &VersionBump::Patch, true);
         assert_eq!(action, PublishAction::AutoBump);
         assert_eq!(version, "0.3.1"); // auto-bumped patch
     }
 
     #[test]
-    fn test_determine_action_skip_transitive() {
-        // Transitive dep with same version → skip
+    fn test_determine_action_skip_same_version() {
+        // auto_bump=false with same version → skip
         let (action, version) = determine_action("0.3.0", &Some("0.3.0".to_string()), &VersionBump::Patch, false);
         assert_eq!(action, PublishAction::Skip);
         assert_eq!(version, "0.3.0");
