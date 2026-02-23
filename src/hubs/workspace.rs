@@ -3682,6 +3682,81 @@ impl WorkspaceHub {
             };
         }
     }
+
+    /// Detect mismatches between directory names and package names
+    #[plexus_macros::hub_method(
+        description = "Detect repos where the directory name differs from the package name in the build manifest. Also reports git repos without hyperforge config (run `hyperforge init` to configure them).",
+        params(
+            path = "Path to workspace root directory"
+        )
+    )]
+    pub async fn detect_name_mismatches(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+
+            let ctx = match discover_workspace(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Report unconfigured repos (git repos without .hyperforge/config.toml)
+            for unconfigured in &ctx.unconfigured_repos {
+                let name = unconfigured.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?");
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "UNCONFIGURED: {} — git repo without .hyperforge/config.toml (run: hyperforge repo init --path {})",
+                        name, unconfigured.display()
+                    ),
+                };
+            }
+
+            // Report name mismatches
+            let mut mismatches = 0usize;
+            let mut checked = 0usize;
+
+            for repo in &ctx.repos {
+                let pkg_name = match &repo.package_name {
+                    Some(n) => n,
+                    None => continue,
+                };
+                checked += 1;
+
+                if *pkg_name != repo.dir_name {
+                    mismatches += 1;
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "MISMATCH: dir={} package={} ({})",
+                            repo.dir_name, pkg_name, repo.build_system
+                        ),
+                    };
+                }
+            }
+
+            let unconfigured_count = ctx.unconfigured_repos.len();
+            if mismatches == 0 && unconfigured_count == 0 {
+                yield HyperforgeEvent::Info {
+                    message: format!("All {} packages match their directory names. No unconfigured repos.", checked),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "{} name mismatches, {} unconfigured repos (across {} configured packages).",
+                        mismatches, unconfigured_count, checked
+                    ),
+                };
+            }
+        }
+    }
 }
 
 #[async_trait]
