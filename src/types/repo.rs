@@ -199,12 +199,7 @@ impl RepoRecord {
             self.ssh = config.ssh.clone();
         }
         if self.forge_config.is_empty() {
-            self.forge_config = config.forge_config.iter()
-                .map(|(k, v)| (k.clone(), ForgeConfig {
-                    org: v.org.clone(),
-                    remote: v.remote.clone(),
-                }))
-                .collect();
+            self.forge_config = config.forge_config.clone();
         }
         if self.ci.is_none() {
             self.ci = config.ci.clone();

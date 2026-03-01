@@ -61,6 +61,26 @@ impl LocalForge {
         }
     }
 
+    /// Acquire a read lock on the repos map
+    fn read_repos(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, RepoRecord>>, ForgeError> {
+        self.repos.read().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+    }
+
+    /// Acquire a write lock on the repos map
+    fn write_repos(&self) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<String, RepoRecord>>, ForgeError> {
+        self.repos.write().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+    }
+
+    /// Acquire a read lock on the forge states map
+    fn read_forges(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<Forge, ForgeSyncState>>, ForgeError> {
+        self.forges.read().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+    }
+
+    /// Acquire a write lock on the forge states map
+    fn write_forges(&self) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<Forge, ForgeSyncState>>, ForgeError> {
+        self.forges.write().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+    }
+
     /// Get the organization name
     pub fn org(&self) -> &str {
         &self.org
@@ -83,9 +103,7 @@ impl LocalForge {
     /// If a dismissed (soft-deleted) record exists with the same name, it will be
     /// overwritten, allowing re-creation of previously deleted repos.
     pub fn add_repo(&self, repo: Repo) -> ForgeResult<()> {
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
 
         if let Some(existing) = repos.get(&repo.name) {
             if !existing.dismissed {
@@ -100,9 +118,7 @@ impl LocalForge {
 
     /// Remove a repository from local state
     pub fn remove_repo(&self, name: &str) -> ForgeResult<()> {
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
 
         repos.remove(name)
             .ok_or_else(|| ForgeError::RepoNotFound { name: name.to_string() })?;
@@ -112,9 +128,7 @@ impl LocalForge {
 
     /// Get all repositories as a Vec of Repo (for backward compat)
     pub fn all_repos(&self) -> ForgeResult<Vec<Repo>> {
-        let repos = self.repos.read().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let repos = self.read_repos()?;
 
         Ok(repos.values().map(|r| r.to_repo()).collect())
     }
@@ -123,26 +137,20 @@ impl LocalForge {
 
     /// Get forge sync states
     pub fn forge_states(&self) -> ForgeResult<HashMap<Forge, ForgeSyncState>> {
-        let states = self.forges.read().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let states = self.read_forges()?;
         Ok(states.clone())
     }
 
     /// Update forge sync state
     pub fn set_forge_state(&self, forge: Forge, state: ForgeSyncState) -> ForgeResult<()> {
-        let mut states = self.forges.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut states = self.write_forges()?;
         states.insert(forge, state);
         Ok(())
     }
 
     /// Get a repo record by name
     pub fn get_record(&self, name: &str) -> ForgeResult<RepoRecord> {
-        let repos = self.repos.read().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let repos = self.read_repos()?;
         repos.get(name)
             .cloned()
             .ok_or_else(|| ForgeError::RepoNotFound { name: name.to_string() })
@@ -150,18 +158,14 @@ impl LocalForge {
 
     /// Update a repo record
     pub fn update_record(&self, record: &RepoRecord) -> ForgeResult<()> {
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
         repos.insert(record.name.clone(), record.clone());
         Ok(())
     }
 
     /// Add or merge a repo record
     pub fn upsert_record(&self, record: RepoRecord) -> ForgeResult<()> {
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
         if let Some(existing) = repos.get_mut(&record.name) {
             // Merge present_on sets
             for forge in &record.present_on {
@@ -180,9 +184,7 @@ impl LocalForge {
 
     /// Get all repo records
     pub fn all_records(&self) -> ForgeResult<Vec<RepoRecord>> {
-        let repos = self.repos.read().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let repos = self.read_repos()?;
         Ok(repos.values().cloned().collect())
     }
 
@@ -200,18 +202,14 @@ impl LocalForge {
 
         // Try new format first
         if let Ok(config) = serde_yaml::from_str::<ReposYaml>(&content) {
-            let mut repos = self.repos.write().map_err(|e| {
-                ForgeError::ApiError(format!("Lock poisoned: {}", e))
-            })?;
+            let mut repos = self.write_repos()?;
             repos.clear();
             for (name, mut record) in config.repos {
                 record.name = name.clone();
                 repos.insert(name, record);
             }
             // Load forge states
-            let mut states = self.forges.write().map_err(|e| {
-                ForgeError::ApiError(format!("Lock poisoned: {}", e))
-            })?;
+            let mut states = self.write_forges()?;
             for (forge_str, state) in config.forge_states {
                 if let Some(forge) = crate::config::HyperforgeConfig::parse_forge(&forge_str) {
                     states.insert(forge, state);
@@ -228,9 +226,7 @@ impl LocalForge {
 
         // Try old format (migration)
         if let Ok(old_config) = serde_yaml::from_str::<OldReposYaml>(&content) {
-            let mut repos = self.repos.write().map_err(|e| {
-                ForgeError::ApiError(format!("Lock poisoned: {}", e))
-            })?;
+            let mut repos = self.write_repos()?;
             repos.clear();
             for (name, repo) in old_config.repos {
                 let mut r = repo;
@@ -251,12 +247,8 @@ impl LocalForge {
 
         // Clone data while holding lock, then release before async operations
         let (yaml_repos, forge_states, owner_type) = {
-            let repos = self.repos.read().map_err(|e| {
-                ForgeError::ApiError(format!("Lock poisoned: {}", e))
-            })?;
-            let states = self.forges.read().map_err(|e| {
-                ForgeError::ApiError(format!("Lock poisoned: {}", e))
-            })?;
+            let repos = self.read_repos()?;
+            let states = self.read_forges()?;
             let ot = self.owner_type.read().map_err(|e| {
                 ForgeError::ApiError(format!("Lock poisoned: {}", e))
             })?;
@@ -305,9 +297,7 @@ impl ForgePort for LocalForge {
             return Err(ForgeError::RepoNotFound { name: name.to_string() });
         }
 
-        let repos = self.repos.read().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let repos = self.read_repos()?;
 
         repos.get(name)
             .map(|r| r.to_repo())
@@ -333,9 +323,7 @@ impl ForgePort for LocalForge {
             )));
         }
 
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
 
         if !repos.contains_key(&repo.name) {
             return Err(ForgeError::RepoNotFound { name: repo.name.clone() });
@@ -355,9 +343,7 @@ impl ForgePort for LocalForge {
             )));
         }
 
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
 
         let record = repos.get_mut(name)
             .ok_or_else(|| ForgeError::RepoNotFound { name: name.to_string() })?;
@@ -371,9 +357,7 @@ impl ForgePort for LocalForge {
 
     async fn set_default_branch(&self, _org: &str, name: &str, branch: &str) -> ForgeResult<()> {
         // LocalForge now tracks default branch in RepoRecord
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
         if let Some(record) = repos.get_mut(name) {
             record.default_branch = branch.to_string();
         }
@@ -388,9 +372,7 @@ impl ForgePort for LocalForge {
             )));
         }
 
-        let mut repos = self.repos.write().map_err(|e| {
-            ForgeError::ApiError(format!("Lock poisoned: {}", e))
-        })?;
+        let mut repos = self.write_repos()?;
 
         // Get the existing record
         let mut record = repos.remove(old_name).ok_or_else(|| {

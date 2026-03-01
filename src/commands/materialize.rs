@@ -65,50 +65,40 @@ pub fn materialize(
         hooks_installed: false,
     };
 
+    // ── Build config from record (needed for both writing and remote naming) ──
+
+    let dir_name = repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let repo_name = if record.name != dir_name {
+        Some(record.name.clone())
+    } else {
+        None
+    };
+
+    let default_branch = if record.default_branch == "main" {
+        None
+    } else {
+        Some(record.default_branch.clone())
+    };
+
+    let config = HyperforgeConfig {
+        repo_name,
+        org: Some(org.to_string()),
+        forges: record.forges.clone(),
+        visibility: record.visibility.clone(),
+        description: record.description.clone(),
+        ssh: record.ssh.clone(),
+        forge_config: record.forge_config.clone(),
+        default_branch,
+        ci: record.ci.clone(),
+    };
+
     // ── Step 1: config ──────────────────────────────────────────────────
 
     if opts.config {
-        let dir_name = repo_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-
-        let repo_name = if record.name != dir_name {
-            Some(record.name.clone())
-        } else {
-            None
-        };
-
-        let default_branch = if record.default_branch == "main" {
-            None
-        } else {
-            Some(record.default_branch.clone())
-        };
-
-        let config = HyperforgeConfig {
-            repo_name,
-            org: Some(org.to_string()),
-            forges: record.forges.clone(),
-            visibility: record.visibility.clone(),
-            description: record.description.clone(),
-            ssh: record.ssh.clone(),
-            forge_config: record
-                .forge_config
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        crate::config::ForgeConfig {
-                            org: v.org.clone(),
-                            remote: v.remote.clone(),
-                        },
-                    )
-                })
-                .collect(),
-            default_branch,
-            ci: record.ci.clone(),
-        };
-
         if !opts.dry_run {
             config
                 .save(repo_path)
@@ -123,7 +113,7 @@ pub fn materialize(
         // Compute desired remotes from record.forges
         let mut desired: Vec<(String, String)> = Vec::new(); // (remote_name, url)
 
-        for (i, forge_str) in record.forges.iter().enumerate() {
+        for forge_str in record.forges.iter() {
             // Determine the org for this forge: check forge_config override, fall back to param
             let org_for_forge = record
                 .forge_config
@@ -133,12 +123,8 @@ pub fn materialize(
 
             let url = build_remote_url(forge_str, org_for_forge, &record.name);
 
-            // First forge in list gets "origin", others keep forge name
-            let remote_name = if i == 0 {
-                "origin".to_string()
-            } else {
-                forge_str.clone()
-            };
+            // Use config.remote_for_forge to respect forge_config.remote overrides
+            let remote_name = config.remote_for_forge(forge_str);
 
             desired.push((remote_name, url));
         }
@@ -149,8 +135,8 @@ pub fn materialize(
 
         for (remote_name, desired_url) in &desired {
             if let Some(existing) = current_remotes.iter().find(|r| r.name == *remote_name) {
-                // Remote exists — check if URL matches (compare against push_url)
-                if existing.push_url != *desired_url {
+                // Remote exists — check if URL matches (compare against fetch_url)
+                if existing.fetch_url != *desired_url {
                     if !opts.dry_run {
                         Git::set_remote_url(repo_path, remote_name, desired_url)
                             .map_err(|e| format!("failed to set remote url: {}", e))?;

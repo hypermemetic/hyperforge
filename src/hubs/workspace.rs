@@ -19,7 +19,7 @@ use crate::auth::YamlAuthProvider;
 use crate::commands::init::{init, InitOptions};
 use crate::commands::push::{push, PushOptions};
 use crate::commands::runner::{discover_or_bail, run_batch, run_batch_blocking};
-use crate::commands::workspace::repo_from_config;
+use crate::commands::workspace::{build_dep_graph, build_publish_dep_graph, repo_from_config};
 use crate::config::HyperforgeConfig;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
@@ -44,12 +44,8 @@ impl WorkspaceHub {
 pub(crate) fn make_adapter(forge: &str, org: &str, owner_type: Option<OwnerType>) -> Result<Arc<dyn ForgePort>, String> {
     let auth = YamlAuthProvider::new().map_err(|e| format!("Failed to create auth provider: {}", e))?;
     let auth = Arc::new(auth);
-    let target_forge = match forge.to_lowercase().as_str() {
-        "github" => Forge::GitHub,
-        "codeberg" => Forge::Codeberg,
-        "gitlab" => Forge::GitLab,
-        _ => return Err(format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge)),
-    };
+    let target_forge = HyperforgeConfig::parse_forge(forge)
+        .ok_or_else(|| format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge))?;
     let adapter: Arc<dyn ForgePort> = match target_forge {
         Forge::GitHub => {
             let a = GitHubAdapter::new(auth, org).map_err(|e| format!("Failed to create GitHub adapter: {}", e))?;
@@ -86,6 +82,26 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         }
     }
     name == pattern
+}
+
+/// Build a default WorkspaceSummary event with all optional fields set to None.
+fn workspace_summary(ctx: &crate::commands::workspace::WorkspaceContext) -> HyperforgeEvent {
+    HyperforgeEvent::WorkspaceSummary {
+        total_repos: ctx.repos.len() + ctx.unconfigured_repos.len(),
+        configured_repos: ctx.repos.len(),
+        unconfigured_repos: ctx.unconfigured_repos.len(),
+        clean_repos: None,
+        dirty_repos: None,
+        wrong_branch_repos: None,
+        push_success: None,
+        push_failed: None,
+        validation_passed: None,
+    }
+}
+
+/// Return a prefix string for dry-run messages.
+fn dry_prefix(is_dry_run: bool) -> &'static str {
+    if is_dry_run { "[DRY RUN] " } else { "" }
 }
 
 #[plexus_macros::hub_methods(
@@ -153,17 +169,7 @@ impl WorkspaceHub {
                 };
             }
 
-            yield HyperforgeEvent::WorkspaceSummary {
-                total_repos: ctx.repos.len() + ctx.unconfigured_repos.len(),
-                configured_repos: ctx.repos.len(),
-                unconfigured_repos: ctx.unconfigured_repos.len(),
-                clean_repos: None,
-                dirty_repos: None,
-                wrong_branch_repos: None,
-                push_success: None,
-                push_failed: None,
-                validation_passed: None,
-            };
+            yield workspace_summary(&ctx);
         }
     }
 
@@ -197,7 +203,7 @@ impl WorkspaceHub {
 
         stream! {
             let workspace_path = PathBuf::from(&path);
-            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+            let dry_prefix = dry_prefix(is_dry_run);
 
             // ── Phase 1: Discover ──
             yield HyperforgeEvent::Info {
@@ -252,17 +258,7 @@ impl WorkspaceHub {
                 yield HyperforgeEvent::Info {
                     message: "No repos to initialize.".to_string(),
                 };
-                yield HyperforgeEvent::WorkspaceSummary {
-                    total_repos: ctx.repos.len(),
-                    configured_repos: ctx.repos.len(),
-                    unconfigured_repos: 0,
-                    clean_repos: None,
-                    dirty_repos: None,
-                    wrong_branch_repos: None,
-                    push_success: None,
-                    push_failed: None,
-                    validation_passed: None,
-                };
+                yield workspace_summary(&ctx);
                 return;
             }
 
@@ -353,17 +349,7 @@ impl WorkspaceHub {
                 ),
             };
 
-            yield HyperforgeEvent::WorkspaceSummary {
-                total_repos: ctx.repos.len() + ctx.unconfigured_repos.len(),
-                configured_repos: ctx.repos.len(),
-                unconfigured_repos: ctx.unconfigured_repos.len(),
-                clean_repos: None,
-                dirty_repos: None,
-                wrong_branch_repos: None,
-                push_success: None,
-                push_failed: None,
-                validation_passed: None,
-            };
+            yield workspace_summary(&ctx);
         }
     }
 
@@ -505,21 +491,7 @@ impl WorkspaceHub {
                     message: "Validation: Running containerized build check...".to_string(),
                 };
 
-                let mut dep_nodes = Vec::new();
-                let mut dep_all = Vec::new();
-                for (idx, repo) in ctx.repos.iter().enumerate() {
-                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
-                    dep_nodes.push(crate::build_system::dep_graph::DepNode {
-                        name,
-                        version: repo.package_version.clone(),
-                        build_system: format!("{}", repo.build_system),
-                        path: repo.dir_name.clone(),
-                    });
-                    if !repo.dependencies.is_empty() {
-                        dep_all.push((idx, repo.dependencies.clone()));
-                    }
-                }
-                let graph = crate::build_system::dep_graph::DepGraph::build(dep_nodes, &dep_all);
+                let graph = build_dep_graph(&ctx.repos);
                 let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
                 match plan {
                     Ok(p) => {
@@ -551,15 +523,9 @@ impl WorkspaceHub {
                 }
             }
 
-            if is_dry_run {
-                yield HyperforgeEvent::Info {
-                    message: format!("[DRY RUN] Pushing {} repos...", ctx.repos.len()),
-                };
-            } else {
-                yield HyperforgeEvent::Info {
-                    message: format!("Pushing {} repos...", ctx.repos.len()),
-                };
-            }
+            yield HyperforgeEvent::Info {
+                message: format!("{}Pushing {} repos...", dry_prefix(is_dry_run), ctx.repos.len()),
+            };
 
             let mut success_count = 0usize;
             let mut failed_count = 0usize;
@@ -784,7 +750,7 @@ impl WorkspaceHub {
 
         stream! {
             let workspace_path = PathBuf::from(&path);
-            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+            let dry_prefix = dry_prefix(is_dry_run);
 
             // ── Phase 1: Discover ──
             yield HyperforgeEvent::Info {
@@ -1580,21 +1546,7 @@ impl WorkspaceHub {
                     message: format!("{}Validation: Running containerized build check...", dry_prefix),
                 };
 
-                let mut dep_nodes = Vec::new();
-                let mut dep_all = Vec::new();
-                for (idx, repo) in ctx.repos.iter().enumerate() {
-                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
-                    dep_nodes.push(crate::build_system::dep_graph::DepNode {
-                        name,
-                        version: repo.package_version.clone(),
-                        build_system: format!("{}", repo.build_system),
-                        path: repo.dir_name.clone(),
-                    });
-                    if !repo.dependencies.is_empty() {
-                        dep_all.push((idx, repo.dependencies.clone()));
-                    }
-                }
-                let graph = crate::build_system::dep_graph::DepGraph::build(dep_nodes, &dep_all);
+                let graph = build_dep_graph(&ctx.repos);
                 let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
                 match plan {
                     Ok(p) => {
@@ -1758,7 +1710,7 @@ impl WorkspaceHub {
 
         stream! {
             let workspace_path = PathBuf::from(&path);
-            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+            let dry_prefix = dry_prefix(is_dry_run);
 
             let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
@@ -2098,7 +2050,7 @@ impl WorkspaceHub {
 
         stream! {
             let workspace_path = PathBuf::from(&path);
-            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+            let dry_prefix = dry_prefix(is_dry_run);
 
             // Discover workspace
             let ctx = match discover_or_bail(&workspace_path) {
@@ -2120,7 +2072,7 @@ impl WorkspaceHub {
                 let crates: Vec<crate::build_system::cargo_config::CrateInfo> = rust_repos
                     .iter()
                     .filter_map(|repo| {
-                        let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                        let name = repo.effective_name();
                         let version = repo.package_version.clone().unwrap_or_else(|| "0.0.0".to_string());
                         let rel_path = repo.dir_name.clone();
                         Some(crate::build_system::cargo_config::CrateInfo {
@@ -2203,7 +2155,7 @@ impl WorkspaceHub {
                 let packages: Vec<crate::build_system::cabal_project::CabalPackageInfo> = cabal_repos
                     .iter()
                     .map(|repo| crate::build_system::cabal_project::CabalPackageInfo {
-                        name: repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone()),
+                        name: repo.effective_name(),
                         path: repo.dir_name.clone(),
                     })
                     .collect();
@@ -2275,33 +2227,14 @@ impl WorkspaceHub {
             };
 
             // Build dep graph from all discovered repos
-            let mut nodes = Vec::new();
-            let mut all_deps = Vec::new();
+            let graph = build_dep_graph(&ctx.repos);
 
-            for (idx, repo) in ctx.repos.iter().enumerate() {
-                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
-                let version = repo.package_version.clone();
-
-                nodes.push(crate::build_system::dep_graph::DepNode {
-                    name,
-                    version,
-                    build_system: format!("{}", repo.build_system),
-                    path: repo.dir_name.clone(),
-                });
-
-                if !repo.dependencies.is_empty() {
-                    all_deps.push((idx, repo.dependencies.clone()));
-                }
-            }
-
-            if nodes.is_empty() {
+            if graph.nodes.is_empty() {
                 yield HyperforgeEvent::Info {
                     message: "No packages found in workspace.".to_string(),
                 };
                 return;
             }
-
-            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
 
             match output_format.as_str() {
                 "summary" => {
@@ -2443,7 +2376,7 @@ impl WorkspaceHub {
 
         stream! {
             let workspace_path = PathBuf::from(&path);
-            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+            let dry_prefix = dry_prefix(is_dry_run);
 
             let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
@@ -2451,26 +2384,7 @@ impl WorkspaceHub {
             };
 
             // Build dep graph
-            let mut nodes = Vec::new();
-            let mut all_deps = Vec::new();
-
-            for (idx, repo) in ctx.repos.iter().enumerate() {
-                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
-                let version = repo.package_version.clone();
-
-                nodes.push(crate::build_system::dep_graph::DepNode {
-                    name,
-                    version,
-                    build_system: format!("{}", repo.build_system),
-                    path: repo.dir_name.clone(),
-                });
-
-                if !repo.dependencies.is_empty() {
-                    all_deps.push((idx, repo.dependencies.clone()));
-                }
-            }
-
-            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
+            let graph = build_dep_graph(&ctx.repos);
 
             // Build CI configs from per-repo .hyperforge/config.toml [ci] sections
             let ci_configs: Vec<(String, crate::build_system::validate::RepoCiConfig)> = ctx
@@ -2479,7 +2393,7 @@ impl WorkspaceHub {
                 .filter_map(|repo| {
                     let config = repo.config.as_ref()?;
                     let ci = config.ci.as_ref()?;
-                    let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
+                    let name = repo.effective_name();
 
                     let mut cfg = crate::build_system::validate::RepoCiConfig::default();
                     cfg.repo_name = name.clone();
@@ -2888,39 +2802,15 @@ impl WorkspaceHub {
                 Err(event) => { yield event; return; }
             };
 
-            // Build dep graph
-            let mut nodes = Vec::new();
-            let mut all_deps = Vec::new();
+            // Build dep graph (excluding dev deps for publish ordering)
+            let graph = build_publish_dep_graph(&ctx.repos);
 
-            for (idx, repo) in ctx.repos.iter().enumerate() {
-                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
-                let version = repo.package_version.clone();
-
-                nodes.push(crate::build_system::dep_graph::DepNode {
-                    name,
-                    version,
-                    build_system: format!("{}", repo.build_system),
-                    path: repo.dir_name.clone(),
-                });
-
-                // Exclude dev-deps for publish graph
-                let non_dev_deps: Vec<_> = repo.dependencies.iter()
-                    .filter(|d| !d.is_dev)
-                    .cloned()
-                    .collect();
-                if !non_dev_deps.is_empty() {
-                    all_deps.push((idx, non_dev_deps));
-                }
-            }
-
-            if nodes.is_empty() {
+            if graph.nodes.is_empty() {
                 yield HyperforgeEvent::Info {
                     message: "No packages found in workspace.".to_string(),
                 };
                 return;
             }
-
-            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
 
             // Filter packages
             let indices: Vec<usize> = graph.nodes.iter().enumerate()
@@ -3037,12 +2927,8 @@ impl WorkspaceHub {
         let is_dry_run = !execute.unwrap_or(false);
         let skip_tags = no_tag.unwrap_or(false);
         let skip_commits = no_commit.unwrap_or(false);
-        let bump_kind = match bump.as_deref() {
-            Some("minor") => crate::types::VersionBump::Minor,
-            Some("major") => crate::types::VersionBump::Major,
-            _ => crate::types::VersionBump::Patch,
-        };
-        let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+        let bump_kind = crate::types::VersionBump::from_str_or_patch(bump.as_deref());
+        let dry_prefix = dry_prefix(is_dry_run);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -3052,39 +2938,15 @@ impl WorkspaceHub {
                 Err(event) => { yield event; return; }
             };
 
-            // Build dep graph
-            let mut nodes = Vec::new();
-            let mut all_deps = Vec::new();
+            // Build dep graph (excluding dev deps for publish ordering)
+            let graph = build_publish_dep_graph(&ctx.repos);
 
-            for (idx, repo) in ctx.repos.iter().enumerate() {
-                let name = repo.package_name.clone().unwrap_or_else(|| repo.dir_name.clone());
-                let version = repo.package_version.clone();
-
-                nodes.push(crate::build_system::dep_graph::DepNode {
-                    name,
-                    version,
-                    build_system: format!("{}", repo.build_system),
-                    path: repo.dir_name.clone(),
-                });
-
-                // Exclude dev-deps for publish graph
-                let non_dev_deps: Vec<_> = repo.dependencies.iter()
-                    .filter(|d| !d.is_dev)
-                    .cloned()
-                    .collect();
-                if !non_dev_deps.is_empty() {
-                    all_deps.push((idx, non_dev_deps));
-                }
-            }
-
-            if nodes.is_empty() {
+            if graph.nodes.is_empty() {
                 yield HyperforgeEvent::Info {
                     message: "No packages found in workspace.".to_string(),
                 };
                 return;
             }
-
-            let graph = crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps);
 
             // Resolve targets from filter
             let targets: Vec<usize> = graph.nodes.iter().enumerate()
@@ -3357,14 +3219,10 @@ impl WorkspaceHub {
         commit: Option<bool>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        let bump_kind = match bump.as_deref() {
-            Some("minor") => crate::types::VersionBump::Minor,
-            Some("major") => crate::types::VersionBump::Major,
-            _ => crate::types::VersionBump::Patch,
-        };
+        let bump_kind = crate::types::VersionBump::from_str_or_patch(bump.as_deref());
         let auto_commit = commit.unwrap_or(false);
         let is_dry_run = dry_run.unwrap_or(false);
-        let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+        let dry_prefix = dry_prefix(is_dry_run);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -3566,7 +3424,7 @@ impl WorkspaceHub {
         let is_dry_run = dry_run.unwrap_or(false);
 
         stream! {
-            let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+            let dry_prefix = dry_prefix(is_dry_run);
             let source_path = PathBuf::from(&path);
             let dest_path = PathBuf::from(&target_path);
 

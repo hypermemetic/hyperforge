@@ -66,6 +66,11 @@ impl DiscoveredRepo {
             .map(|c| c.forges.iter().map(|f| f.as_str()).collect())
             .unwrap_or_default()
     }
+
+    /// Get the effective name: package name if available, otherwise directory name.
+    pub fn effective_name(&self) -> String {
+        self.package_name.clone().unwrap_or_else(|| self.dir_name.clone())
+    }
 }
 
 /// Aggregated workspace context from filesystem discovery
@@ -149,6 +154,45 @@ impl WorkspaceContext {
         }
         pairs.into_iter().collect()
     }
+}
+
+/// Build a DepGraph from discovered repos.
+pub fn build_dep_graph(repos: &[DiscoveredRepo]) -> crate::build_system::dep_graph::DepGraph {
+    let mut nodes = Vec::new();
+    let mut all_deps = Vec::new();
+    for (idx, repo) in repos.iter().enumerate() {
+        let name = repo.effective_name();
+        nodes.push(crate::build_system::dep_graph::DepNode {
+            name,
+            version: repo.package_version.clone(),
+            build_system: format!("{}", repo.build_system),
+            path: repo.dir_name.clone(),
+        });
+        if !repo.dependencies.is_empty() {
+            all_deps.push((idx, repo.dependencies.clone()));
+        }
+    }
+    crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps)
+}
+
+/// Build a DepGraph excluding dev dependencies (for publish ordering).
+pub fn build_publish_dep_graph(repos: &[DiscoveredRepo]) -> crate::build_system::dep_graph::DepGraph {
+    let mut nodes = Vec::new();
+    let mut all_deps = Vec::new();
+    for (idx, repo) in repos.iter().enumerate() {
+        let name = repo.effective_name();
+        nodes.push(crate::build_system::dep_graph::DepNode {
+            name,
+            version: repo.package_version.clone(),
+            build_system: format!("{}", repo.build_system),
+            path: repo.dir_name.clone(),
+        });
+        let non_dev: Vec<_> = repo.dependencies.iter().filter(|d| !d.is_dev).cloned().collect();
+        if !non_dev.is_empty() {
+            all_deps.push((idx, non_dev));
+        }
+    }
+    crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps)
 }
 
 /// Build a `Repo` (suitable for LocalForge) from a discovered repo's config.

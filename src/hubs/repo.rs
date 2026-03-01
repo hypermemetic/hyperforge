@@ -11,11 +11,81 @@ use std::sync::Arc;
 
 use crate::adapters::{CodebergAdapter, ForgePort, GitHubAdapter, GitLabAdapter};
 use crate::auth::YamlAuthProvider;
-use crate::commands::materialize::{materialize, MaterializeOpts};
+use crate::commands::materialize::{materialize, MaterializeOpts, MaterializeReport};
 use crate::commands::{push, status};
+use crate::config::HyperforgeConfig;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::types::{Forge, Repo, RepoRecord, Visibility};
+
+/// Create a forge adapter for the given forge, org, and auth provider.
+fn make_repo_adapter(
+    forge: &Forge,
+    auth: Arc<YamlAuthProvider>,
+    org: &str,
+) -> Result<Box<dyn ForgePort>, String> {
+    match forge {
+        Forge::GitHub => GitHubAdapter::new(auth, org)
+            .map(|a| Box::new(a) as Box<dyn ForgePort>)
+            .map_err(|e| format!("{:?}: {}", forge, e)),
+        Forge::Codeberg => CodebergAdapter::new(auth, org)
+            .map(|a| Box::new(a) as Box<dyn ForgePort>)
+            .map_err(|e| format!("{:?}: {}", forge, e)),
+        Forge::GitLab => GitLabAdapter::new(auth, org)
+            .map(|a| Box::new(a) as Box<dyn ForgePort>)
+            .map_err(|e| format!("{:?}: {}", forge, e)),
+    }
+}
+
+/// Create an auth provider, returning a formatted error on failure.
+fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
+    YamlAuthProvider::new()
+        .map(Arc::new)
+        .map_err(|e| format!("Failed to create auth provider: {}", e))
+}
+
+/// Build a `HyperforgeEvent::Repo` from a `Repo` struct.
+fn repo_event(repo: &crate::types::Repo) -> HyperforgeEvent {
+    HyperforgeEvent::Repo {
+        name: repo.name.clone(),
+        description: repo.description.clone(),
+        visibility: format!("{:?}", repo.visibility).to_lowercase(),
+        origin: format!("{:?}", repo.origin).to_lowercase(),
+        mirrors: repo
+            .mirrors
+            .iter()
+            .map(|f| format!("{:?}", f).to_lowercase())
+            .collect(),
+        protected: repo.protected,
+        staged_for_deletion: repo.staged_for_deletion,
+    }
+}
+
+/// Convert a `MaterializeReport` into a list of info events.
+fn materialize_events(report: &MaterializeReport) -> Vec<HyperforgeEvent> {
+    let mut events = Vec::new();
+    if report.config_written {
+        events.push(HyperforgeEvent::Info {
+            message: "Updated on-disk config".to_string(),
+        });
+    }
+    for remote in &report.remotes_added {
+        events.push(HyperforgeEvent::Info {
+            message: format!("Added remote: {}", remote),
+        });
+    }
+    for remote in &report.remotes_updated {
+        events.push(HyperforgeEvent::Info {
+            message: format!("Updated remote: {}", remote),
+        });
+    }
+    if report.hooks_installed {
+        events.push(HyperforgeEvent::Info {
+            message: "Installed pre-push hook".to_string(),
+        });
+    }
+    events
+}
 
 /// Sub-hub for single-repo operations and registry CRUD
 #[derive(Clone)]
@@ -52,17 +122,7 @@ impl RepoHub {
             match local.list_repos(&org).await {
                 Ok(repos) => {
                     for repo in repos {
-                        yield HyperforgeEvent::Repo {
-                            name: repo.name.clone(),
-                            description: repo.description.clone(),
-                            visibility: format!("{:?}", repo.visibility).to_lowercase(),
-                            origin: format!("{:?}", repo.origin).to_lowercase(),
-                            mirrors: repo.mirrors.iter()
-                                .map(|f| format!("{:?}", f).to_lowercase())
-                                .collect(),
-                            protected: repo.protected,
-                            staged_for_deletion: repo.staged_for_deletion,
-                        };
+                        yield repo_event(&repo);
                     }
                 }
                 Err(e) => {
@@ -99,11 +159,9 @@ impl RepoHub {
 
         stream! {
             // Parse forge from string
-            let origin_forge = match origin.to_lowercase().as_str() {
-                "github" => Forge::GitHub,
-                "codeberg" => Forge::Codeberg,
-                "gitlab" => Forge::GitLab,
-                _ => {
+            let origin_forge = match HyperforgeConfig::parse_forge(&origin) {
+                Some(f) => f,
+                None => {
                     yield HyperforgeEvent::Error {
                         message: format!("Invalid origin forge: {}. Must be github, codeberg, or gitlab", origin),
                     };
@@ -112,13 +170,10 @@ impl RepoHub {
             };
 
             // Parse visibility
-            let vis = match visibility.to_lowercase().as_str() {
-                "public" => Visibility::Public,
-                "private" => Visibility::Private,
-                _ => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Invalid visibility: {}. Must be public or private", visibility),
-                    };
+            let vis = match Visibility::parse(&visibility) {
+                Ok(v) => v,
+                Err(e) => {
+                    yield HyperforgeEvent::Error { message: e };
                     return;
                 }
             };
@@ -128,12 +183,7 @@ impl RepoHub {
                 m.split(',')
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
-                    .filter_map(|s| match s.to_lowercase().as_str() {
-                        "github" => Some(Forge::GitHub),
-                        "codeberg" => Some(Forge::Codeberg),
-                        "gitlab" => Some(Forge::GitLab),
-                        _ => None,
-                    })
+                    .filter_map(|s| HyperforgeConfig::parse_forge(s))
                     .collect()
             } else {
                 Vec::new()
@@ -162,17 +212,7 @@ impl RepoHub {
                     yield HyperforgeEvent::Info {
                         message: format!("Created repository: {}", repo.name),
                     };
-                    yield HyperforgeEvent::Repo {
-                        name: repo.name.clone(),
-                        description: repo.description.clone(),
-                        visibility: format!("{:?}", repo.visibility).to_lowercase(),
-                        origin: format!("{:?}", repo.origin).to_lowercase(),
-                        mirrors: repo.mirrors.iter()
-                            .map(|f| format!("{:?}", f).to_lowercase())
-                            .collect(),
-                        protected: repo.protected,
-                        staged_for_deletion: repo.staged_for_deletion,
-                    };
+                    yield repo_event(&repo);
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
@@ -222,13 +262,10 @@ impl RepoHub {
             }
 
             if let Some(vis) = visibility {
-                repo.visibility = match vis.to_lowercase().as_str() {
-                    "public" => Visibility::Public,
-                    "private" => Visibility::Private,
-                    _ => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Invalid visibility: {}. Must be public or private", vis),
-                        };
+                repo.visibility = match Visibility::parse(&vis) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
                         return;
                     }
                 };
@@ -252,15 +289,8 @@ impl RepoHub {
                         if let Some(ref local_path) = record.local_path {
                             match materialize(&org, &record, local_path, MaterializeOpts::default()) {
                                 Ok(report) => {
-                                    if report.config_written {
-                                        yield HyperforgeEvent::Info {
-                                            message: "Updated on-disk config".to_string(),
-                                        };
-                                    }
-                                    for remote in &report.remotes_updated {
-                                        yield HyperforgeEvent::Info {
-                                            message: format!("Updated remote: {}", remote),
-                                        };
+                                    for event in materialize_events(&report) {
+                                        yield event;
                                     }
                                 }
                                 Err(e) => {
@@ -319,12 +349,10 @@ impl RepoHub {
             }
 
             // Privatize on each remote forge
-            let auth = match YamlAuthProvider::new() {
-                Ok(provider) => Arc::new(provider),
+            let auth = match make_auth() {
+                Ok(a) => a,
                 Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Failed to create auth provider: {}", e),
-                    };
+                    yield HyperforgeEvent::Error { message: e };
                     return;
                 }
             };
@@ -332,33 +360,11 @@ impl RepoHub {
             let mut privatize_errors = Vec::new();
             let mut privatized_forges = Vec::new();
             for forge in &record.present_on {
-                let adapter: Box<dyn ForgePort> = match forge {
-                    Forge::GitHub => {
-                        match GitHubAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                privatize_errors.push(format!("{:?}: {}", forge, e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::Codeberg => {
-                        match CodebergAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                privatize_errors.push(format!("{:?}: {}", forge, e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::GitLab => {
-                        match GitLabAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                privatize_errors.push(format!("{:?}: {}", forge, e));
-                                continue;
-                            }
-                        }
+                let adapter = match make_repo_adapter(forge, auth.clone(), &org) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        privatize_errors.push(e);
+                        continue;
                     }
                 };
 
@@ -474,45 +480,21 @@ impl RepoHub {
             }
 
             // Delete from each remote forge
-            let auth = match YamlAuthProvider::new() {
-                Ok(provider) => Arc::new(provider),
+            let auth = match make_auth() {
+                Ok(a) => a,
                 Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Failed to create auth provider: {}", e),
-                    };
+                    yield HyperforgeEvent::Error { message: e };
                     return;
                 }
             };
 
             let mut delete_errors = Vec::new();
             for forge in &record.present_on {
-                let adapter: Box<dyn ForgePort> = match forge {
-                    Forge::GitHub => {
-                        match GitHubAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                delete_errors.push(format!("{:?}: {}", forge, e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::Codeberg => {
-                        match CodebergAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                delete_errors.push(format!("{:?}: {}", forge, e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::GitLab => {
-                        match GitLabAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                delete_errors.push(format!("{:?}: {}", forge, e));
-                                continue;
-                            }
-                        }
+                let adapter = match make_repo_adapter(forge, auth.clone(), &org) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        delete_errors.push(e);
+                        continue;
                     }
                 };
 
@@ -596,12 +578,7 @@ impl RepoHub {
             let target_forges: Vec<Forge> = if let Some(forge_list) = forges {
                 forge_list
                     .split(',')
-                    .filter_map(|f| match f.trim().to_lowercase().as_str() {
-                        "github" => Some(Forge::GitHub),
-                        "codeberg" => Some(Forge::Codeberg),
-                        "gitlab" => Some(Forge::GitLab),
-                        _ => None,
-                    })
+                    .filter_map(|f| HyperforgeConfig::parse_forge(f.trim()))
                     .collect()
             } else {
                 // Default to origin only
@@ -609,12 +586,10 @@ impl RepoHub {
             };
 
             // Get auth provider
-            let auth = match YamlAuthProvider::new() {
-                Ok(provider) => Arc::new(provider),
+            let auth = match make_auth() {
+                Ok(a) => a,
                 Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Failed to create auth provider: {}", e),
-                    };
+                    yield HyperforgeEvent::Error { message: e };
                     return;
                 }
             };
@@ -622,33 +597,11 @@ impl RepoHub {
             // Rename on each target forge
             let mut errors = Vec::new();
             for forge in &target_forges {
-                let adapter: Box<dyn ForgePort> = match forge {
-                    Forge::GitHub => {
-                        match GitHubAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                errors.push(format!("GitHub: {}", e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::Codeberg => {
-                        match CodebergAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                errors.push(format!("Codeberg: {}", e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::GitLab => {
-                        match GitLabAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                errors.push(format!("GitLab: {}", e));
-                                continue;
-                            }
-                        }
+                let adapter = match make_repo_adapter(forge, auth.clone(), &org) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
                     }
                 };
 
@@ -690,20 +643,8 @@ impl RepoHub {
                         if let Some(ref local_path) = record.local_path {
                             match materialize(&org, &record, local_path, MaterializeOpts::default()) {
                                 Ok(report) => {
-                                    if report.config_written {
-                                        yield HyperforgeEvent::Info {
-                                            message: "Updated on-disk config with new name".to_string(),
-                                        };
-                                    }
-                                    for remote in &report.remotes_updated {
-                                        yield HyperforgeEvent::Info {
-                                            message: format!("Updated remote URL: {}", remote),
-                                        };
-                                    }
-                                    for remote in &report.remotes_added {
-                                        yield HyperforgeEvent::Info {
-                                            message: format!("Added remote: {}", remote),
-                                        };
+                                    for event in materialize_events(&report) {
+                                        yield event;
                                     }
                                 }
                                 Err(e) => {
@@ -778,12 +719,10 @@ impl RepoHub {
             }
 
             // Get auth provider
-            let auth = match YamlAuthProvider::new() {
-                Ok(provider) => Arc::new(provider),
+            let auth = match make_auth() {
+                Ok(a) => a,
                 Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Failed to create auth provider: {}", e),
-                    };
+                    yield HyperforgeEvent::Error { message: e };
                     return;
                 }
             };
@@ -791,33 +730,11 @@ impl RepoHub {
             // Set default branch on each forge
             let mut errors = Vec::new();
             for forge in &target_forges {
-                let adapter: Box<dyn ForgePort> = match forge {
-                    Forge::GitHub => {
-                        match GitHubAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                errors.push(format!("GitHub: {}", e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::Codeberg => {
-                        match CodebergAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                errors.push(format!("Codeberg: {}", e));
-                                continue;
-                            }
-                        }
-                    }
-                    Forge::GitLab => {
-                        match GitLabAdapter::new(auth.clone(), &org) {
-                            Ok(a) => Box::new(a),
-                            Err(e) => {
-                                errors.push(format!("GitLab: {}", e));
-                                continue;
-                            }
-                        }
+                let adapter = match make_repo_adapter(forge, auth.clone(), &org) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
                     }
                 };
 
@@ -892,11 +809,9 @@ impl RepoHub {
 
         stream! {
             // Parse forge
-            let source_forge = match forge.to_lowercase().as_str() {
-                "github" => Forge::GitHub,
-                "codeberg" => Forge::Codeberg,
-                "gitlab" => Forge::GitLab,
-                _ => {
+            let source_forge = match HyperforgeConfig::parse_forge(&forge) {
+                Some(f) => f,
+                None => {
                     yield HyperforgeEvent::Error {
                         message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
                     };
@@ -905,48 +820,18 @@ impl RepoHub {
             };
 
             // Get forge adapter
-            let auth = match YamlAuthProvider::new() {
-                Ok(provider) => Arc::new(provider),
+            let auth = match make_auth() {
+                Ok(a) => a,
                 Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Failed to create auth provider: {}", e),
-                    };
+                    yield HyperforgeEvent::Error { message: e };
                     return;
                 }
             };
-            let adapter: Arc<dyn ForgePort> = match source_forge {
-                Forge::GitHub => {
-                    match GitHubAdapter::new(auth, &org) {
-                        Ok(a) => Arc::new(a),
-                        Err(e) => {
-                            yield HyperforgeEvent::Error {
-                                message: format!("Failed to create GitHub adapter: {}", e),
-                            };
-                            return;
-                        }
-                    }
-                }
-                Forge::Codeberg => {
-                    match CodebergAdapter::new(auth, &org) {
-                        Ok(a) => Arc::new(a),
-                        Err(e) => {
-                            yield HyperforgeEvent::Error {
-                                message: format!("Failed to create Codeberg adapter: {}", e),
-                            };
-                            return;
-                        }
-                    }
-                }
-                Forge::GitLab => {
-                    match GitLabAdapter::new(auth, &org) {
-                        Ok(a) => Arc::new(a),
-                        Err(e) => {
-                            yield HyperforgeEvent::Error {
-                                message: format!("Failed to create GitLab adapter: {}", e),
-                            };
-                            return;
-                        }
-                    }
+            let adapter: Arc<dyn ForgePort> = match make_repo_adapter(&source_forge, auth, &org) {
+                Ok(a) => Arc::from(a),
+                Err(e) => {
+                    yield HyperforgeEvent::Error { message: e };
+                    return;
                 }
             };
 
@@ -999,17 +884,7 @@ impl RepoHub {
                 match local.create_repo(&org, &repo).await {
                     Ok(_) => {
                         imported += 1;
-                        yield HyperforgeEvent::Repo {
-                            name: repo.name.clone(),
-                            description: repo.description.clone(),
-                            visibility: format!("{:?}", repo.visibility).to_lowercase(),
-                            origin: format!("{:?}", repo.origin).to_lowercase(),
-                            mirrors: repo.mirrors.iter()
-                                .map(|f| format!("{:?}", f).to_lowercase())
-                                .collect(),
-                            protected: repo.protected,
-                            staged_for_deletion: repo.staged_for_deletion,
-                        };
+                        yield repo_event(&repo);
                     }
                     Err(e) => {
                         errors += 1;
@@ -1089,14 +964,14 @@ impl RepoHub {
 
             // Parse visibility
             let vis = match visibility.as_deref() {
-                Some("private") => Visibility::Private,
-                Some("public") | None => Visibility::Public,
-                Some(other) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Invalid visibility: {}. Must be public or private", other),
-                    };
-                    return;
-                }
+                None => Visibility::Public,
+                Some(s) => match Visibility::parse(s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
+                        return;
+                    }
+                },
             };
 
             // Parse SSH keys into a HashMap
@@ -1122,7 +997,7 @@ impl RepoHub {
             // Parse forge strings into Forge enums for present_on
             let mut present_on = HashSet::new();
             for f in &forge_list {
-                if let Some(forge_enum) = crate::config::HyperforgeConfig::parse_forge(f) {
+                if let Some(forge_enum) = HyperforgeConfig::parse_forge(f) {
                     present_on.insert(forge_enum);
                 }
             }
@@ -1166,7 +1041,7 @@ impl RepoHub {
             }
 
             // Check if config already exists (unless --force)
-            let config_exists = crate::config::HyperforgeConfig::exists(&repo_path);
+            let config_exists = HyperforgeConfig::exists(&repo_path);
             if config_exists && !force.unwrap_or(false) {
                 yield HyperforgeEvent::Error {
                     message: "Config already exists. Use --force to reinitialize.".to_string(),
@@ -1212,6 +1087,7 @@ impl RepoHub {
                         };
                     }
 
+                    // Override config_written message for init (shows path)
                     if report.config_written {
                         yield HyperforgeEvent::Info {
                             message: format!("Created config at {}", repo_path.join(".hyperforge/config.toml").display()),
@@ -1472,7 +1348,7 @@ impl RepoHub {
 
             // 2. Pick clone forge
             let clone_forge = if let Some(ref forge_str) = forge {
-                match crate::config::HyperforgeConfig::parse_forge(forge_str) {
+                match HyperforgeConfig::parse_forge(forge_str) {
                     Some(f) => {
                         if !record.present_on.contains(&f) {
                             yield HyperforgeEvent::Error {
@@ -1540,18 +1416,17 @@ impl RepoHub {
             // Materialize config + remotes onto disk
             match materialize(&org, &updated_record, &clone_path, MaterializeOpts::default()) {
                 Ok(report) => {
+                    // Override config_written message for clone (shows provenance)
                     if report.config_written {
                         yield HyperforgeEvent::Info {
                             message: "Generated .hyperforge/config.toml from LocalForge metadata".to_string(),
                         };
                     }
-
                     for remote in &report.remotes_added {
                         yield HyperforgeEvent::Info {
                             message: format!("Added remote: {}", remote),
                         };
                     }
-
                     for remote in &report.remotes_updated {
                         yield HyperforgeEvent::Info {
                             message: format!("Updated remote: {}", remote),

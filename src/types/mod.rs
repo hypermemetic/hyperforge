@@ -30,6 +30,20 @@ pub enum Visibility {
     Private,
 }
 
+impl Visibility {
+    /// Parse a visibility string ("public" or "private"), case-insensitive.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "public" => Ok(Visibility::Public),
+            "private" => Ok(Visibility::Private),
+            _ => Err(format!(
+                "Invalid visibility: {}. Must be public or private",
+                s
+            )),
+        }
+    }
+}
+
 /// Whether the org name refers to a user account or an organization
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,4 +58,15 @@ pub enum VersionBump {
     Patch,
     Minor,
     Major,
+}
+
+impl VersionBump {
+    /// Parse a bump kind from an optional string, defaulting to Patch.
+    pub fn from_str_or_patch(s: Option<&str>) -> Self {
+        match s {
+            Some("minor") => VersionBump::Minor,
+            Some("major") => VersionBump::Major,
+            _ => VersionBump::Patch,
+        }
+    }
 }
