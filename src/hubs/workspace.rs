@@ -18,8 +18,8 @@ use crate::adapters::{CodebergAdapter, ForgePort, ForgeSyncState, GitHubAdapter,
 use crate::auth::YamlAuthProvider;
 use crate::commands::init::{init, InitOptions};
 use crate::commands::push::{push, PushOptions};
-use crate::commands::runner::{discover_or_bail, run_batch_blocking};
-use crate::commands::workspace::{discover_workspace, repo_from_config};
+use crate::commands::runner::{discover_or_bail, run_batch, run_batch_blocking};
+use crate::commands::workspace::repo_from_config;
 use crate::config::HyperforgeConfig;
 use crate::git::{build_remote_url, parse_remote_url, Git};
 use crate::hub::HyperforgeEvent;
@@ -107,14 +107,9 @@ impl WorkspaceHub {
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             let workspace_path = PathBuf::from(&path);
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {
@@ -209,14 +204,9 @@ impl WorkspaceHub {
                 message: format!("{}Discovering workspace...", dry_prefix),
             };
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {
@@ -347,14 +337,9 @@ impl WorkspaceHub {
                 yield HyperforgeEvent::Info {
                     message: format!("Re-discovering after {} inits...", inits_performed),
                 };
-                match discover_workspace(&workspace_path) {
+                match discover_or_bail(&workspace_path) {
                     Ok(ctx) => ctx,
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Re-discovery failed: {}", e),
-                        };
-                        return;
-                    }
+                    Err(event) => { yield event; return; }
                 }
             } else {
                 ctx
@@ -509,14 +494,9 @@ impl WorkspaceHub {
             let is_set_upstream = set_upstream.unwrap_or(false);
             let is_validate = validate.unwrap_or(false);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Validation gate (if --validate)
@@ -584,77 +564,61 @@ impl WorkspaceHub {
             let mut success_count = 0usize;
             let mut failed_count = 0usize;
 
-            // Parallel push: spawn_blocking per repo
-            {
-                use tokio::task::JoinSet;
-                let concurrency = 8usize;
-                let git_repos: Vec<_> = ctx.repos.iter().filter(|r| r.is_git_repo).cloned().collect();
-                let non_git: Vec<_> = ctx.repos.iter().filter(|r| !r.is_git_repo).collect();
+            // Skip non-git repos
+            for repo in ctx.repos.iter().filter(|r| !r.is_git_repo) {
+                yield HyperforgeEvent::Info {
+                    message: format!("  Skipping {} (not a git repo)", repo.dir_name),
+                };
+            }
 
-                for repo in &non_git {
-                    yield HyperforgeEvent::Info {
-                        message: format!("  Skipping {} (not a git repo)", repo.dir_name),
-                    };
-                }
+            // Parallel push via run_batch_blocking
+            let push_inputs: Vec<_> = ctx.repos.iter()
+                .filter(|r| r.is_git_repo)
+                .map(|r| {
+                    let mut options = PushOptions::new();
+                    if is_dry_run { options = options.dry_run(); }
+                    if is_set_upstream { options = options.set_upstream(); }
+                    (r.dir_name.clone(), r.path.clone(), options)
+                })
+                .collect();
 
-                for chunk in git_repos.chunks(concurrency) {
-                    let mut join_set = JoinSet::new();
+            let push_results = run_batch_blocking(push_inputs, 8, |(dir_name, path, options)| {
+                let result = push(&path, options);
+                (dir_name, path, result)
+            }).await;
 
-                    for repo in chunk {
-                        let dir_name = repo.dir_name.clone();
-                        let path = repo.path.clone();
-                        let mut options = PushOptions::new();
-                        if is_dry_run { options = options.dry_run(); }
-                        if is_set_upstream { options = options.set_upstream(); }
-
-                        join_set.spawn(tokio::task::spawn_blocking(move || {
-                            let result = push(&path, options);
-                            (dir_name, path, result)
-                        }));
+            for result in push_results {
+                let (dir_name, path, push_result) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
+                        failed_count += 1;
+                        continue;
                     }
+                };
 
-                    while let Some(result) = join_set.join_next().await {
-                        let inner = match result {
-                            Ok(inner) => inner,
-                            Err(e) => {
-                                yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
-                                failed_count += 1;
-                                continue;
-                            }
-                        };
-                        let (dir_name, path, push_result) = match inner {
-                            Ok(v) => v,
-                            Err(e) => {
-                                yield HyperforgeEvent::Error { message: format!("Spawn error: {}", e) };
-                                failed_count += 1;
-                                continue;
-                            }
-                        };
-
-                        match push_result {
-                            Ok(report) => {
-                                for r in &report.results {
-                                    yield HyperforgeEvent::RepoPush {
-                                        repo_name: dir_name.clone(),
-                                        path: path.display().to_string(),
-                                        forge: r.forge.clone(),
-                                        success: r.success,
-                                        error: r.error.clone(),
-                                    };
-                                }
-                                if report.all_success { success_count += 1; } else { failed_count += 1; }
-                            }
-                            Err(e) => {
-                                yield HyperforgeEvent::RepoPush {
-                                    repo_name: dir_name.clone(),
-                                    path: path.display().to_string(),
-                                    forge: "all".to_string(),
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                };
-                                failed_count += 1;
-                            }
+                match push_result {
+                    Ok(report) => {
+                        for r in &report.results {
+                            yield HyperforgeEvent::RepoPush {
+                                repo_name: dir_name.clone(),
+                                path: path.display().to_string(),
+                                forge: r.forge.clone(),
+                                success: r.success,
+                                error: r.error.clone(),
+                            };
                         }
+                        if report.all_success { success_count += 1; } else { failed_count += 1; }
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::RepoPush {
+                            repo_name: dir_name.clone(),
+                            path: path.display().to_string(),
+                            forge: "all".to_string(),
+                            success: false,
+                            error: Some(e.to_string()),
+                        };
+                        failed_count += 1;
                     }
                 }
             }
@@ -695,14 +659,9 @@ impl WorkspaceHub {
             // Resolve org/forge pairs to diff
             let pairs: Vec<(String, String)> = if let Some(ref workspace_path) = path {
                 let workspace_path = PathBuf::from(workspace_path);
-                let ctx = match discover_workspace(&workspace_path) {
+                let ctx = match discover_or_bail(&workspace_path) {
                     Ok(ctx) => ctx,
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Discovery failed: {}", e),
-                        };
-                        return;
-                    }
+                    Err(event) => { yield event; return; }
                 };
 
                 let all_pairs = ctx.org_forge_pairs();
@@ -731,29 +690,22 @@ impl WorkspaceHub {
 
             // Parallel diff: spawn per org/forge pair
             {
-                use tokio::task::JoinSet;
-                let mut join_set = JoinSet::new();
+                let items: Vec<_> = pairs.iter()
+                    .map(|(o, f)| (o.clone(), f.clone(), state.clone(), sync_service.clone()))
+                    .collect();
+                let results = run_batch(items, 8, |(org_name, forge_name, state, sync_service)| async move {
+                    let local = state.get_local_forge(&org_name).await;
+                    let ot = local.owner_type();
+                    let adapter = match make_adapter(&forge_name, &org_name, ot) {
+                        Ok(a) => a,
+                        Err(e) => return (org_name, forge_name, Err(e)),
+                    };
+                    let result = sync_service.diff(local, adapter, &org_name).await
+                        .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
+                    (org_name, forge_name, result)
+                }).await;
 
-                for (org_name, forge_name) in &pairs {
-                    let state = state.clone();
-                    let sync_service = sync_service.clone();
-                    let org_name = org_name.clone();
-                    let forge_name = forge_name.clone();
-
-                    join_set.spawn(async move {
-                        let local = state.get_local_forge(&org_name).await;
-                        let ot = local.owner_type();
-                        let adapter = match make_adapter(&forge_name, &org_name, ot) {
-                            Ok(a) => a,
-                            Err(e) => return (org_name, forge_name, Err(e)),
-                        };
-                        let result = sync_service.diff(local, adapter, &org_name).await
-                            .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
-                        (org_name, forge_name, result)
-                    });
-                }
-
-                while let Some(result) = join_set.join_next().await {
+                for result in results {
                     let (org_name, forge_name, diff_result) = match result {
                         Ok(v) => v,
                         Err(e) => {
@@ -839,14 +791,9 @@ impl WorkspaceHub {
                 message: format!("{}Phase 1/8: Discovering workspace...", dry_prefix),
             };
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {
@@ -947,14 +894,9 @@ impl WorkspaceHub {
                 yield HyperforgeEvent::Info {
                     message: format!("{}Phase 3/8: Re-discovering after {} inits...", dry_prefix, inits_performed),
                 };
-                match discover_workspace(&workspace_path) {
+                match discover_or_bail(&workspace_path) {
                     Ok(ctx) => ctx,
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Re-discovery failed: {}", e),
-                        };
-                        return;
-                    }
+                    Err(event) => { yield event; return; }
                 }
             } else {
                 yield HyperforgeEvent::Info {
@@ -1216,29 +1158,22 @@ impl WorkspaceHub {
             let mut all_diffs: Vec<(String, String, crate::services::SyncDiff)> = Vec::new();
 
             {
-                use tokio::task::JoinSet;
-                let mut join_set = JoinSet::new();
+                let items: Vec<_> = pairs.iter()
+                    .map(|(o, f)| (o.clone(), f.clone(), state.clone(), sync_service.clone()))
+                    .collect();
+                let results = run_batch(items, 8, |(org_name, forge_name, state, sync_service)| async move {
+                    let local = state.get_local_forge(&org_name).await;
+                    let ot = local.owner_type();
+                    let adapter = match make_adapter(&forge_name, &org_name, ot) {
+                        Ok(a) => a,
+                        Err(e) => return (org_name, forge_name, Err(e)),
+                    };
+                    let result = sync_service.diff(local, adapter, &org_name).await
+                        .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
+                    (org_name, forge_name, result)
+                }).await;
 
-                for (org_name, forge_name) in &pairs {
-                    let state = state.clone();
-                    let sync_service = sync_service.clone();
-                    let org_name = org_name.clone();
-                    let forge_name = forge_name.clone();
-
-                    join_set.spawn(async move {
-                        let local = state.get_local_forge(&org_name).await;
-                        let ot = local.owner_type();
-                        let adapter = match make_adapter(&forge_name, &org_name, ot) {
-                            Ok(a) => a,
-                            Err(e) => return (org_name, forge_name, Err(e)),
-                        };
-                        let result = sync_service.diff(local, adapter, &org_name).await
-                            .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
-                        (org_name, forge_name, result)
-                    });
-                }
-
-                while let Some(result) = join_set.join_next().await {
+                for result in results {
                     let (org_name, forge_name, diff_result) = match result {
                         Ok(v) => v,
                         Err(e) => {
@@ -1287,124 +1222,121 @@ impl WorkspaceHub {
 
             // Parallel apply: spawn per org/forge pair, ops within a forge stay sequential
             {
-                use tokio::task::JoinSet;
-                let mut join_set = JoinSet::new();
+                let dry_run = is_dry_run;
+                let items: Vec<_> = all_diffs.into_iter()
+                    .map(|(org_name, forge_name, diff)| (org_name, forge_name, diff, state.clone()))
+                    .collect();
+                let results = run_batch(items, 8, move |(org_name, forge_name, diff, state)| async move {
+                    let ot = state.get_local_forge(&org_name).await.owner_type();
+                    let adapter = match make_adapter(&forge_name, &org_name, ot) {
+                        Ok(a) => a,
+                        Err(e) => return (vec![HyperforgeEvent::Error { message: e }], 0usize, 0usize),
+                    };
 
-                for (org_name, forge_name, diff) in all_diffs {
-                    let state = state.clone();
+                    let mut events = Vec::new();
+                    let mut created = 0usize;
+                    let mut updated = 0usize;
 
-                    join_set.spawn(async move {
-                        let ot = state.get_local_forge(&org_name).await.owner_type();
-                        let adapter = match make_adapter(&forge_name, &org_name, ot) {
-                            Ok(a) => a,
-                            Err(e) => return (vec![HyperforgeEvent::Error { message: e }], 0usize, 0usize),
-                        };
-
-                        let mut events = Vec::new();
-                        let mut created = 0usize;
-                        let mut updated = 0usize;
-
-                        for repo_op in &diff.ops {
-                            match repo_op.op {
-                                SyncOp::Create => {
-                                    if !is_dry_run {
-                                        if let Err(e) = adapter.create_repo(&org_name, &repo_op.repo).await {
-                                            events.push(HyperforgeEvent::Error {
-                                                message: format!("  Failed to create {} on {}: {}", repo_op.repo.name, forge_name, e),
-                                            });
-                                            continue;
-                                        }
-                                    }
-                                    created += 1;
-                                    events.push(HyperforgeEvent::SyncOp {
-                                        repo_name: repo_op.repo.name.clone(),
-                                        operation: "create".to_string(),
-                                        forge: forge_name.clone(),
-                                    });
-                                }
-                                SyncOp::Update => {
-                                    if !is_dry_run {
-                                        if let Err(e) = adapter.update_repo(&org_name, &repo_op.repo).await {
-                                            events.push(HyperforgeEvent::Error {
-                                                message: format!("  Failed to update {} on {}: {}", repo_op.repo.name, forge_name, e),
-                                            });
-                                            continue;
-                                        }
-                                    }
-                                    updated += 1;
-                                    events.push(HyperforgeEvent::SyncOp {
-                                        repo_name: repo_op.repo.name.clone(),
-                                        operation: "update".to_string(),
-                                        forge: forge_name.clone(),
-                                    });
-                                }
-                                SyncOp::Delete => {
-                                    let local = state.get_local_forge(&org_name).await;
-                                    let record_info = local.get_record(&repo_op.repo.name).ok();
-
-                                    if record_info.as_ref().map_or(false, |r| r.protected) {
-                                        events.push(HyperforgeEvent::SyncOp {
-                                            repo_name: repo_op.repo.name.clone(),
-                                            operation: "skip_protected".to_string(),
-                                            forge: forge_name.clone(),
+                    for repo_op in &diff.ops {
+                        match repo_op.op {
+                            SyncOp::Create => {
+                                if !dry_run {
+                                    if let Err(e) = adapter.create_repo(&org_name, &repo_op.repo).await {
+                                        events.push(HyperforgeEvent::Error {
+                                            message: format!("  Failed to create {} on {}: {}", repo_op.repo.name, forge_name, e),
                                         });
                                         continue;
                                     }
-
-                                    let already_privatized = record_info.as_ref()
-                                        .and_then(|rec| {
-                                            crate::config::HyperforgeConfig::parse_forge(&forge_name)
-                                                .map(|fe| rec.privatized_on.contains(&fe))
-                                        })
-                                        .unwrap_or(false);
-
-                                    if already_privatized {
-                                        events.push(HyperforgeEvent::SyncOp {
-                                            repo_name: repo_op.repo.name.clone(),
-                                            operation: "already_privatized".to_string(),
-                                            forge: forge_name.clone(),
+                                }
+                                created += 1;
+                                events.push(HyperforgeEvent::SyncOp {
+                                    repo_name: repo_op.repo.name.clone(),
+                                    operation: "create".to_string(),
+                                    forge: forge_name.clone(),
+                                });
+                            }
+                            SyncOp::Update => {
+                                if !dry_run {
+                                    if let Err(e) = adapter.update_repo(&org_name, &repo_op.repo).await {
+                                        events.push(HyperforgeEvent::Error {
+                                            message: format!("  Failed to update {} on {}: {}", repo_op.repo.name, forge_name, e),
                                         });
-                                    } else {
-                                        let private_repo = crate::types::Repo::new(
-                                            &repo_op.repo.name,
-                                            repo_op.repo.origin.clone(),
-                                        ).with_visibility(crate::types::Visibility::Private);
-
-                                        if !is_dry_run {
-                                            match adapter.update_repo(&org_name, &private_repo).await {
-                                                Ok(_) => {
-                                                    if let Some(forge_enum) = crate::config::HyperforgeConfig::parse_forge(&forge_name) {
-                                                        if let Ok(mut rec) = local.get_record(&repo_op.repo.name) {
-                                                            rec.privatized_on.insert(forge_enum);
-                                                            let _ = local.update_record(&rec);
-                                                            let _ = local.save_to_yaml().await;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    events.push(HyperforgeEvent::Error {
-                                                        message: format!("  Failed to privatize {} on {}: {}",
-                                                            repo_op.repo.name, forge_name, e),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                        events.push(HyperforgeEvent::SyncOp {
-                                            repo_name: repo_op.repo.name.clone(),
-                                            operation: "privatize".to_string(),
-                                            forge: forge_name.clone(),
-                                        });
+                                        continue;
                                     }
                                 }
-                                SyncOp::InSync => {}
+                                updated += 1;
+                                events.push(HyperforgeEvent::SyncOp {
+                                    repo_name: repo_op.repo.name.clone(),
+                                    operation: "update".to_string(),
+                                    forge: forge_name.clone(),
+                                });
                             }
+                            SyncOp::Delete => {
+                                let local = state.get_local_forge(&org_name).await;
+                                let record_info = local.get_record(&repo_op.repo.name).ok();
+
+                                if record_info.as_ref().map_or(false, |r| r.protected) {
+                                    events.push(HyperforgeEvent::SyncOp {
+                                        repo_name: repo_op.repo.name.clone(),
+                                        operation: "skip_protected".to_string(),
+                                        forge: forge_name.clone(),
+                                    });
+                                    continue;
+                                }
+
+                                let already_privatized = record_info.as_ref()
+                                    .and_then(|rec| {
+                                        crate::config::HyperforgeConfig::parse_forge(&forge_name)
+                                            .map(|fe| rec.privatized_on.contains(&fe))
+                                    })
+                                    .unwrap_or(false);
+
+                                if already_privatized {
+                                    events.push(HyperforgeEvent::SyncOp {
+                                        repo_name: repo_op.repo.name.clone(),
+                                        operation: "already_privatized".to_string(),
+                                        forge: forge_name.clone(),
+                                    });
+                                } else {
+                                    let private_repo = crate::types::Repo::new(
+                                        &repo_op.repo.name,
+                                        repo_op.repo.origin.clone(),
+                                    ).with_visibility(crate::types::Visibility::Private);
+
+                                    if !dry_run {
+                                        match adapter.update_repo(&org_name, &private_repo).await {
+                                            Ok(_) => {
+                                                if let Some(forge_enum) = crate::config::HyperforgeConfig::parse_forge(&forge_name) {
+                                                    if let Ok(mut rec) = local.get_record(&repo_op.repo.name) {
+                                                        rec.privatized_on.insert(forge_enum);
+                                                        let _ = local.update_record(&rec);
+                                                        let _ = local.save_to_yaml().await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                events.push(HyperforgeEvent::Error {
+                                                    message: format!("  Failed to privatize {} on {}: {}",
+                                                        repo_op.repo.name, forge_name, e),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    events.push(HyperforgeEvent::SyncOp {
+                                        repo_name: repo_op.repo.name.clone(),
+                                        operation: "privatize".to_string(),
+                                        forge: forge_name.clone(),
+                                    });
+                                }
+                            }
+                            SyncOp::InSync => {}
                         }
+                    }
 
-                        (events, created, updated)
-                    });
-                }
+                    (events, created, updated)
+                }).await;
 
-                while let Some(result) = join_set.join_next().await {
+                for result in results {
                     match result {
                         Ok((events, created, updated)) => {
                             total_created += created;
@@ -1719,66 +1651,52 @@ impl WorkspaceHub {
 
                 // Parallel push: spawn_blocking per repo
                 {
-                    use tokio::task::JoinSet;
-                    let concurrency = 8usize;
                     let git_repos: Vec<_> = ctx.repos.iter().filter(|r| r.is_git_repo).cloned().collect();
+                    let items: Vec<_> = git_repos.into_iter().map(|repo| {
+                        let dir_name = repo.dir_name.clone();
+                        let path = repo.path.clone();
+                        let mut options = PushOptions::new();
+                        if is_dry_run { options = options.dry_run(); }
+                        (dir_name, path, options)
+                    }).collect();
 
-                    for chunk in git_repos.chunks(concurrency) {
-                        let mut join_set = JoinSet::new();
+                    let results = run_batch_blocking(items, 8, |(dir_name, path, options)| {
+                        let result = push(&path, options);
+                        (dir_name, path, result)
+                    }).await;
 
-                        for repo in chunk {
-                            let dir_name = repo.dir_name.clone();
-                            let path = repo.path.clone();
-                            let mut options = PushOptions::new();
-                            if is_dry_run { options = options.dry_run(); }
+                    for result in results {
+                        let (dir_name, path, push_result) = match result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
+                                push_failed += 1;
+                                continue;
+                            }
+                        };
 
-                            join_set.spawn(tokio::task::spawn_blocking(move || {
-                                let result = push(&path, options);
-                                (dir_name, path, result)
-                            }));
-                        }
-
-                        while let Some(result) = join_set.join_next().await {
-                            let inner = match result {
-                                Ok(inner) => inner,
-                                Err(e) => {
-                                    yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
-                                    push_failed += 1;
-                                    continue;
-                                }
-                            };
-                            let (dir_name, path, push_result) = match inner {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    yield HyperforgeEvent::Error { message: format!("Spawn error: {}", e) };
-                                    push_failed += 1;
-                                    continue;
-                                }
-                            };
-
-                            match push_result {
-                                Ok(report) => {
-                                    for r in &report.results {
-                                        yield HyperforgeEvent::RepoPush {
-                                            repo_name: dir_name.clone(),
-                                            path: path.display().to_string(),
-                                            forge: r.forge.clone(),
-                                            success: r.success,
-                                            error: r.error.clone(),
-                                        };
-                                    }
-                                    if report.all_success { push_success += 1; } else { push_failed += 1; }
-                                }
-                                Err(e) => {
+                        match push_result {
+                            Ok(report) => {
+                                for r in &report.results {
                                     yield HyperforgeEvent::RepoPush {
                                         repo_name: dir_name.clone(),
                                         path: path.display().to_string(),
-                                        forge: "all".to_string(),
-                                        success: false,
-                                        error: Some(e.to_string()),
+                                        forge: r.forge.clone(),
+                                        success: r.success,
+                                        error: r.error.clone(),
                                     };
-                                    push_failed += 1;
                                 }
+                                if report.all_success { push_success += 1; } else { push_failed += 1; }
+                            }
+                            Err(e) => {
+                                yield HyperforgeEvent::RepoPush {
+                                    repo_name: dir_name.clone(),
+                                    path: path.display().to_string(),
+                                    forge: "all".to_string(),
+                                    success: false,
+                                    error: Some(e.to_string()),
+                                };
+                                push_failed += 1;
                             }
                         }
                     }
@@ -1836,14 +1754,9 @@ impl WorkspaceHub {
             let workspace_path = PathBuf::from(&path);
             let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {
@@ -1858,9 +1771,6 @@ impl WorkspaceHub {
 
             // Parallel set_default_branch: spawn per repo
             {
-                use tokio::task::JoinSet;
-                let concurrency = 8usize;
-
                 // Filter repos that have config and org
                 let eligible: Vec<_> = ctx.repos.iter()
                     .filter(|r| r.config.is_some() && r.org().is_some())
@@ -1877,110 +1787,109 @@ impl WorkspaceHub {
                     }
                 }
 
-                for chunk in eligible.chunks(concurrency) {
-                    let mut join_set = JoinSet::new();
+                let items: Vec<_> = eligible.into_iter().map(|repo| {
+                    let config = repo.config.clone().unwrap();
+                    let org = repo.org().unwrap().to_string();
+                    let repo_name = config.repo_name.clone()
+                        .unwrap_or_else(|| repo.dir_name.clone());
+                    let dir_name = repo.dir_name.clone();
+                    let forges: Vec<String> = repo.forges().into_iter().map(|s| s.to_string()).collect();
+                    let branch = branch.clone();
+                    let dry_prefix = dry_prefix.to_string();
+                    let path = repo.path.clone();
+                    let is_git = repo.is_git_repo;
+                    (dir_name, org, repo_name, forges, branch, dry_prefix, path, is_git)
+                }).collect();
 
-                    for repo in chunk {
-                        let config = repo.config.clone().unwrap();
-                        let org = repo.org().unwrap().to_string();
-                        let repo_name = config.repo_name.clone()
-                            .unwrap_or_else(|| repo.dir_name.clone());
-                        let dir_name = repo.dir_name.clone();
-                        let forges: Vec<String> = repo.forges().into_iter().map(|s| s.to_string()).collect();
-                        let branch = branch.clone();
-                        let dry_prefix = dry_prefix.to_string();
-                        let path = repo.path.clone();
-                        let is_git = repo.is_git_repo;
+                let dry_run = is_dry_run;
+                let checkout = is_checkout;
+                let results = run_batch(items, 8, move |(dir_name, org, repo_name, forges, branch, dry_prefix, path, is_git)| async move {
+                    let mut events = Vec::new();
+                    let mut errors = Vec::new();
 
-                        join_set.spawn(async move {
-                            let mut events = Vec::new();
-                            let mut errors = Vec::new();
+                    for forge_name in &forges {
+                        if dry_run {
+                            events.push(HyperforgeEvent::Info {
+                                message: format!(
+                                    "  {}Would set default branch on {}/{} ({})",
+                                    dry_prefix, repo_name, forge_name, branch,
+                                ),
+                            });
+                            continue;
+                        }
 
-                            for forge_name in &forges {
-                                if is_dry_run {
-                                    events.push(HyperforgeEvent::Info {
-                                        message: format!(
-                                            "  {}Would set default branch on {}/{} ({})",
-                                            dry_prefix, repo_name, forge_name, branch,
-                                        ),
-                                    });
-                                    continue;
-                                }
-
-                                let adapter = match make_adapter(forge_name, &org, None) {
-                                    Ok(a) => a,
-                                    Err(e) => {
-                                        errors.push(format!("{}: {}", forge_name, e));
-                                        continue;
-                                    }
-                                };
-
-                                match adapter.set_default_branch(&org, &repo_name, &branch).await {
-                                    Ok(_) => {
-                                        events.push(HyperforgeEvent::Info {
-                                            message: format!("  {} → {} default branch set to '{}'", repo_name, forge_name, branch),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        errors.push(format!("{}: {}", forge_name, e));
-                                    }
-                                }
-                            }
-
-                            // Optionally checkout locally (sync git op)
-                            if is_checkout && is_git {
-                                if is_dry_run {
-                                    events.push(HyperforgeEvent::Info {
-                                        message: format!("  {}Would checkout '{}' in {}", dry_prefix, branch, dir_name),
-                                    });
-                                } else {
-                                    match tokio::task::spawn_blocking({
-                                        let path = path.clone();
-                                        let branch = branch.clone();
-                                        move || Git::checkout(&path, &branch)
-                                    }).await {
-                                        Ok(Ok(_)) => {
-                                            events.push(HyperforgeEvent::Info {
-                                                message: format!("  {} → checked out '{}'", dir_name, branch),
-                                            });
-                                        }
-                                        Ok(Err(e)) => {
-                                            errors.push(format!("checkout: {}", e));
-                                        }
-                                        Err(e) => {
-                                            errors.push(format!("checkout spawn error: {}", e));
-                                        }
-                                    }
-                                }
-                            }
-
-                            (dir_name, events, errors)
-                        });
-                    }
-
-                    while let Some(result) = join_set.join_next().await {
-                        let (dir_name, events, errors) = match result {
-                            Ok(v) => v,
+                        let adapter = match make_adapter(forge_name, &org, None) {
+                            Ok(a) => a,
                             Err(e) => {
-                                yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
-                                error_count += 1;
+                                errors.push(format!("{}: {}", forge_name, e));
                                 continue;
                             }
                         };
 
-                        for event in events {
-                            yield event;
-                        }
-
-                        if errors.is_empty() {
-                            success_count += 1;
-                        } else {
-                            error_count += 1;
-                            for err in &errors {
-                                yield HyperforgeEvent::Error {
-                                    message: format!("  {} error: {}", dir_name, err),
-                                };
+                        match adapter.set_default_branch(&org, &repo_name, &branch).await {
+                            Ok(_) => {
+                                events.push(HyperforgeEvent::Info {
+                                    message: format!("  {} → {} default branch set to '{}'", repo_name, forge_name, branch),
+                                });
                             }
+                            Err(e) => {
+                                errors.push(format!("{}: {}", forge_name, e));
+                            }
+                        }
+                    }
+
+                    // Optionally checkout locally (sync git op)
+                    if checkout && is_git {
+                        if dry_run {
+                            events.push(HyperforgeEvent::Info {
+                                message: format!("  {}Would checkout '{}' in {}", dry_prefix, branch, dir_name),
+                            });
+                        } else {
+                            match tokio::task::spawn_blocking({
+                                let path = path.clone();
+                                let branch = branch.clone();
+                                move || Git::checkout(&path, &branch)
+                            }).await {
+                                Ok(Ok(_)) => {
+                                    events.push(HyperforgeEvent::Info {
+                                        message: format!("  {} → checked out '{}'", dir_name, branch),
+                                    });
+                                }
+                                Ok(Err(e)) => {
+                                    errors.push(format!("checkout: {}", e));
+                                }
+                                Err(e) => {
+                                    errors.push(format!("checkout spawn error: {}", e));
+                                }
+                            }
+                        }
+                    }
+
+                    (dir_name, events, errors)
+                }).await;
+
+                for result in results {
+                    let (dir_name, events, errors) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
+                            error_count += 1;
+                            continue;
+                        }
+                    };
+
+                    for event in events {
+                        yield event;
+                    }
+
+                    if errors.is_empty() {
+                        success_count += 1;
+                    } else {
+                        error_count += 1;
+                        for err in &errors {
+                            yield HyperforgeEvent::Error {
+                                message: format!("  {} error: {}", dir_name, err),
+                            };
                         }
                     }
                 }
@@ -2019,14 +1928,9 @@ impl WorkspaceHub {
             // Determine orgs to check
             let orgs_to_check: Vec<String> = if let Some(ref workspace_path) = path {
                 let workspace_path = PathBuf::from(workspace_path);
-                let ctx = match discover_workspace(&workspace_path) {
+                let ctx = match discover_or_bail(&workspace_path) {
                     Ok(ctx) => ctx,
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Discovery failed: {}", e),
-                        };
-                        return;
-                    }
+                    Err(event) => { yield event; return; }
                 };
 
                 // If org specified, filter; otherwise use all discovered orgs
@@ -2191,14 +2095,9 @@ impl WorkspaceHub {
             let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
 
             // Discover workspace
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {
@@ -2364,14 +2263,9 @@ impl WorkspaceHub {
         stream! {
             let workspace_path = PathBuf::from(&path);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Build dep graph from all discovered repos
@@ -2545,14 +2439,9 @@ impl WorkspaceHub {
             let workspace_path = PathBuf::from(&path);
             let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Build dep graph
@@ -2698,14 +2587,9 @@ impl WorkspaceHub {
         stream! {
             let workspace_path = PathBuf::from(&path);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Filter repos by name glob if provided
@@ -2743,12 +2627,20 @@ impl WorkspaceHub {
                 ),
             };
 
-            if is_sequential {
-                for repo in &repos {
+            // Build exec inputs
+            let exec_inputs: Vec<_> = repos.iter()
+                .map(|r| (r.dir_name.clone(), r.path.clone(), command.clone()))
+                .collect();
+
+            let concurrency = if is_sequential { 1 } else { 0 }; // 0 = unbounded
+            let exec_results = crate::commands::runner::run_batch(
+                exec_inputs,
+                concurrency,
+                |(repo_name, repo_path, cmd)| async move {
                     let output = tokio::process::Command::new("sh")
                         .arg("-c")
-                        .arg(&command)
-                        .current_dir(&repo.path)
+                        .arg(&cmd)
+                        .current_dir(&repo_path)
                         .output()
                         .await;
 
@@ -2757,72 +2649,29 @@ impl WorkspaceHub {
                             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                             let exit_code = output.status.code().unwrap_or(-1);
-
-                            yield HyperforgeEvent::ExecResult {
-                                repo_name: repo.dir_name.clone(),
-                                exit_code,
-                                stdout,
-                                stderr,
-                            };
+                            (repo_name, exit_code, stdout, stderr)
                         }
                         Err(e) => {
-                            yield HyperforgeEvent::ExecResult {
-                                repo_name: repo.dir_name.clone(),
-                                exit_code: -1,
-                                stdout: String::new(),
-                                stderr: format!("Failed to execute: {}", e),
-                            };
+                            (repo_name, -1, String::new(), format!("Failed to execute: {}", e))
                         }
                     }
-                }
-            } else {
-                // Parallel execution
-                use tokio::task::JoinSet;
+                },
+            ).await;
 
-                let mut join_set = JoinSet::new();
-
-                for repo in &repos {
-                    let repo_name = repo.dir_name.clone();
-                    let repo_path = repo.path.clone();
-                    let cmd = command.clone();
-
-                    join_set.spawn(async move {
-                        let output = tokio::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(&cmd)
-                            .current_dir(&repo_path)
-                            .output()
-                            .await;
-
-                        match output {
-                            Ok(output) => {
-                                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                                let exit_code = output.status.code().unwrap_or(-1);
-                                (repo_name, exit_code, stdout, stderr)
-                            }
-                            Err(e) => {
-                                (repo_name, -1, String::new(), format!("Failed to execute: {}", e))
-                            }
-                        }
-                    });
-                }
-
-                while let Some(result) = join_set.join_next().await {
-                    match result {
-                        Ok((repo_name, exit_code, stdout, stderr)) => {
-                            yield HyperforgeEvent::ExecResult {
-                                repo_name,
-                                exit_code,
-                                stdout,
-                                stderr,
-                            };
-                        }
-                        Err(e) => {
-                            yield HyperforgeEvent::Error {
-                                message: format!("Task join error: {}", e),
-                            };
-                        }
+            for result in exec_results {
+                match result {
+                    Ok((repo_name, exit_code, stdout, stderr)) => {
+                        yield HyperforgeEvent::ExecResult {
+                            repo_name,
+                            exit_code,
+                            stdout,
+                            stderr,
+                        };
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Task error: {}", e),
+                        };
                     }
                 }
             }
@@ -2931,93 +2780,68 @@ impl WorkspaceHub {
                 }
             }
 
-            // 6. Clone in batches using JoinSet for concurrency control
+            // 6. Clone in batches using run_batch
             let mut success_count = 0usize;
             let mut failed_count = 0usize;
 
-            for chunk in to_clone.chunks(max_concurrent) {
-                use tokio::task::JoinSet;
-                let mut join_set = JoinSet::new();
+            let clone_inputs: Vec<_> = to_clone.into_iter()
+                .map(|r| (r, org.clone(), forge.clone(), workspace_path.clone()))
+                .collect();
 
-                for record in chunk {
-                    let record = record.clone();
-                    let org = org.clone();
-                    let forge_pref = forge.clone();
-                    let ws_path = workspace_path.clone();
-
-                    join_set.spawn(async move {
-                        // Pick forge to clone from
-                        let clone_forge = if let Some(ref f) = forge_pref {
-                            f.to_lowercase()
-                        } else {
-                            match record.present_on.iter().next() {
-                                Some(f) => format!("{:?}", f).to_lowercase(),
-                                None => {
-                                    return (record.name.clone(), Err("No forges in present_on".to_string()));
-                                }
+            let clone_results = crate::commands::runner::run_batch(
+                clone_inputs,
+                max_concurrent,
+                |(record, org, forge_pref, ws_path)| async move {
+                    // Pick forge to clone from
+                    let clone_forge = if let Some(ref f) = forge_pref {
+                        f.to_lowercase()
+                    } else {
+                        match record.present_on.iter().next() {
+                            Some(f) => format!("{:?}", f).to_lowercase(),
+                            None => {
+                                return (record.name.clone(), Err("No forges in present_on".to_string()));
                             }
+                        }
+                    };
+
+                    let clone_url = crate::git::build_remote_url(&clone_forge, &org, &record.name);
+                    let target = ws_path.join(&record.name);
+                    let target_str = target.display().to_string();
+
+                    // Clone
+                    if let Err(e) = crate::git::Git::clone(&clone_url, &target_str) {
+                        return (record.name.clone(), Err(format!("Clone failed: {}", e)));
+                    }
+
+                    // Materialize config + remotes from the record
+                    let opts = crate::commands::materialize::MaterializeOpts::default();
+                    if let Err(e) = crate::commands::materialize::materialize(&org, &record, &target, opts) {
+                        return (record.name.clone(), Err(format!("Cloned but materialize failed: {}", e)));
+                    }
+
+                    (record.name.clone(), Ok(()))
+                },
+            ).await;
+
+            for result in clone_results {
+                match result {
+                    Ok((name, Ok(()))) => {
+                        success_count += 1;
+                        yield HyperforgeEvent::Info {
+                            message: format!("  Cloned: {}", name),
                         };
-
-                        let clone_url = crate::git::build_remote_url(&clone_forge, &org, &record.name);
-                        let target = ws_path.join(&record.name);
-                        let target_str = target.display().to_string();
-
-                        // Clone
-                        if let Err(e) = crate::git::Git::clone(&clone_url, &target_str) {
-                            return (record.name.clone(), Err(format!("Clone failed: {}", e)));
-                        }
-
-                        // Generate .hyperforge/config.toml if missing
-                        if !crate::config::HyperforgeConfig::exists(&target) {
-                            let forges: Vec<String> = record.present_on.iter()
-                                .map(|f| format!("{:?}", f).to_lowercase())
-                                .collect();
-                            let mut config = crate::config::HyperforgeConfig::new(forges)
-                                .with_org(&org)
-                                .with_repo_name(&record.name)
-                                .with_visibility(record.visibility.clone());
-                            if let Some(ref desc) = record.description {
-                                config = config.with_description(desc);
-                            }
-                            let _ = config.save(&target);
-                        }
-
-                        // Add remotes for other forges in present_on
-                        let clone_forge_parsed = crate::config::HyperforgeConfig::parse_forge(&clone_forge);
-                        for f in &record.present_on {
-                            if Some(f.clone()) == clone_forge_parsed {
-                                continue; // Already set as "origin" by git clone
-                            }
-                            let f_str = format!("{:?}", f).to_lowercase();
-                            let remote_url = crate::git::build_remote_url(&f_str, &org, &record.name);
-                            let _ = crate::git::Git::add_remote(&target, &f_str, &remote_url);
-                        }
-
-                        (record.name.clone(), Ok(()))
-                    });
-                }
-
-                // Collect results from this batch
-                while let Some(result) = join_set.join_next().await {
-                    match result {
-                        Ok((name, Ok(()))) => {
-                            success_count += 1;
-                            yield HyperforgeEvent::Info {
-                                message: format!("  Cloned: {}", name),
-                            };
-                        }
-                        Ok((name, Err(e))) => {
-                            failed_count += 1;
-                            yield HyperforgeEvent::Error {
-                                message: format!("  Failed: {} — {}", name, e),
-                            };
-                        }
-                        Err(e) => {
-                            failed_count += 1;
-                            yield HyperforgeEvent::Error {
-                                message: format!("  Task join error: {}", e),
-                            };
-                        }
+                    }
+                    Ok((name, Err(e))) => {
+                        failed_count += 1;
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed: {} — {}", name, e),
+                        };
+                    }
+                    Err(e) => {
+                        failed_count += 1;
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Task error: {}", e),
+                        };
                     }
                 }
             }
@@ -3053,14 +2877,9 @@ impl WorkspaceHub {
         stream! {
             let workspace_path = PathBuf::from(&path);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Build dep graph
@@ -3222,14 +3041,9 @@ impl WorkspaceHub {
         stream! {
             let workspace_path = PathBuf::from(&path);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Build dep graph
@@ -3549,14 +3363,9 @@ impl WorkspaceHub {
         stream! {
             let workspace_path = PathBuf::from(&path);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             let repos: Vec<_> = if let Some(ref pattern) = filter {
@@ -3672,14 +3481,9 @@ impl WorkspaceHub {
         stream! {
             let workspace_path = PathBuf::from(&path);
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             // Report unconfigured repos (git repos without .hyperforge/config.toml)
@@ -3781,14 +3585,9 @@ impl WorkspaceHub {
             }
 
             // ── Discover source workspace ──
-            let ctx = match discover_workspace(&source_path) {
+            let ctx = match discover_or_bail(&source_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Source discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {

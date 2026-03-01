@@ -5,14 +5,17 @@ use async_trait::async_trait;
 use futures::Stream;
 use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapters::{CodebergAdapter, ForgePort, GitHubAdapter, GitLabAdapter};
 use crate::auth::YamlAuthProvider;
-use crate::commands::{init, push, status};
+use crate::commands::materialize::{materialize, MaterializeOpts};
+use crate::commands::{push, status};
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
-use crate::types::{Forge, Repo, Visibility};
+use crate::types::{Forge, Repo, RepoRecord, Visibility};
 
 /// Sub-hub for single-repo operations and registry CRUD
 #[derive(Clone)]
@@ -243,6 +246,31 @@ impl RepoHub {
                     yield HyperforgeEvent::Info {
                         message: format!("Updated repository: {}", repo.name),
                     };
+
+                    // Materialize to disk if the record has a local_path
+                    if let Ok(record) = local.get_record(&repo.name) {
+                        if let Some(ref local_path) = record.local_path {
+                            match materialize(&org, &record, local_path, MaterializeOpts::default()) {
+                                Ok(report) => {
+                                    if report.config_written {
+                                        yield HyperforgeEvent::Info {
+                                            message: "Updated on-disk config".to_string(),
+                                        };
+                                    }
+                                    for remote in &report.remotes_updated {
+                                        yield HyperforgeEvent::Info {
+                                            message: format!("Updated remote: {}", remote),
+                                        };
+                                    }
+                                }
+                                Err(e) => {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("Failed to materialize config: {}", e),
+                                    };
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
@@ -656,6 +684,36 @@ impl RepoHub {
                     yield HyperforgeEvent::Info {
                         message: format!("Local config updated: {} -> {}", old_name, new_name),
                     };
+
+                    // Materialize to disk if the renamed record has a local_path
+                    if let Ok(record) = local.get_record(&new_name) {
+                        if let Some(ref local_path) = record.local_path {
+                            match materialize(&org, &record, local_path, MaterializeOpts::default()) {
+                                Ok(report) => {
+                                    if report.config_written {
+                                        yield HyperforgeEvent::Info {
+                                            message: "Updated on-disk config with new name".to_string(),
+                                        };
+                                    }
+                                    for remote in &report.remotes_updated {
+                                        yield HyperforgeEvent::Info {
+                                            message: format!("Updated remote URL: {}", remote),
+                                        };
+                                    }
+                                    for remote in &report.remotes_added {
+                                        yield HyperforgeEvent::Info {
+                                            message: format!("Added remote: {}", remote),
+                                        };
+                                    }
+                                }
+                                Err(e) => {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("Failed to materialize config: {}", e),
+                                    };
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
@@ -1010,7 +1068,12 @@ impl RepoHub {
         no_hooks: Option<bool>,
         no_ssh_wrapper: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
         stream! {
+            let repo_path = PathBuf::from(&path);
+            let is_dry_run = dry_run.unwrap_or(false);
+
             // Parse forges
             let forge_list: Vec<String> = forges.split(',')
                 .map(|s| s.trim().to_string())
@@ -1036,73 +1099,134 @@ impl RepoHub {
                 }
             };
 
-            // Parse SSH keys
-            let mut ssh_key_pairs = Vec::new();
+            // Parse SSH keys into a HashMap
+            let mut ssh: HashMap<String, String> = HashMap::new();
             if let Some(keys_str) = ssh_keys {
                 for pair in keys_str.split(',') {
                     let parts: Vec<&str> = pair.trim().split(':').collect();
                     if parts.len() == 2 {
-                        ssh_key_pairs.push((parts[0].to_string(), parts[1].to_string()));
+                        ssh.insert(parts[0].to_string(), parts[1].to_string());
                     }
                 }
             }
 
-            // Build options
-            let mut options = init::InitOptions::new(forge_list)
-                .with_org(org)
-                .with_visibility(vis);
+            // Derive repo name from dir name or explicit param
+            let name = repo_name.unwrap_or_else(|| {
+                repo_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
 
-            if let Some(name) = repo_name {
-                options = options.with_repo_name(name);
+            // Parse forge strings into Forge enums for present_on
+            let mut present_on = HashSet::new();
+            for f in &forge_list {
+                if let Some(forge_enum) = crate::config::HyperforgeConfig::parse_forge(f) {
+                    present_on.insert(forge_enum);
+                }
             }
 
+            // Build or update a RepoRecord
+            let local = state.get_local_forge(&org).await;
+
+            let mut record = match local.get_record(&name) {
+                Ok(existing) => existing,
+                Err(_) => RepoRecord {
+                    name: name.clone(),
+                    description: None,
+                    visibility: Visibility::Public,
+                    default_branch: "main".to_string(),
+                    present_on: HashSet::new(),
+                    protected: false,
+                    managed: false,
+                    dismissed: false,
+                    deleted_from: Vec::new(),
+                    deleted_at: None,
+                    privatized_on: HashSet::new(),
+                    previous_names: Vec::new(),
+                    local_path: None,
+                    forges: Vec::new(),
+                    ssh: HashMap::new(),
+                    forge_config: HashMap::new(),
+                    ci: None,
+                },
+            };
+
+            // Set config-first fields
+            record.local_path = Some(repo_path.clone());
+            record.forges = forge_list.clone();
+            record.visibility = vis;
+            record.ssh = ssh;
+            for forge in &present_on {
+                record.present_on.insert(forge.clone());
+            }
             if let Some(desc) = description {
-                options = options.with_description(desc);
+                record.description = Some(desc);
             }
 
-            for (forge, key_path) in ssh_key_pairs {
-                options = options.with_ssh_key(forge, key_path);
+            // Check if config already exists (unless --force)
+            let config_exists = crate::config::HyperforgeConfig::exists(&repo_path);
+            if config_exists && !force.unwrap_or(false) {
+                yield HyperforgeEvent::Error {
+                    message: "Config already exists. Use --force to reinitialize.".to_string(),
+                };
+                return;
             }
 
-            if force.unwrap_or(false) {
-                options = options.force();
+            // Register in LocalForge
+            if !is_dry_run {
+                if let Err(e) = local.upsert_record(record.clone()) {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to register in LocalForge: {}", e),
+                    };
+                    return;
+                }
+
+                if let Err(e) = local.save_to_yaml().await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save repos.yaml: {}", e),
+                    };
+                    return;
+                }
+
+                yield HyperforgeEvent::Info {
+                    message: format!("Registered {} in LocalForge for org {}", name, org),
+                };
             }
 
-            if dry_run.unwrap_or(false) {
-                options = options.dry_run();
-            }
+            // Materialize config + remotes + hooks onto disk
+            let opts = MaterializeOpts {
+                config: true,
+                remotes: true,
+                hooks: !no_hooks.unwrap_or(false),
+                ssh_wrapper: !no_ssh_wrapper.unwrap_or(false),
+                dry_run: is_dry_run,
+            };
 
-            if no_hooks.unwrap_or(false) {
-                options = options.no_hooks();
-            }
-
-            if no_ssh_wrapper.unwrap_or(false) {
-                options = options.no_ssh_wrapper();
-            }
-
-            // Run init
-            let repo_path = std::path::Path::new(&path);
-            match init::init(repo_path, options) {
+            match materialize(&org, &record, &repo_path, opts) {
                 Ok(report) => {
-                    if report.dry_run {
+                    if is_dry_run {
                         yield HyperforgeEvent::Info {
                             message: "[DRY RUN] Would initialize hyperforge".to_string(),
                         };
                     }
 
-                    if report.git_initialized {
+                    if report.config_written {
                         yield HyperforgeEvent::Info {
-                            message: "Initialized git repository".to_string(),
+                            message: format!("Created config at {}", repo_path.join(".hyperforge/config.toml").display()),
                         };
                     }
 
-                    yield HyperforgeEvent::Info {
-                        message: format!("Created config at {}", repo_path.join(".hyperforge/config.toml").display()),
-                    };
-
-                    for remote in report.remotes_added {
+                    for remote in &report.remotes_added {
                         yield HyperforgeEvent::Info {
-                            message: format!("Added remote {} → {}", remote.name, remote.url),
+                            message: format!("Added remote: {}", remote),
+                        };
+                    }
+
+                    for remote in &report.remotes_updated {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Updated remote: {}", remote),
                         };
                     }
 
@@ -1112,19 +1236,13 @@ impl RepoHub {
                         };
                     }
 
-                    if report.ssh_configured {
-                        yield HyperforgeEvent::Info {
-                            message: "Configured SSH wrapper (hyperforge-ssh)".to_string(),
-                        };
-                    }
-
                     yield HyperforgeEvent::Info {
                         message: "Hyperforge initialized successfully".to_string(),
                     };
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Init failed: {}", e),
+                        message: format!("Materialize failed: {}", e),
                     };
                 }
             }
@@ -1407,60 +1525,56 @@ impl RepoHub {
                 message: "Clone successful".to_string(),
             };
 
-            // 6. Check for .hyperforge/config.toml in clone
-            let clone_path = std::path::Path::new(&target_path);
-            let has_config = crate::config::HyperforgeConfig::exists(clone_path);
+            // 6. Set local_path on the record and materialize
+            let clone_path = PathBuf::from(&target_path);
 
-            if !has_config {
-                // Generate config from RepoRecord metadata
-                let forges: Vec<String> = record.present_on.iter()
+            // Update record with local_path and ensure forges list is populated
+            let mut updated_record = record.clone();
+            updated_record.local_path = Some(clone_path.clone());
+            if updated_record.forges.is_empty() {
+                updated_record.forges = updated_record.present_on.iter()
                     .map(|f| format!("{:?}", f).to_lowercase())
                     .collect();
-
-                let mut config = crate::config::HyperforgeConfig::new(forges.clone())
-                    .with_org(&org)
-                    .with_repo_name(&name)
-                    .with_visibility(record.visibility.clone());
-
-                if let Some(ref desc) = record.description {
-                    config = config.with_description(desc);
-                }
-
-                if let Err(e) = config.save(clone_path) {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Failed to create .hyperforge/config.toml: {}", e),
-                    };
-                    // Continue anyway - clone succeeded
-                } else {
-                    yield HyperforgeEvent::Info {
-                        message: "Generated .hyperforge/config.toml from LocalForge metadata".to_string(),
-                    };
-                }
-            } else {
-                yield HyperforgeEvent::Info {
-                    message: "Found existing .hyperforge/config.toml".to_string(),
-                };
             }
 
-            // 7. Add remotes for all forges in present_on
-            for f in &record.present_on {
-                if *f == clone_forge {
-                    continue; // Already set as "origin" by git clone
-                }
-                let f_str = format!("{:?}", f).to_lowercase();
-                let remote_url = crate::git::build_remote_url(&f_str, &org, &name);
-                match crate::git::Git::add_remote(clone_path, &f_str, &remote_url) {
-                    Ok(_) => {
+            // Materialize config + remotes onto disk
+            match materialize(&org, &updated_record, &clone_path, MaterializeOpts::default()) {
+                Ok(report) => {
+                    if report.config_written {
                         yield HyperforgeEvent::Info {
-                            message: format!("Added remote {} → {}", f_str, remote_url),
+                            message: "Generated .hyperforge/config.toml from LocalForge metadata".to_string(),
                         };
                     }
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Failed to add remote {}: {}", f_str, e),
+
+                    for remote in &report.remotes_added {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Added remote: {}", remote),
+                        };
+                    }
+
+                    for remote in &report.remotes_updated {
+                        yield HyperforgeEvent::Info {
+                            message: format!("Updated remote: {}", remote),
                         };
                     }
                 }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to materialize config: {}", e),
+                    };
+                    // Continue anyway - clone succeeded
+                }
+            }
+
+            // 7. Update LocalForge with local_path
+            if let Err(e) = local.update_record(&updated_record) {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to update LocalForge record: {}", e),
+                };
+            } else if let Err(e) = local.save_to_yaml().await {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to save repos.yaml: {}", e),
+                };
             }
 
             yield HyperforgeEvent::Info {
