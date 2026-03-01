@@ -18,7 +18,7 @@ use crate::adapters::{CodebergAdapter, ForgePort, ForgeSyncState, GitHubAdapter,
 use crate::auth::YamlAuthProvider;
 use crate::commands::init::{init, InitOptions};
 use crate::commands::push::{push, PushOptions};
-use crate::commands::runner::{discover_or_bail, run_batch, run_batch_blocking};
+use crate::commands::runner::{collect_push_results, discover_or_bail, run_batch, run_batch_blocking, run_diff_batch, run_validation_gate};
 use crate::commands::workspace::{build_dep_graph, build_publish_dep_graph, repo_from_config};
 use crate::config::HyperforgeConfig;
 use crate::git::Git;
@@ -491,44 +491,18 @@ impl WorkspaceHub {
                     message: "Validation: Running containerized build check...".to_string(),
                 };
 
-                let graph = build_dep_graph(&ctx.repos);
-                let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
-                match plan {
-                    Ok(p) => {
-                        let results = crate::build_system::validate::execute_validation(&p, &ctx.root, is_dry_run);
-                        let summary = crate::build_system::validate::summarize_results(&results);
-                        yield HyperforgeEvent::ValidateSummary {
-                            total: summary.total,
-                            passed: summary.passed,
-                            failed: summary.failed,
-                            skipped: summary.skipped,
-                            duration_ms: summary.duration_ms,
-                        };
-                        if summary.failed > 0 {
-                            yield HyperforgeEvent::Error {
-                                message: format!(
-                                    "Validation failed ({}/{} steps failed) — aborting push.",
-                                    summary.failed, summary.total
-                                ),
-                            };
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Validation plan failed: {} — aborting push.", e),
-                        };
-                        return;
-                    }
+                let gate = run_validation_gate(&ctx.repos, &ctx.root, is_dry_run);
+                for event in gate.events {
+                    yield event;
+                }
+                if gate.passed == Some(false) {
+                    return;
                 }
             }
 
             yield HyperforgeEvent::Info {
                 message: format!("{}Pushing {} repos...", dry_prefix(is_dry_run), ctx.repos.len()),
             };
-
-            let mut success_count = 0usize;
-            let mut failed_count = 0usize;
 
             // Skip non-git repos
             for repo in ctx.repos.iter().filter(|r| !r.is_git_repo) {
@@ -553,40 +527,9 @@ impl WorkspaceHub {
                 (dir_name, path, result)
             }).await;
 
-            for result in push_results {
-                let (dir_name, path, push_result) = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        yield HyperforgeEvent::Error { message: e };
-                        failed_count += 1;
-                        continue;
-                    }
-                };
-
-                match push_result {
-                    Ok(report) => {
-                        for r in &report.results {
-                            yield HyperforgeEvent::RepoPush {
-                                repo_name: dir_name.clone(),
-                                path: path.display().to_string(),
-                                forge: r.forge.clone(),
-                                success: r.success,
-                                error: r.error.clone(),
-                            };
-                        }
-                        if report.all_success { success_count += 1; } else { failed_count += 1; }
-                    }
-                    Err(e) => {
-                        yield HyperforgeEvent::RepoPush {
-                            repo_name: dir_name.clone(),
-                            path: path.display().to_string(),
-                            forge: "all".to_string(),
-                            success: false,
-                            error: Some(e.to_string()),
-                        };
-                        failed_count += 1;
-                    }
-                }
+            let batch = collect_push_results(push_results);
+            for event in batch.events {
+                yield event;
             }
 
             yield HyperforgeEvent::WorkspaceSummary {
@@ -596,8 +539,8 @@ impl WorkspaceHub {
                 clean_repos: None,
                 dirty_repos: None,
                 wrong_branch_repos: None,
-                push_success: Some(success_count),
-                push_failed: Some(failed_count),
+                push_success: Some(batch.success_count),
+                push_failed: Some(batch.failed_count),
                 validation_passed: None,
             };
         }
@@ -656,23 +599,10 @@ impl WorkspaceHub {
 
             // Parallel diff: spawn per org/forge pair
             {
-                let items: Vec<_> = pairs.iter()
-                    .map(|(o, f)| (o.clone(), f.clone(), state.clone(), sync_service.clone()))
-                    .collect();
-                let results = run_batch(items, 8, |(org_name, forge_name, state, sync_service)| async move {
-                    let local = state.get_local_forge(&org_name).await;
-                    let ot = local.owner_type();
-                    let adapter = match make_adapter(&forge_name, &org_name, ot) {
-                        Ok(a) => a,
-                        Err(e) => return (org_name, forge_name, Err(e)),
-                    };
-                    let result = sync_service.diff(local, adapter, &org_name).await
-                        .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
-                    (org_name, forge_name, result)
-                }).await;
+                let results = run_diff_batch(&pairs, &state, &sync_service).await;
 
                 for result in results {
-                    let (org_name, forge_name, diff_result) = match result {
+                    let entry = match result {
                         Ok(v) => v,
                         Err(e) => {
                             yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
@@ -681,13 +611,13 @@ impl WorkspaceHub {
                     };
 
                     yield HyperforgeEvent::Info {
-                        message: format!("Computing diff for {}/{}", org_name, forge_name),
+                        message: format!("Computing diff for {}/{}", entry.org_name, entry.forge_name),
                     };
 
-                    match diff_result {
+                    match entry.diff_result {
                         Ok(diff) => {
                             yield HyperforgeEvent::SyncSummary {
-                                forge: forge_name.clone(),
+                                forge: entry.forge_name.clone(),
                                 total: diff.ops.len(),
                                 to_create: diff.to_create().len(),
                                 to_update: diff.to_update().len(),
@@ -699,7 +629,7 @@ impl WorkspaceHub {
                                 yield HyperforgeEvent::SyncOp {
                                     repo_name: op.repo.name.clone(),
                                     operation: format!("{:?}", op.op).to_lowercase(),
-                                    forge: forge_name.clone(),
+                                    forge: entry.forge_name.clone(),
                                 };
                             }
                         }
@@ -1130,23 +1060,10 @@ impl WorkspaceHub {
             let mut all_diffs: Vec<(String, String, crate::services::SyncDiff)> = Vec::new();
 
             {
-                let items: Vec<_> = pairs.iter()
-                    .map(|(o, f)| (o.clone(), f.clone(), state.clone(), sync_service.clone()))
-                    .collect();
-                let results = run_batch(items, 8, |(org_name, forge_name, state, sync_service)| async move {
-                    let local = state.get_local_forge(&org_name).await;
-                    let ot = local.owner_type();
-                    let adapter = match make_adapter(&forge_name, &org_name, ot) {
-                        Ok(a) => a,
-                        Err(e) => return (org_name, forge_name, Err(e)),
-                    };
-                    let result = sync_service.diff(local, adapter, &org_name).await
-                        .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
-                    (org_name, forge_name, result)
-                }).await;
+                let results = run_diff_batch(&pairs, &state, &sync_service).await;
 
                 for result in results {
-                    let (org_name, forge_name, diff_result) = match result {
+                    let entry = match result {
                         Ok(v) => v,
                         Err(e) => {
                             yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
@@ -1154,10 +1071,10 @@ impl WorkspaceHub {
                         }
                     };
 
-                    match diff_result {
+                    match entry.diff_result {
                         Ok(diff) => {
                             yield HyperforgeEvent::SyncSummary {
-                                forge: forge_name.clone(),
+                                forge: entry.forge_name.clone(),
                                 total: diff.ops.len(),
                                 to_create: diff.to_create().len(),
                                 to_update: diff.to_update().len(),
@@ -1170,12 +1087,12 @@ impl WorkspaceHub {
                                     message: format!(
                                         "  {} repos would be deleted on {} — skipped by sync (use 'workspace apply' to delete)",
                                         diff.to_delete().len(),
-                                        forge_name,
+                                        entry.forge_name,
                                     ),
                                 };
                             }
 
-                            all_diffs.push((org_name, forge_name, diff));
+                            all_diffs.push((entry.org_name, entry.forge_name, diff));
                         }
                         Err(e) => {
                             yield HyperforgeEvent::Error { message: e };
@@ -1540,52 +1457,19 @@ impl WorkspaceHub {
             }
 
             // ── Validation gate (if --validate) ──
-            let mut validation_passed_result: Option<bool> = None;
-            if is_validate {
+            let validation_passed_result: Option<bool> = if is_validate {
                 yield HyperforgeEvent::Info {
                     message: format!("{}Validation: Running containerized build check...", dry_prefix),
                 };
 
-                let graph = build_dep_graph(&ctx.repos);
-                let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
-                match plan {
-                    Ok(p) => {
-                        let results = crate::build_system::validate::execute_validation(&p, &ctx.root, is_dry_run);
-                        for r in &results {
-                            yield HyperforgeEvent::ValidateStep {
-                                repo_name: r.repo_name.clone(),
-                                step: r.step.clone(),
-                                status: format!("{}", r.status),
-                                duration_ms: r.duration_ms,
-                            };
-                        }
-                        let summary = crate::build_system::validate::summarize_results(&results);
-                        let passed = summary.failed == 0;
-                        validation_passed_result = Some(passed);
-                        yield HyperforgeEvent::ValidateSummary {
-                            total: summary.total,
-                            passed: summary.passed,
-                            failed: summary.failed,
-                            skipped: summary.skipped,
-                            duration_ms: summary.duration_ms,
-                        };
-                        if !passed {
-                            yield HyperforgeEvent::Error {
-                                message: format!(
-                                    "Validation failed ({}/{} steps failed) — aborting push.",
-                                    summary.failed, summary.total
-                                ),
-                            };
-                        }
-                    }
-                    Err(e) => {
-                        validation_passed_result = Some(false);
-                        yield HyperforgeEvent::Error {
-                            message: format!("Validation plan failed: {} — aborting push.", e),
-                        };
-                    }
+                let gate = run_validation_gate(&ctx.repos, &ctx.root, is_dry_run);
+                for event in gate.events {
+                    yield event;
                 }
-            }
+                gate.passed
+            } else {
+                None
+            };
 
             // ── Phase 8: Push git content ──
             let skip_push_for_validation = validation_passed_result == Some(false);
@@ -1604,66 +1488,32 @@ impl WorkspaceHub {
                     message: format!("{}Phase 8/8: Pushing {} repos...", dry_prefix, ctx.repos.len()),
                 };
 
-                let mut push_success = 0usize;
-                let mut push_failed = 0usize;
-
                 // Parallel push: spawn_blocking per repo
-                {
-                    let git_repos: Vec<_> = ctx.repos.iter().filter(|r| r.is_git_repo).cloned().collect();
-                    let items: Vec<_> = git_repos.into_iter().map(|repo| {
+                let push_inputs: Vec<_> = ctx.repos.iter()
+                    .filter(|r| r.is_git_repo)
+                    .map(|repo| {
                         let dir_name = repo.dir_name.clone();
                         let path = repo.path.clone();
                         let mut options = PushOptions::new();
                         if is_dry_run { options = options.dry_run(); }
                         (dir_name, path, options)
-                    }).collect();
+                    })
+                    .collect();
 
-                    let results = run_batch_blocking(items, 8, |(dir_name, path, options)| {
-                        let result = push(&path, options);
-                        (dir_name, path, result)
-                    }).await;
+                let push_results = run_batch_blocking(push_inputs, 8, |(dir_name, path, options)| {
+                    let result = push(&path, options);
+                    (dir_name, path, result)
+                }).await;
 
-                    for result in results {
-                        let (dir_name, path, push_result) = match result {
-                            Ok(v) => v,
-                            Err(e) => {
-                                yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
-                                push_failed += 1;
-                                continue;
-                            }
-                        };
-
-                        match push_result {
-                            Ok(report) => {
-                                for r in &report.results {
-                                    yield HyperforgeEvent::RepoPush {
-                                        repo_name: dir_name.clone(),
-                                        path: path.display().to_string(),
-                                        forge: r.forge.clone(),
-                                        success: r.success,
-                                        error: r.error.clone(),
-                                    };
-                                }
-                                if report.all_success { push_success += 1; } else { push_failed += 1; }
-                            }
-                            Err(e) => {
-                                yield HyperforgeEvent::RepoPush {
-                                    repo_name: dir_name.clone(),
-                                    path: path.display().to_string(),
-                                    forge: "all".to_string(),
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                };
-                                push_failed += 1;
-                            }
-                        }
-                    }
+                let batch = collect_push_results(push_results);
+                for event in batch.events {
+                    yield event;
                 }
 
                 yield HyperforgeEvent::Info {
                     message: format!(
                         "  {}{} pushed successfully, {} failed",
-                        dry_prefix, push_success, push_failed,
+                        dry_prefix, batch.success_count, batch.failed_count,
                     ),
                 };
             }

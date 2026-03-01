@@ -125,6 +125,182 @@ pub fn discover_or_bail(
     })
 }
 
+/// Result of a parallel diff batch across org/forge pairs.
+pub struct DiffBatchEntry {
+    pub org_name: String,
+    pub forge_name: String,
+    pub diff_result: Result<crate::services::SyncDiff, String>,
+}
+
+/// Run diffs in parallel for a set of org/forge pairs.
+///
+/// This is the shared batch diff used by both the standalone `diff` method
+/// and sync Phase 6. Callers iterate the results and yield events as needed.
+pub async fn run_diff_batch(
+    pairs: &[(String, String)],
+    state: &crate::hubs::HyperforgeState,
+    sync_service: &std::sync::Arc<crate::services::SymmetricSyncService>,
+) -> Vec<Result<DiffBatchEntry, String>> {
+    let items: Vec<(String, String, crate::hubs::HyperforgeState, std::sync::Arc<crate::services::SymmetricSyncService>)> = pairs
+        .iter()
+        .map(|(o, f)| (o.clone(), f.clone(), state.clone(), sync_service.clone()))
+        .collect();
+    run_batch(items, 8, |(org_name, forge_name, state, sync_service)| async move {
+        let local = state.get_local_forge(&org_name).await;
+        let ot = local.owner_type();
+        let adapter = match crate::hubs::workspace::make_adapter(&forge_name, &org_name, ot) {
+            Ok(a) => a,
+            Err(e) => {
+                return DiffBatchEntry {
+                    org_name,
+                    forge_name,
+                    diff_result: Err(e),
+                };
+            }
+        };
+        let result = sync_service
+            .diff(local, adapter, &org_name)
+            .await
+            .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
+        DiffBatchEntry {
+            org_name,
+            forge_name,
+            diff_result: result,
+        }
+    })
+    .await
+}
+
+/// Result of processing push batch results into events.
+pub struct PushBatchResult {
+    /// Events to yield to the caller
+    pub events: Vec<crate::hub::HyperforgeEvent>,
+    /// Number of repos where all pushes succeeded
+    pub success_count: usize,
+    /// Number of repos where at least one push failed
+    pub failed_count: usize,
+}
+
+/// Process the results of a parallel push batch into events and counts.
+///
+/// This is the shared result processing used by both `push_all` and sync Phase 8.
+pub fn collect_push_results(
+    results: Vec<Result<(String, std::path::PathBuf, crate::commands::push::PushResult<crate::commands::push::PushReport>), String>>,
+) -> PushBatchResult {
+    let mut events = Vec::new();
+    let mut success_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for result in results {
+        let (dir_name, path, push_result) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                events.push(crate::hub::HyperforgeEvent::Error { message: e });
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        match push_result {
+            Ok(report) => {
+                for r in &report.results {
+                    events.push(crate::hub::HyperforgeEvent::RepoPush {
+                        repo_name: dir_name.clone(),
+                        path: path.display().to_string(),
+                        forge: r.forge.clone(),
+                        success: r.success,
+                        error: r.error.clone(),
+                    });
+                }
+                if report.all_success {
+                    success_count += 1;
+                } else {
+                    failed_count += 1;
+                }
+            }
+            Err(e) => {
+                events.push(crate::hub::HyperforgeEvent::RepoPush {
+                    repo_name: dir_name.clone(),
+                    path: path.display().to_string(),
+                    forge: "all".to_string(),
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                failed_count += 1;
+            }
+        }
+    }
+
+    PushBatchResult {
+        events,
+        success_count,
+        failed_count,
+    }
+}
+
+/// Result of running a validation gate.
+pub struct ValidationGateResult {
+    /// Events to yield to the caller (ValidateStep, ValidateSummary, Error)
+    pub events: Vec<crate::hub::HyperforgeEvent>,
+    /// Whether validation passed (None if not run, Some(true) if passed, Some(false) if failed)
+    pub passed: Option<bool>,
+}
+
+/// Run the containerized validation gate.
+///
+/// Shared by `push_all` and sync's validation phase. Builds the dep graph,
+/// creates a validation plan, executes it, and returns events + pass/fail status.
+pub fn run_validation_gate(
+    repos: &[crate::commands::workspace::DiscoveredRepo],
+    workspace_root: &std::path::Path,
+    is_dry_run: bool,
+) -> ValidationGateResult {
+    let graph = crate::commands::workspace::build_dep_graph(repos);
+    let plan = crate::build_system::validate::build_validation_plan(&graph, &[], false);
+    match plan {
+        Ok(p) => {
+            let results =
+                crate::build_system::validate::execute_validation(&p, workspace_root, is_dry_run);
+            let mut events = Vec::new();
+            for r in &results {
+                events.push(crate::hub::HyperforgeEvent::ValidateStep {
+                    repo_name: r.repo_name.clone(),
+                    step: r.step.clone(),
+                    status: format!("{}", r.status),
+                    duration_ms: r.duration_ms,
+                });
+            }
+            let summary = crate::build_system::validate::summarize_results(&results);
+            let passed = summary.failed == 0;
+            events.push(crate::hub::HyperforgeEvent::ValidateSummary {
+                total: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                duration_ms: summary.duration_ms,
+            });
+            if !passed {
+                events.push(crate::hub::HyperforgeEvent::Error {
+                    message: format!(
+                        "Validation failed ({}/{} steps failed) — aborting push.",
+                        summary.failed, summary.total
+                    ),
+                });
+            }
+            ValidationGateResult {
+                events,
+                passed: Some(passed),
+            }
+        }
+        Err(e) => ValidationGateResult {
+            events: vec![crate::hub::HyperforgeEvent::Error {
+                message: format!("Validation plan failed: {} — aborting push.", e),
+            }],
+            passed: Some(false),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
