@@ -170,6 +170,13 @@ pub enum HyperforgeEvent {
         skipped: usize,
         duration_ms: u64,
     },
+    /// Per-repo move step result
+    RepoMove {
+        repo_name: String,
+        step: String,      // "config", "remotes", "registry", "directory"
+        success: bool,
+        message: String,
+    },
     /// Result of workspace exec command for a single repo
     ExecResult {
         repo_name: String,

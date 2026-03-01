@@ -20,7 +20,7 @@ use crate::commands::init::{init, InitOptions};
 use crate::commands::push::{push, PushOptions};
 use crate::commands::workspace::{discover_workspace, repo_from_config};
 use crate::config::HyperforgeConfig;
-use crate::git::Git;
+use crate::git::{build_remote_url, parse_remote_url, Git};
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::services::SyncOp;
@@ -3755,6 +3755,390 @@ impl WorkspaceHub {
                     ),
                 };
             }
+        }
+    }
+
+    /// Move repos from one workspace to another
+    #[plexus_macros::hub_method(
+        description = "Move repos from one workspace to another, updating config, git remotes, and LocalForge registry",
+        params(
+            path = "Source workspace directory",
+            target_path = "Target workspace directory",
+            target_org = "Target organization name",
+            repo = "Repo names to move (repeat for multiple: --repo a --repo b)",
+            dry_run = "Preview without making changes (optional, default: false)"
+        )
+    )]
+    pub async fn move_repos(
+        &self,
+        path: String,
+        target_path: String,
+        target_org: String,
+        repo: Vec<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+            let source_path = PathBuf::from(&path);
+            let dest_path = PathBuf::from(&target_path);
+
+            // ── Validate paths ──
+            if !source_path.is_dir() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Source path does not exist: {}", source_path.display()),
+                };
+                return;
+            }
+            if !dest_path.is_dir() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Target path does not exist: {}", dest_path.display()),
+                };
+                return;
+            }
+            if repo.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: "No repos specified. Use --repo <name> (repeatable).".to_string(),
+                };
+                return;
+            }
+
+            // ── Discover source workspace ──
+            let ctx = match discover_workspace(&source_path) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Source discovery failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Moving {} repo(s) from {} to {} (target org: {})",
+                    dry_prefix, repo.len(), source_path.display(), dest_path.display(), target_org,
+                ),
+            };
+
+            // Build a lookup of discovered repos by dir_name
+            let mut discovered_map: std::collections::HashMap<String, &crate::commands::workspace::DiscoveredRepo> =
+                std::collections::HashMap::new();
+            for dr in &ctx.repos {
+                discovered_map.insert(dr.dir_name.clone(), dr);
+            }
+            // Also check unconfigured repos (they have no DiscoveredRepo, just paths)
+            let unconfigured_names: HashSet<String> = ctx.unconfigured_repos.iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                .collect();
+
+            // Validate all requested repos exist in source
+            for name in &repo {
+                if !discovered_map.contains_key(name.as_str()) && !unconfigured_names.contains(name.as_str()) {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' not found in source workspace {}", name, source_path.display()),
+                    };
+                    return;
+                }
+                // Check target doesn't already have it
+                let target_repo_path = dest_path.join(name);
+                if target_repo_path.exists() {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Target already contains '{}': {}", name, target_repo_path.display()),
+                    };
+                    return;
+                }
+            }
+
+            let mut moved = 0usize;
+            let mut failed = 0usize;
+
+            for name in &repo {
+                let repo_path = source_path.join(name);
+                let target_repo_path = dest_path.join(name);
+                let discovered = discovered_map.get(name.as_str()).copied();
+                let source_org = discovered.and_then(|d| d.org().map(|s| s.to_string()));
+
+                yield HyperforgeEvent::Info {
+                    message: format!("{}── {} ──", dry_prefix, name),
+                };
+
+                // ── Step 1: Update .hyperforge/config.toml ──
+                let config_result = if let Some(dr) = discovered {
+                    if let Some(ref config) = dr.config {
+                        let mut new_config = config.clone();
+                        new_config.org = Some(target_org.clone());
+                        if !is_dry_run {
+                            match new_config.save(&repo_path) {
+                                Ok(_) => Ok("updated org"),
+                                Err(e) => Err(format!("Failed to save config: {}", e)),
+                            }
+                        } else {
+                            Ok("would update org")
+                        }
+                    } else {
+                        // No config — create minimal one
+                        let new_config = HyperforgeConfig {
+                            repo_name: Some(name.clone()),
+                            org: Some(target_org.clone()),
+                            forges: vec![],
+                            visibility: Visibility::Private,
+                            description: None,
+                            ssh: Default::default(),
+                            forge_config: Default::default(),
+                            default_branch: None,
+                            ci: None,
+                        };
+                        if !is_dry_run {
+                            // Ensure .hyperforge dir exists
+                            let hf_dir = repo_path.join(".hyperforge");
+                            if let Err(e) = std::fs::create_dir_all(&hf_dir) {
+                                Err(format!("Failed to create .hyperforge dir: {}", e))
+                            } else {
+                                match new_config.save(&repo_path) {
+                                    Ok(_) => Ok("created config"),
+                                    Err(e) => Err(format!("Failed to save config: {}", e)),
+                                }
+                            }
+                        } else {
+                            Ok("would create config")
+                        }
+                    }
+                } else {
+                    // Unconfigured repo — create minimal config
+                    let new_config = HyperforgeConfig {
+                        repo_name: Some(name.clone()),
+                        org: Some(target_org.clone()),
+                        forges: vec![],
+                        visibility: Visibility::Private,
+                        description: None,
+                        ssh: Default::default(),
+                        forge_config: Default::default(),
+                        default_branch: None,
+                        ci: None,
+                    };
+                    if !is_dry_run {
+                        let hf_dir = repo_path.join(".hyperforge");
+                        if let Err(e) = std::fs::create_dir_all(&hf_dir) {
+                            Err(format!("Failed to create .hyperforge dir: {}", e))
+                        } else {
+                            match new_config.save(&repo_path) {
+                                Ok(_) => Ok("created config"),
+                                Err(e) => Err(format!("Failed to save config: {}", e)),
+                            }
+                        }
+                    } else {
+                        Ok("would create config")
+                    }
+                };
+
+                match config_result {
+                    Ok(action) => {
+                        yield HyperforgeEvent::RepoMove {
+                            repo_name: name.clone(),
+                            step: "config".to_string(),
+                            success: true,
+                            message: format!("{}{}", dry_prefix, action),
+                        };
+                    }
+                    Err(e) => {
+                        yield HyperforgeEvent::RepoMove {
+                            repo_name: name.clone(),
+                            step: "config".to_string(),
+                            success: false,
+                            message: e,
+                        };
+                        failed += 1;
+                        continue;
+                    }
+                }
+
+                // ── Step 2: Update git remotes ──
+                if repo_path.join(".git").exists() {
+                    match Git::list_remotes(&repo_path) {
+                        Ok(remotes) => {
+                            for remote in &remotes {
+                                if let Some((forge, remote_org, remote_repo)) = parse_remote_url(&remote.fetch_url) {
+                                    if Some(remote_org.as_str()) == source_org.as_deref() || source_org.is_none() {
+                                        let new_url = build_remote_url(&forge, &target_org, &remote_repo);
+                                        if !is_dry_run {
+                                            match Git::set_remote_url(&repo_path, &remote.name, &new_url) {
+                                                Ok(_) => {
+                                                    yield HyperforgeEvent::RepoMove {
+                                                        repo_name: name.clone(),
+                                                        step: "remotes".to_string(),
+                                                        success: true,
+                                                        message: format!("{}updated {} → {}", dry_prefix, remote.name, new_url),
+                                                    };
+                                                }
+                                                Err(e) => {
+                                                    yield HyperforgeEvent::RepoMove {
+                                                        repo_name: name.clone(),
+                                                        step: "remotes".to_string(),
+                                                        success: false,
+                                                        message: format!("Failed to update remote {}: {}", remote.name, e),
+                                                    };
+                                                }
+                                            }
+                                        } else {
+                                            yield HyperforgeEvent::RepoMove {
+                                                repo_name: name.clone(),
+                                                step: "remotes".to_string(),
+                                                success: true,
+                                                message: format!("{}would update {} → {}", dry_prefix, remote.name, new_url),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::RepoMove {
+                                repo_name: name.clone(),
+                                step: "remotes".to_string(),
+                                success: false,
+                                message: format!("Failed to list remotes: {}", e),
+                            };
+                        }
+                    }
+                }
+
+                // ── Step 3: Update LocalForge registry ──
+                if let Some(ref src_org) = source_org {
+                    let source_forge = state.get_local_forge(src_org).await;
+                    let target_forge = state.get_local_forge(&target_org).await;
+
+                    // Copy record to target, then remove from source
+                    let record_opt = source_forge.all_records().ok().and_then(|records| {
+                        records.into_iter().find(|r| r.name == *name)
+                    });
+
+                    if let Some(record) = record_opt {
+                        if !is_dry_run {
+                            if let Err(e) = target_forge.upsert_record(record) {
+                                yield HyperforgeEvent::RepoMove {
+                                    repo_name: name.clone(),
+                                    step: "registry".to_string(),
+                                    success: false,
+                                    message: format!("Failed to add to target LocalForge: {}", e),
+                                };
+                            } else if let Err(e) = source_forge.remove_repo(name) {
+                                yield HyperforgeEvent::RepoMove {
+                                    repo_name: name.clone(),
+                                    step: "registry".to_string(),
+                                    success: false,
+                                    message: format!("Added to target but failed to remove from source LocalForge: {}", e),
+                                };
+                            } else {
+                                yield HyperforgeEvent::RepoMove {
+                                    repo_name: name.clone(),
+                                    step: "registry".to_string(),
+                                    success: true,
+                                    message: format!("{}moved {} → {} in LocalForge", dry_prefix, src_org, target_org),
+                                };
+                            }
+                        } else {
+                            yield HyperforgeEvent::RepoMove {
+                                repo_name: name.clone(),
+                                step: "registry".to_string(),
+                                success: true,
+                                message: format!("{}would move {} → {} in LocalForge", dry_prefix, src_org, target_org),
+                            };
+                        }
+                    } else {
+                        yield HyperforgeEvent::RepoMove {
+                            repo_name: name.clone(),
+                            step: "registry".to_string(),
+                            success: true,
+                            message: format!("{}not in source LocalForge, skipping registry", dry_prefix),
+                        };
+                    }
+                } else {
+                    yield HyperforgeEvent::RepoMove {
+                        repo_name: name.clone(),
+                        step: "registry".to_string(),
+                        success: true,
+                        message: format!("{}no source org, skipping registry", dry_prefix),
+                    };
+                }
+
+                // ── Step 4: Move directory ──
+                if !is_dry_run {
+                    match tokio::fs::rename(&repo_path, &target_repo_path).await {
+                        Ok(_) => {
+                            yield HyperforgeEvent::RepoMove {
+                                repo_name: name.clone(),
+                                step: "directory".to_string(),
+                                success: true,
+                                message: format!("moved to {}", target_repo_path.display()),
+                            };
+                            moved += 1;
+                        }
+                        Err(e) => {
+                            yield HyperforgeEvent::RepoMove {
+                                repo_name: name.clone(),
+                                step: "directory".to_string(),
+                                success: false,
+                                message: format!("Failed to move directory: {}", e),
+                            };
+                            failed += 1;
+                        }
+                    }
+                } else {
+                    yield HyperforgeEvent::RepoMove {
+                        repo_name: name.clone(),
+                        step: "directory".to_string(),
+                        success: true,
+                        message: format!("{}would move to {}", dry_prefix, target_repo_path.display()),
+                    };
+                    moved += 1;
+                }
+            }
+
+            // ── Save LocalForge state ──
+            if !is_dry_run {
+                // Collect all source orgs that were affected
+                let source_orgs: HashSet<String> = repo.iter()
+                    .filter_map(|name| discovered_map.get(name.as_str()).and_then(|d| d.org().map(|s| s.to_string())))
+                    .collect();
+
+                for src_org in &source_orgs {
+                    let forge = state.get_local_forge(src_org).await;
+                    if let Err(e) = forge.save_to_yaml().await {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save source LocalForge for {}: {}", src_org, e),
+                        };
+                    }
+                }
+                let target_forge = state.get_local_forge(&target_org).await;
+                if let Err(e) = target_forge.save_to_yaml().await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save target LocalForge for {}: {}", target_org, e),
+                    };
+                }
+            }
+
+            // ── Summary ──
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Move complete: {} moved, {} failed (of {} requested)",
+                    dry_prefix, moved, failed, repo.len(),
+                ),
+            };
+
+            yield HyperforgeEvent::WorkspaceSummary {
+                total_repos: repo.len(),
+                configured_repos: moved,
+                unconfigured_repos: failed,
+                clean_repos: None,
+                dirty_repos: None,
+                wrong_branch_repos: None,
+                push_success: None,
+                push_failed: None,
+                validation_passed: None,
+            };
         }
     }
 }
