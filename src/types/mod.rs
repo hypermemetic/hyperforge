@@ -1,5 +1,6 @@
 //! Core types for hyperforge
 
+pub mod config;
 pub mod repo;
 
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,9 @@ use serde::{Deserialize, Serialize};
 // Re-export Repo types
 pub use repo::Repo;
 pub use repo::RepoRecord;
+
+// Re-export config types
+pub use config::{CiConfig, ForgeConfig};
 
 /// Supported git forges
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

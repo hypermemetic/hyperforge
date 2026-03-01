@@ -18,6 +18,7 @@ use crate::adapters::{CodebergAdapter, ForgePort, ForgeSyncState, GitHubAdapter,
 use crate::auth::YamlAuthProvider;
 use crate::commands::init::{init, InitOptions};
 use crate::commands::push::{push, PushOptions};
+use crate::commands::runner::{discover_or_bail, run_batch_blocking};
 use crate::commands::workspace::{discover_workspace, repo_from_config};
 use crate::config::HyperforgeConfig;
 use crate::git::{build_remote_url, parse_remote_url, Git};
@@ -398,14 +399,9 @@ impl WorkspaceHub {
             let workspace_path = PathBuf::from(&path);
             let expected_branch = branch.unwrap_or_else(|| "main".to_string());
 
-            let ctx = match discover_workspace(&workspace_path) {
+            let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
-                Err(e) => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Discovery failed: {}", e),
-                    };
-                    return;
-                }
+                Err(event) => { yield event; return; }
             };
 
             yield HyperforgeEvent::Info {
@@ -420,77 +416,56 @@ impl WorkspaceHub {
             let mut dirty_count = 0usize;
             let mut wrong_branch_count = 0usize;
 
-            // Parallel check: spawn_blocking per repo for git ops
-            {
-                use tokio::task::JoinSet;
-                let concurrency = 8usize;
-                let git_repos: Vec<_> = ctx.repos.iter().filter(|r| r.is_git_repo).cloned().collect();
+            // Collect inputs for run_batch_blocking
+            let check_inputs: Vec<_> = ctx.repos.iter()
+                .filter(|r| r.is_git_repo)
+                .map(|r| (r.dir_name.clone(), r.path.clone(), expected_branch.clone()))
+                .collect();
 
-                for chunk in git_repos.chunks(concurrency) {
-                    let mut join_set = JoinSet::new();
+            let results = run_batch_blocking(check_inputs, 8, |(dir_name, path, exp_branch)| {
+                let current_branch = Git::current_branch(&path)
+                    .map_err(|e| format!("{}: failed to get branch: {}", dir_name, e));
+                let status = Git::repo_status(&path)
+                    .map_err(|e| format!("{}: failed to get status: {}", dir_name, e));
+                let ssh_cmd = Git::config_get(&path, "core.sshCommand").ok().flatten();
+                let hf_org = Git::config_get(&path, "hyperforge.org").ok().flatten();
+                (dir_name, path, exp_branch, current_branch, status, ssh_cmd, hf_org)
+            }).await;
 
-                    for repo in chunk {
-                        let dir_name = repo.dir_name.clone();
-                        let path = repo.path.clone();
-                        let exp_branch = expected_branch.clone();
+            for result in results {
+                let (dir_name, path, exp_branch, current_branch, status, ssh_cmd, hf_org) = match result {
+                    Ok(v) => v,
+                    Err(e) => { yield HyperforgeEvent::Error { message: e }; continue; }
+                };
 
-                        join_set.spawn(tokio::task::spawn_blocking(move || {
-                            let current_branch = Git::current_branch(&path)
-                                .map_err(|e| format!("{}: failed to get branch: {}", dir_name, e));
-                            let status = Git::repo_status(&path)
-                                .map_err(|e| format!("{}: failed to get status: {}", dir_name, e));
-                            let ssh_cmd = Git::config_get(&path, "core.sshCommand").ok().flatten();
-                            let hf_org = Git::config_get(&path, "hyperforge.org").ok().flatten();
-                            (dir_name, path, exp_branch, current_branch, status, ssh_cmd, hf_org)
-                        }));
-                    }
+                let current_branch = match current_branch {
+                    Ok(b) => b,
+                    Err(e) => { yield HyperforgeEvent::Error { message: e }; continue; }
+                };
+                let status = match status {
+                    Ok(s) => s,
+                    Err(e) => { yield HyperforgeEvent::Error { message: e }; continue; }
+                };
 
-                    while let Some(result) = join_set.join_next().await {
-                        let inner = match result {
-                            Ok(inner) => inner,
-                            Err(e) => {
-                                yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
-                                continue;
-                            }
-                        };
-                        let (dir_name, path, exp_branch, current_branch, status, ssh_cmd, hf_org) = match inner {
-                            Ok(v) => v,
-                            Err(e) => {
-                                yield HyperforgeEvent::Error { message: format!("Spawn error: {}", e) };
-                                continue;
-                            }
-                        };
+                let is_clean = !status.has_changes && !status.has_staged && !status.has_untracked;
+                let on_correct_branch = current_branch == exp_branch;
 
-                        let current_branch = match current_branch {
-                            Ok(b) => b,
-                            Err(e) => { yield HyperforgeEvent::Error { message: e }; continue; }
-                        };
-                        let status = match status {
-                            Ok(s) => s,
-                            Err(e) => { yield HyperforgeEvent::Error { message: e }; continue; }
-                        };
+                if is_clean { clean_count += 1; } else { dirty_count += 1; }
+                if !on_correct_branch { wrong_branch_count += 1; }
 
-                        let is_clean = !status.has_changes && !status.has_staged && !status.has_untracked;
-                        let on_correct_branch = current_branch == exp_branch;
+                yield HyperforgeEvent::RepoCheck {
+                    repo_name: dir_name.clone(),
+                    path: path.display().to_string(),
+                    branch: current_branch,
+                    expected_branch: exp_branch,
+                    is_clean,
+                    on_correct_branch,
+                };
 
-                        if is_clean { clean_count += 1; } else { dirty_count += 1; }
-                        if !on_correct_branch { wrong_branch_count += 1; }
-
-                        yield HyperforgeEvent::RepoCheck {
-                            repo_name: dir_name.clone(),
-                            path: path.display().to_string(),
-                            branch: current_branch,
-                            expected_branch: exp_branch,
-                            is_clean,
-                            on_correct_branch,
-                        };
-
-                        if ssh_cmd.as_deref() == Some("hyperforge-ssh") && hf_org.is_none() {
-                            yield HyperforgeEvent::Error {
-                                message: format!("{}: SSH misconfigured — hyperforge-ssh set but hyperforge.org missing", dir_name),
-                            };
-                        }
-                    }
+                if ssh_cmd.as_deref() == Some("hyperforge-ssh") && hf_org.is_none() {
+                    yield HyperforgeEvent::Error {
+                        message: format!("{}: SSH misconfigured — hyperforge-ssh set but hyperforge.org missing", dir_name),
+                    };
                 }
             }
 

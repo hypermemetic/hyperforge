@@ -1,9 +1,10 @@
 //! Repository types for LFORGE2
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use super::{Forge, Visibility};
+use super::{CiConfig, ForgeConfig, Forge, Visibility};
 
 pub(crate) fn is_false(b: &bool) -> bool {
     !*b
@@ -129,6 +130,28 @@ pub struct RepoRecord {
     pub privatized_on: HashSet<Forge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_names: Vec<String>,
+
+    // ── Config-first fields (absorbed from HyperforgeConfig) ──
+
+    /// Local clone path on disk (if known)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<PathBuf>,
+
+    /// Which forges this repo should sync to (e.g. ["github", "codeberg"])
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forges: Vec<String>,
+
+    /// SSH key paths per forge
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ssh: HashMap<String, String>,
+
+    /// Per-forge config overrides (org override, remote name override)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub forge_config: HashMap<String, ForgeConfig>,
+
+    /// CI/validation configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiConfig>,
 }
 
 fn default_branch() -> String {
@@ -156,6 +179,43 @@ impl RepoRecord {
             deleted_at: None,
             privatized_on: HashSet::new(),
             previous_names: Vec::new(),
+            local_path: None,
+            forges: Vec::new(),
+            ssh: HashMap::new(),
+            forge_config: HashMap::new(),
+            ci: None,
+        }
+    }
+
+    /// Absorb fields from a per-repo HyperforgeConfig into this record.
+    ///
+    /// Only fills in fields that are currently empty/None in the record,
+    /// preserving any existing values (LocalForge wins over per-repo config).
+    pub fn merge_from_config(&mut self, config: &crate::config::HyperforgeConfig) {
+        if self.forges.is_empty() {
+            self.forges = config.forges.clone();
+        }
+        if self.ssh.is_empty() {
+            self.ssh = config.ssh.clone();
+        }
+        if self.forge_config.is_empty() {
+            self.forge_config = config.forge_config.iter()
+                .map(|(k, v)| (k.clone(), ForgeConfig {
+                    org: v.org.clone(),
+                    remote: v.remote.clone(),
+                }))
+                .collect();
+        }
+        if self.ci.is_none() {
+            self.ci = config.ci.clone();
+        }
+        if self.default_branch == "main" {
+            if let Some(ref branch) = config.default_branch {
+                self.default_branch = branch.clone();
+            }
+        }
+        if self.description.is_none() {
+            self.description = config.description.clone();
         }
     }
 

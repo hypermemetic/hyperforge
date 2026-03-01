@@ -757,6 +757,11 @@ mod tests {
             deleted_at: None,
             privatized_on: std::collections::HashSet::new(),
             previous_names: Vec::new(),
+            local_path: None,
+            forges: Vec::new(),
+            ssh: std::collections::HashMap::new(),
+            forge_config: std::collections::HashMap::new(),
+            ci: None,
         };
         forge.upsert_record(record).unwrap();
 
