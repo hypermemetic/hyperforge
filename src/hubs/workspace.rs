@@ -21,7 +21,7 @@ use crate::commands::push::{push, PushOptions};
 use crate::commands::runner::{discover_or_bail, run_batch, run_batch_blocking};
 use crate::commands::workspace::repo_from_config;
 use crate::config::HyperforgeConfig;
-use crate::git::{build_remote_url, parse_remote_url, Git};
+use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::services::SyncOp;
@@ -950,12 +950,14 @@ impl WorkspaceHub {
                             }
                         }
                         already_registered += 1;
-                        // Mark as managed even if already registered
+                        // Mark as managed + merge config-first fields from per-repo config
                         if let Ok(mut record) = local.get_record(&repo.name) {
-                            if !record.managed {
-                                record.managed = true;
-                                let _ = local.update_record(&record);
+                            record.managed = true;
+                            record.local_path = Some(discovered.path.clone());
+                            if let Some(ref config) = discovered.config {
+                                record.merge_from_config(config);
                             }
+                            let _ = local.update_record(&record);
                         }
                         continue;
                     }
@@ -976,9 +978,13 @@ impl WorkspaceHub {
                     continue;
                 }
 
-                // Mark newly registered repos as managed
+                // Mark newly registered repos as managed + merge config-first fields
                 if let Ok(mut record) = local.get_record(&repo.name) {
                     record.managed = true;
+                    record.local_path = Some(discovered.path.clone());
+                    if let Some(ref config) = discovered.config {
+                        record.merge_from_config(config);
+                    }
                     let _ = local.update_record(&record);
                 }
 
@@ -3639,143 +3645,72 @@ impl WorkspaceHub {
                     message: format!("{}── {} ──", dry_prefix, name),
                 };
 
-                // ── Step 1: Update .hyperforge/config.toml ──
-                let config_result = if let Some(dr) = discovered {
-                    if let Some(ref config) = dr.config {
-                        let mut new_config = config.clone();
-                        new_config.org = Some(target_org.clone());
-                        if !is_dry_run {
-                            match new_config.save(&repo_path) {
-                                Ok(_) => Ok("updated org"),
-                                Err(e) => Err(format!("Failed to save config: {}", e)),
-                            }
-                        } else {
-                            Ok("would update org")
-                        }
-                    } else {
-                        // No config — create minimal one
-                        let new_config = HyperforgeConfig {
-                            repo_name: Some(name.clone()),
-                            org: Some(target_org.clone()),
-                            forges: vec![],
-                            visibility: Visibility::Private,
-                            description: None,
-                            ssh: Default::default(),
-                            forge_config: Default::default(),
-                            default_branch: None,
-                            ci: None,
-                        };
-                        if !is_dry_run {
-                            // Ensure .hyperforge dir exists
-                            let hf_dir = repo_path.join(".hyperforge");
-                            if let Err(e) = std::fs::create_dir_all(&hf_dir) {
-                                Err(format!("Failed to create .hyperforge dir: {}", e))
-                            } else {
-                                match new_config.save(&repo_path) {
-                                    Ok(_) => Ok("created config"),
-                                    Err(e) => Err(format!("Failed to save config: {}", e)),
-                                }
-                            }
-                        } else {
-                            Ok("would create config")
-                        }
-                    }
+                // ── Step 1+2: Materialize config + remotes ──
+                // Build a RepoRecord for the target org, then materialize
+                let mut record = if let Some(ref src_org) = source_org {
+                    let source_forge = state.get_local_forge(src_org).await;
+                    source_forge.get_record(name).unwrap_or_else(|_| {
+                        crate::types::RepoRecord::from_repo(
+                            &crate::types::Repo::new(name.clone(), crate::types::Forge::GitHub),
+                        )
+                    })
                 } else {
-                    // Unconfigured repo — create minimal config
-                    let new_config = HyperforgeConfig {
-                        repo_name: Some(name.clone()),
-                        org: Some(target_org.clone()),
-                        forges: vec![],
-                        visibility: Visibility::Private,
-                        description: None,
-                        ssh: Default::default(),
-                        forge_config: Default::default(),
-                        default_branch: None,
-                        ci: None,
-                    };
-                    if !is_dry_run {
-                        let hf_dir = repo_path.join(".hyperforge");
-                        if let Err(e) = std::fs::create_dir_all(&hf_dir) {
-                            Err(format!("Failed to create .hyperforge dir: {}", e))
-                        } else {
-                            match new_config.save(&repo_path) {
-                                Ok(_) => Ok("created config"),
-                                Err(e) => Err(format!("Failed to save config: {}", e)),
-                            }
-                        }
-                    } else {
-                        Ok("would create config")
-                    }
+                    crate::types::RepoRecord::from_repo(
+                        &crate::types::Repo::new(name.clone(), crate::types::Forge::GitHub),
+                    )
                 };
 
-                match config_result {
-                    Ok(action) => {
+                // Absorb per-repo config if available
+                if let Some(dr) = discovered {
+                    if let Some(ref config) = dr.config {
+                        record.merge_from_config(config);
+                    }
+                }
+                record.local_path = Some(repo_path.clone());
+
+                let materialize_opts = crate::commands::materialize::MaterializeOpts {
+                    config: true,
+                    remotes: true,
+                    hooks: false,
+                    ssh_wrapper: false,
+                    dry_run: is_dry_run,
+                };
+
+                match crate::commands::materialize::materialize(&target_org, &record, &repo_path, materialize_opts) {
+                    Ok(report) => {
+                        let action = if report.config_written { "updated config" } else { "config unchanged" };
                         yield HyperforgeEvent::RepoMove {
                             repo_name: name.clone(),
                             step: "config".to_string(),
                             success: true,
                             message: format!("{}{}", dry_prefix, action),
                         };
+                        for remote in &report.remotes_updated {
+                            yield HyperforgeEvent::RepoMove {
+                                repo_name: name.clone(),
+                                step: "remotes".to_string(),
+                                success: true,
+                                message: format!("{}updated remote: {}", dry_prefix, remote),
+                            };
+                        }
+                        for remote in &report.remotes_added {
+                            yield HyperforgeEvent::RepoMove {
+                                repo_name: name.clone(),
+                                step: "remotes".to_string(),
+                                success: true,
+                                message: format!("{}added remote: {}", dry_prefix, remote),
+                            };
+                        }
                     }
                     Err(e) => {
                         yield HyperforgeEvent::RepoMove {
                             repo_name: name.clone(),
                             step: "config".to_string(),
                             success: false,
-                            message: e,
+                            message: format!("Materialize failed: {}", e),
                         };
                         failed += 1;
                         continue;
-                    }
-                }
-
-                // ── Step 2: Update git remotes ──
-                if repo_path.join(".git").exists() {
-                    match Git::list_remotes(&repo_path) {
-                        Ok(remotes) => {
-                            for remote in &remotes {
-                                if let Some((forge, remote_org, remote_repo)) = parse_remote_url(&remote.fetch_url) {
-                                    if Some(remote_org.as_str()) == source_org.as_deref() || source_org.is_none() {
-                                        let new_url = build_remote_url(&forge, &target_org, &remote_repo);
-                                        if !is_dry_run {
-                                            match Git::set_remote_url(&repo_path, &remote.name, &new_url) {
-                                                Ok(_) => {
-                                                    yield HyperforgeEvent::RepoMove {
-                                                        repo_name: name.clone(),
-                                                        step: "remotes".to_string(),
-                                                        success: true,
-                                                        message: format!("{}updated {} → {}", dry_prefix, remote.name, new_url),
-                                                    };
-                                                }
-                                                Err(e) => {
-                                                    yield HyperforgeEvent::RepoMove {
-                                                        repo_name: name.clone(),
-                                                        step: "remotes".to_string(),
-                                                        success: false,
-                                                        message: format!("Failed to update remote {}: {}", remote.name, e),
-                                                    };
-                                                }
-                                            }
-                                        } else {
-                                            yield HyperforgeEvent::RepoMove {
-                                                repo_name: name.clone(),
-                                                step: "remotes".to_string(),
-                                                success: true,
-                                                message: format!("{}would update {} → {}", dry_prefix, remote.name, new_url),
-                                            };
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield HyperforgeEvent::RepoMove {
-                                repo_name: name.clone(),
-                                step: "remotes".to_string(),
-                                success: false,
-                                message: format!("Failed to list remotes: {}", e),
-                            };
-                        }
                     }
                 }
 
