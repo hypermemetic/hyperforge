@@ -17,8 +17,8 @@ use std::collections::HashMap;
 
 use crate::adapters::{ForgePort, ForgeSyncState};
 use crate::config::HyperforgeConfig;
-use crate::hubs::workspace::make_adapter;
-use crate::hubs::{HyperforgeState, RepoHub, WorkspaceHub};
+use crate::hubs::utils::make_adapter;
+use crate::hubs::{BuildHub, HyperforgeState, RepoHub, WorkspaceHub};
 use crate::types::repo::RepoRecord;
 use crate::types::Forge;
 
@@ -53,6 +53,8 @@ pub enum PackageStatus {
     Unpublished,
     /// Local version == published version but needs bump (code changed)
     Stale,
+    /// Version matches but code changed since publish tag
+    Drifted,
 }
 
 /// Action taken or planned during publish
@@ -192,6 +194,9 @@ pub enum HyperforgeEvent {
         published_version: Option<String>,
         registry: PackageRegistry,
         status: PackageStatus,
+        /// Files that differ between local and published artifact.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changed_files: Option<Vec<String>>,
     },
     /// Per-package publish step result
     PublishStep {
@@ -455,10 +460,12 @@ impl HyperforgeHub {
     pub fn plugin_children(&self) -> Vec<ChildSummary> {
         let repo = RepoHub::new(self.state.clone());
         let workspace = WorkspaceHub::new(self.state.clone());
+        let build = BuildHub::new();
 
         vec![
             child_summary(&repo),
             child_summary(&workspace),
+            child_summary(&build),
         ]
     }
 }
@@ -488,6 +495,7 @@ impl ChildRouter for HyperforgeHub {
         match name {
             "repo" => Some(Box::new(RepoHub::new(self.state.clone()))),
             "workspace" => Some(Box::new(WorkspaceHub::new(self.state.clone()))),
+            "build" => Some(Box::new(BuildHub::new())),
             _ => None,
         }
     }

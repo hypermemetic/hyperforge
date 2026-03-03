@@ -2,7 +2,9 @@
 //!
 //! Each sub-hub is a leaf plugin under the root `hyperforge` hub.
 
+pub mod build;
 pub mod repo;
+pub mod utils;
 pub mod workspace;
 
 use std::collections::HashMap;
@@ -12,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use crate::adapters::LocalForge;
 use crate::services::SymmetricSyncService;
 
+pub use build::BuildHub;
 pub use repo::RepoHub;
 pub use workspace::WorkspaceHub;
 

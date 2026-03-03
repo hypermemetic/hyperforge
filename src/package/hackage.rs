@@ -1,13 +1,15 @@
 //! Hackage registry client.
 //!
 //! Queries Hackage API for published versions and shells out to
-//! `cabal upload --publish` for publishing. Fetches auth token from
-//! cabal's `password-command` config or `HACKAGE_TOKEN` env var.
+//! `cabal upload --publish` for publishing. Drift detection downloads
+//! the published tarball and compares its SHA256 against a local
+//! `cabal sdist` build.
 
-use super::{PublishResult, PublishedVersion, RegistryClient};
+use super::{DriftResult, PublishResult, PublishedVersion, RegistryClient};
 use crate::build_system::BuildSystemKind;
 use crate::hub::PackageRegistry;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Hackage registry client
@@ -219,6 +221,119 @@ impl RegistryClient for HackageClient {
             version,
             success,
             error,
+        })
+    }
+
+    async fn detect_drift(
+        &self,
+        path: &Path,
+        name: &str,
+        version: &str,
+    ) -> anyhow::Result<DriftResult> {
+        // Step 1: Download published tarball from Hackage
+        let url = format!(
+            "https://hackage.haskell.org/package/{name}-{version}/{name}-{version}.tar.gz",
+        );
+
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Ok(DriftResult::Unknown);
+        }
+        let published_bytes = resp.bytes().await?;
+        let published_hash = format!("{:x}", Sha256::digest(&published_bytes));
+
+        // Step 2: Build local source distribution
+        let output = tokio::process::Command::new("cabal")
+            .args(["sdist", "--ignore-project"])
+            .current_dir(path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Ok(DriftResult::Unknown);
+        }
+
+        // Find the local tarball path (last .tar.gz line in stdout)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let tarball_path = match stdout.lines().rev().find(|l| l.ends_with(".tar.gz")) {
+            Some(p) => p.trim().to_string(),
+            None => return Ok(DriftResult::Unknown),
+        };
+
+        // Step 3: Hash the local tarball
+        let local_bytes = match tokio::fs::read(&tarball_path).await {
+            Ok(b) => b,
+            Err(_) => return Ok(DriftResult::Unknown),
+        };
+        let local_hash = format!("{:x}", Sha256::digest(&local_bytes));
+
+        // Step 4: If identical, done
+        if local_hash == published_hash {
+            return Ok(DriftResult::Identical);
+        }
+
+        // Step 5: Extract both and diff to find changed files
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "hyperforge-drift-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let local_dir = tmp_dir.join("local");
+        let published_dir = tmp_dir.join("published");
+
+        let changed_files = async {
+            tokio::fs::create_dir_all(&local_dir).await?;
+            tokio::fs::create_dir_all(&published_dir).await?;
+
+            let published_tar = tmp_dir.join("published.tar.gz");
+            tokio::fs::write(&published_tar, &published_bytes).await?;
+
+            tokio::process::Command::new("tar")
+                .args(["xzf", &tarball_path])
+                .current_dir(&local_dir)
+                .output()
+                .await?;
+            tokio::process::Command::new("tar")
+                .args(["xzf", &published_tar.display().to_string()])
+                .current_dir(&published_dir)
+                .output()
+                .await?;
+
+            let pkg_dir = format!("{}-{}", name, version);
+            let output = tokio::process::Command::new("diff")
+                .args([
+                    "-rq",
+                    &local_dir.join(&pkg_dir).display().to_string(),
+                    &published_dir.join(&pkg_dir).display().to_string(),
+                ])
+                .output()
+                .await?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let prefix = format!("{}/", pkg_dir);
+            let files: Vec<String> = stdout
+                .lines()
+                .filter_map(|line| {
+                    if line.starts_with("Files ") && line.ends_with(" differ") {
+                        let after_files = line.trim_start_matches("Files ").trim();
+                        let local_path = after_files.split(" and ").next()?;
+                        let pos = local_path.find(&prefix)?;
+                        Some(local_path[pos + prefix.len()..].to_string())
+                    } else if line.starts_with("Only in") {
+                        Some(line.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            Ok::<Vec<String>, anyhow::Error>(files)
+        }
+        .await;
+
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+
+        Ok(DriftResult::Drifted {
+            changed_files: changed_files.unwrap_or_default(),
         })
     }
 }

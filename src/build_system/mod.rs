@@ -132,6 +132,20 @@ pub fn package_version(path: &Path, kind: &BuildSystemKind) -> Option<String> {
     }
 }
 
+/// List files that would be included in a published package.
+///
+/// Delegates to the build system's native file-listing command.
+/// Returns `None` if the build system doesn't support this (callers
+/// should fall back to directory-scoped diff).
+pub fn publishable_files(path: &Path, kind: &BuildSystemKind) -> Option<Vec<String>> {
+    match kind {
+        BuildSystemKind::Cargo => cargo::cargo_publishable_files(path),
+        BuildSystemKind::Cabal => cabal::cabal_publishable_files(path),
+        BuildSystemKind::Node => node::node_publishable_files(path),
+        BuildSystemKind::Unknown => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

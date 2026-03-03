@@ -564,6 +564,76 @@ impl Git {
         Ok(())
     }
 
+    /// Check if a tag exists in the repo.
+    pub fn tag_exists(path: &Path, tag: &str) -> bool {
+        Command::new("git")
+            .args(["rev-parse", "--verify", &format!("refs/tags/{}", tag)])
+            .current_dir(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Count commits since a tag.
+    /// Returns 0 if tag is at HEAD. Errors if tag doesn't exist.
+    pub fn commits_since_tag(path: &Path, tag: &str) -> GitResult<usize> {
+        let output = Command::new("git")
+            .args(["rev-list", &format!("{}..HEAD", tag), "--count"])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| GitError::ParseError {
+                message: format!("failed to parse commit count: {}", e),
+            })
+    }
+
+    /// Count commits since a tag that touch any of the given files.
+    ///
+    /// More precise than `commits_since_tag` — only counts commits where
+    /// at least one of the specified paths was modified.
+    pub fn commits_touching_paths_since_tag(
+        path: &Path,
+        tag: &str,
+        files: &[String],
+    ) -> GitResult<usize> {
+        let mut args = vec![
+            "rev-list".to_string(),
+            "--count".to_string(),
+            format!("{}..HEAD", tag),
+            "--".to_string(),
+        ];
+        args.extend(files.iter().cloned());
+
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| GitError::ParseError {
+                message: format!("failed to parse commit count: {}", e),
+            })
+    }
+
     /// Create an annotated or lightweight tag
     pub fn tag(path: &Path, name: &str, message: Option<&str>) -> GitResult<()> {
         Self::ensure_repo(path)?;

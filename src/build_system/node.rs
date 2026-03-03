@@ -73,6 +73,14 @@ pub fn parse_node_deps(path: &Path) -> Vec<DepRef> {
     deps
 }
 
+/// List files that would be included in a published package.
+///
+/// Node/npm does not have registry support in hyperforge yet, so this
+/// returns `None`. Callers should fall back to directory-scoped diff.
+pub fn node_publishable_files(_path: &Path) -> Option<Vec<String>> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

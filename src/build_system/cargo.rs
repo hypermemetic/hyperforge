@@ -1,6 +1,7 @@
 //! Cargo (Rust) build system detection and manifest parsing
 
 use std::path::Path;
+use std::process::Command;
 
 use super::DepRef;
 
@@ -63,6 +64,31 @@ pub fn parse_cargo_deps(path: &Path) -> Vec<DepRef> {
     }
 
     deps
+}
+
+/// List files that would be included in a published crate.
+///
+/// Shells out to `cargo package --list` and parses the output.
+/// Returns `None` if the command fails (e.g., not a publishable crate).
+pub fn cargo_publishable_files(path: &Path) -> Option<Vec<String>> {
+    let output = Command::new("cargo")
+        .args(["package", "--list", "--allow-dirty"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if files.is_empty() { None } else { Some(files) }
 }
 
 fn parse_dep_table(table: &toml::map::Map<String, toml::Value>, is_dev: bool) -> Vec<DepRef> {

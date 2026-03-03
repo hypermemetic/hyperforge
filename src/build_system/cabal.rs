@@ -149,6 +149,14 @@ fn parse_dep_list(
     }
 }
 
+/// List files that would be included in a published package.
+///
+/// Cabal does not have a lightweight file-listing command, so this
+/// returns `None`. Callers should fall back to directory-scoped diff.
+pub fn cabal_publishable_files(_path: &Path) -> Option<Vec<String>> {
+    None
+}
+
 /// Split a cabal dependency into name and version constraint
 fn split_cabal_dep(dep: &str) -> (&str, Option<String>) {
     // Find first version constraint operator

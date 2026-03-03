@@ -148,7 +148,7 @@ pub async fn run_diff_batch(
     run_batch(items, 8, |(org_name, forge_name, state, sync_service)| async move {
         let local = state.get_local_forge(&org_name).await;
         let ot = local.owner_type();
-        let adapter = match crate::hubs::workspace::make_adapter(&forge_name, &org_name, ot) {
+        let adapter = match crate::hubs::utils::make_adapter(&forge_name, &org_name, ot) {
             Ok(a) => a,
             Err(e) => {
                 return DiffBatchEntry {

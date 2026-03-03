@@ -27,6 +27,23 @@ pub struct PublishResult {
     pub error: Option<String>,
 }
 
+/// Result of a drift detection check.
+///
+/// Each registry implements detection using the most reliable mechanism
+/// available (checksum comparison, tarball diff, etc.). Callers don't
+/// need to know the method — just the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriftResult {
+    /// Package content is identical to what's published.
+    Identical,
+    /// Package content differs from what's published.
+    /// `changed_files` lists the files that differ (may be empty if
+    /// the registry detected drift but couldn't enumerate files).
+    Drifted { changed_files: Vec<String> },
+    /// Could not determine (registry doesn't support comparison).
+    Unknown,
+}
+
 /// Unified interface for package registry operations
 #[async_trait]
 pub trait RegistryClient: Send + Sync {
@@ -47,6 +64,22 @@ pub trait RegistryClient: Send + Sync {
         name: &str,
         dry_run: bool,
     ) -> anyhow::Result<PublishResult>;
+
+    /// Detect whether local package content differs from what's published.
+    ///
+    /// Each registry uses the most reliable mechanism available:
+    /// - crates.io: SHA256 checksum comparison (cargo package vs registry)
+    /// - Hackage: tarball hash comparison (cabal sdist vs published)
+    ///
+    /// Default returns `Unknown` for registries that haven't implemented this.
+    async fn detect_drift(
+        &self,
+        _path: &Path,
+        _name: &str,
+        _version: &str,
+    ) -> anyhow::Result<DriftResult> {
+        Ok(DriftResult::Unknown)
+    }
 }
 
 /// Get the appropriate registry client for a build system kind.
