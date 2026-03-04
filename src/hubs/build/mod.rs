@@ -4,6 +4,7 @@
 //! on the filesystem via workspace discovery.
 
 pub mod execution;
+pub mod gitignore;
 pub mod manifest;
 pub mod packaging;
 
@@ -184,6 +185,26 @@ impl BuildHub {
         image: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         execution::validate(path, test, dry_run, image)
+    }
+
+    /// Ensure sane .gitignore patterns across all workspace repos
+    #[plexus_macros::hub_method(
+        description = "Add missing .gitignore patterns across all workspace repos. Includes OS, editor, build artifact, and build-system-specific patterns. Idempotent — only adds what's missing.",
+        params(
+            path = "Path to workspace directory",
+            patterns = "Extra patterns to add beyond defaults (optional)",
+            filter = "Glob pattern to filter repos by name (optional)",
+            dry_run = "Preview without writing files (optional, default: false)"
+        )
+    )]
+    pub async fn gitignore_sync(
+        &self,
+        path: String,
+        patterns: Option<Vec<String>>,
+        filter: Option<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        gitignore::gitignore_sync(path, patterns, filter, dry_run)
     }
 }
 

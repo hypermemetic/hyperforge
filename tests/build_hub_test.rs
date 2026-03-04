@@ -100,6 +100,7 @@ fn build_hub_has_correct_methods() {
         "bump",
         "exec",
         "validate",
+        "gitignore_sync",
         "schema",
     ]
     .into_iter()
