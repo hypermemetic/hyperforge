@@ -78,6 +78,57 @@ pub struct RepoStatus {
     pub has_untracked: bool,
 }
 
+/// Maximum number of retries for transient push errors
+const PUSH_MAX_RETRIES: u32 = 3;
+
+/// Base delay between retries (doubles each attempt)
+const PUSH_RETRY_BASE_MS: u64 = 1000;
+
+/// Check if a git push error message indicates a transient network/SSH failure
+/// that may succeed on retry.
+fn is_transient_push_error(msg: &str) -> bool {
+    let msg_lower = msg.to_lowercase();
+    msg_lower.contains("connection reset by peer")
+        || msg_lower.contains("connection timed out")
+        || msg_lower.contains("connection refused")
+        || msg_lower.contains("broken pipe")
+        || msg_lower.contains("kex_exchange_identification")
+        || msg_lower.contains("ssh_msg_disconnect")
+        || msg_lower.contains("could not read from remote repository")
+        || msg_lower.contains("the remote end hung up unexpectedly")
+        || msg_lower.contains("ssl_error_syscall")
+        || msg_lower.contains("network is unreachable")
+}
+
+/// Run a git push command with retry logic for transient failures.
+/// Retries up to PUSH_MAX_RETRIES times with exponential backoff.
+fn push_with_retry<F>(mut attempt: F) -> GitResult<()>
+where
+    F: FnMut() -> GitResult<()>,
+{
+    let mut last_err = None;
+
+    for retry in 0..=PUSH_MAX_RETRIES {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if retry < PUSH_MAX_RETRIES && is_transient_push_error(&msg) {
+                    let delay = std::time::Duration::from_millis(
+                        PUSH_RETRY_BASE_MS * 2u64.pow(retry),
+                    );
+                    std::thread::sleep(delay);
+                    last_err = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap())
+}
+
 /// Git operations helper
 pub struct Git;
 
@@ -342,45 +393,57 @@ impl Git {
         })
     }
 
-    /// Push to a remote
+    /// Push to a remote (retries transient SSH/network failures)
     pub fn push(path: &Path, remote: &str, branch: Option<&str>) -> GitResult<()> {
         Self::ensure_repo(path)?;
 
-        let mut args = vec!["push", remote];
-        if let Some(b) = branch {
-            args.push(b);
-        }
+        let path = path.to_path_buf();
+        let remote = remote.to_string();
+        let branch = branch.map(|b| b.to_string());
 
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(path)
-            .output()?;
+        push_with_retry(move || {
+            let mut args = vec!["push".to_string(), remote.clone()];
+            if let Some(ref b) = branch {
+                args.push(b.clone());
+            }
 
-        if !output.status.success() {
-            return Err(GitError::CommandFailed {
-                message: command_error_message(&output),
-            });
-        }
+            let output = Command::new("git")
+                .args(&args)
+                .current_dir(&path)
+                .output()?;
 
-        Ok(())
+            if !output.status.success() {
+                return Err(GitError::CommandFailed {
+                    message: command_error_message(&output),
+                });
+            }
+
+            Ok(())
+        })
     }
 
-    /// Push with upstream tracking
+    /// Push with upstream tracking (retries transient SSH/network failures)
     pub fn push_set_upstream(path: &Path, remote: &str, branch: &str) -> GitResult<()> {
         Self::ensure_repo(path)?;
 
-        let output = Command::new("git")
-            .args(["push", "-u", remote, branch])
-            .current_dir(path)
-            .output()?;
+        let path = path.to_path_buf();
+        let remote = remote.to_string();
+        let branch = branch.to_string();
 
-        if !output.status.success() {
-            return Err(GitError::CommandFailed {
-                message: command_error_message(&output),
-            });
-        }
+        push_with_retry(move || {
+            let output = Command::new("git")
+                .args(["push", "-u", &remote, &branch])
+                .current_dir(&path)
+                .output()?;
 
-        Ok(())
+            if !output.status.success() {
+                return Err(GitError::CommandFailed {
+                    message: command_error_message(&output),
+                });
+            }
+
+            Ok(())
+        })
     }
 
     /// Pull from a remote
@@ -775,6 +838,28 @@ impl Git {
             .collect();
         num_str.parse().ok()
     }
+}
+
+/// Force push with retry logic for transient SSH/network failures.
+pub fn force_push_with_retry(path: &Path, remote: &str, branch: &str) -> GitResult<()> {
+    let path = path.to_path_buf();
+    let remote = remote.to_string();
+    let branch = branch.to_string();
+
+    push_with_retry(move || {
+        let output = Command::new("git")
+            .args(["push", "--force", &remote, &branch])
+            .current_dir(&path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                message: command_error_message(&output),
+            });
+        }
+
+        Ok(())
+    })
 }
 
 /// Build a git remote URL for a forge

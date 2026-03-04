@@ -6,7 +6,8 @@
 //! 1. Reads the hyperforge config
 //! 2. Pushes the current branch to all configured forges
 //! 3. Reports success/failure for each forge
-//! 4. Stops on first failure (can't easily resolve push failures automatically)
+//! 4. Retries transient SSH/network failures automatically
+//! 5. Continues to remaining forges even if one fails
 
 use std::path::Path;
 use thiserror::Error;
@@ -174,9 +175,9 @@ impl PushReport {
 /// PushReport with results for each forge
 ///
 /// # Behavior
-/// Stops on first failure - if pushing to one forge fails, subsequent forges
-/// are not attempted. This is intentional as push failures often indicate
-/// issues that need manual resolution.
+/// Attempts all configured forges even if one fails. This ensures that a
+/// transient failure on one forge (e.g. SSH connection reset on Codeberg)
+/// doesn't prevent pushing to other forges (e.g. GitHub).
 pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
     // Check if hyperforge config exists
     if !HyperforgeConfig::exists(path) {
@@ -217,10 +218,15 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
 
         // Check if remote exists
         if Git::get_remote(path, &remote_name).is_err() {
-            return Err(PushError::RemoteNotFound {
+            results.push(ForgePushResult {
                 forge: forge.clone(),
-                remote: remote_name,
+                remote_name: remote_name.clone(),
+                branch: branch.clone(),
+                success: false,
+                error: Some(format!("Remote not found: {}", remote_name)),
+                dry_run: options.dry_run,
             });
+            continue;
         }
 
         let mut result = ForgePushResult {
@@ -233,23 +239,12 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
         };
 
         if !options.dry_run {
-            // Perform the actual push
+            // Perform the actual push (Git::push already retries transient errors)
             let push_result = if options.set_upstream {
                 Git::push_set_upstream(path, &remote_name, &branch)
             } else if options.force {
-                // Force push - use git command directly
-                let output = std::process::Command::new("git")
-                    .args(["push", "--force", &remote_name, &branch])
-                    .current_dir(path)
-                    .output();
-
-                match output {
-                    Ok(out) if out.status.success() => Ok(()),
-                    Ok(out) => Err(GitError::CommandFailed {
-                        message: crate::git::command_error_message(&out),
-                    }),
-                    Err(e) => Err(GitError::IoError(e)),
-                }
+                // Force push — also use retry via push_with_retry pattern
+                crate::git::force_push_with_retry(path, &remote_name, &branch)
             } else {
                 Git::push(path, &remote_name, Some(&branch))
             };
@@ -261,15 +256,6 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
                 Err(e) => {
                     result.success = false;
                     result.error = Some(e.to_string());
-
-                    // Add result and stop - don't try remaining forges
-                    results.push(result);
-
-                    return Err(PushError::PushFailed {
-                        forge: forge.clone(),
-                        remote: remote_name,
-                        message: e.to_string(),
-                    });
                 }
             }
         }
@@ -277,12 +263,13 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
         results.push(result);
     }
 
-    // If we reach here, all pushes succeeded (we return early on error)
+    let all_success = results.iter().all(|r| r.success);
+
     Ok(PushReport {
         repo_path: path.display().to_string(),
         branch,
         results,
-        all_success: true,
+        all_success,
         dry_run: options.dry_run,
     })
 }
@@ -446,8 +433,11 @@ mod tests {
         // Remove the remote
         Git::remove_remote(temp.path(), "origin").unwrap();
 
-        // Push should fail with remote not found
-        let result = push(temp.path(), PushOptions::new());
-        assert!(matches!(result, Err(PushError::RemoteNotFound { .. })));
+        // Push returns Ok but with failed result for the missing remote
+        let report = push(temp.path(), PushOptions::new()).unwrap();
+        assert!(!report.all_success);
+        assert_eq!(report.results.len(), 1);
+        assert!(!report.results[0].success);
+        assert!(report.results[0].error.as_ref().unwrap().contains("Remote not found"));
     }
 }
