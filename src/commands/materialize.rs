@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::config::HyperforgeConfig;
+use crate::config::{HyperforgeConfig, OrgConfig};
 use crate::git::{build_remote_url, Git};
 use crate::types::RepoRecord;
 
@@ -45,6 +45,10 @@ pub struct MaterializeReport {
     pub remotes_updated: Vec<String>,
     /// Whether hooks were installed
     pub hooks_installed: bool,
+    /// Whether SSH wrapper was configured
+    pub ssh_configured: bool,
+    /// Warnings emitted during materialization
+    pub warnings: Vec<String>,
 }
 
 /// Project a `RepoRecord` onto disk at the given path.
@@ -63,6 +67,8 @@ pub fn materialize(
         remotes_added: Vec::new(),
         remotes_updated: Vec::new(),
         hooks_installed: false,
+        ssh_configured: false,
+        warnings: Vec::new(),
     };
 
     // ── Build config from record (needed for both writing and remote naming) ──
@@ -163,15 +169,36 @@ pub fn materialize(
         report.hooks_installed = installed;
     }
 
+    // ── Step 4: SSH wrapper ─────────────────────────────────────────────
+
     if opts.ssh_wrapper {
-        // SSH wrapper configuration: set core.sshCommand per forge's SSH key.
-        // We pick the first SSH key declared (since git only supports one
-        // core.sshCommand per repo).  For multi-key setups users should use
-        // ~/.ssh/config instead.
-        if let Some((_forge, key_path)) = record.ssh.iter().next() {
-            if !opts.dry_run {
-                Git::configure_ssh(repo_path, key_path)
-                    .map_err(|e| format!("failed to configure SSH wrapper: {}", e))?;
+        // Resolve SSH key: per-repo first, then org-level defaults
+        let ssh_key = record.ssh.iter().next().map(|(_f, k)| k.clone()).or_else(|| {
+            let config_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+                .join("hyperforge");
+            let org_config = OrgConfig::load(&config_dir, org);
+            // Pick the first org-level key that matches one of our forges
+            record.forges.iter()
+                .find_map(|f| org_config.ssh_key_for_forge(f).map(|k| k.to_string()))
+        });
+
+        match ssh_key {
+            Some(key_path) => {
+                if !opts.dry_run {
+                    Git::configure_ssh(repo_path, &key_path)
+                        .map_err(|e| format!("failed to configure SSH wrapper: {}", e))?;
+                }
+                report.ssh_configured = true;
+            }
+            None => {
+                report.warnings.push(
+                    "No SSH keys configured (per-repo or org-level). \
+                     Pushes will use your default SSH agent keys. \
+                     Set org defaults with: synapse lforge hyperforge config set_ssh_key"
+                        .to_string(),
+                );
             }
         }
     }

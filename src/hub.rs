@@ -16,7 +16,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 
 use crate::adapters::{ForgePort, ForgeSyncState};
-use crate::config::HyperforgeConfig;
+use crate::config::{HyperforgeConfig, OrgConfig};
 use crate::hubs::utils::make_adapter;
 use crate::hubs::{BuildHub, HyperforgeState, RepoHub, WorkspaceHub};
 use crate::types::repo::RepoRecord;
@@ -452,6 +452,112 @@ impl HyperforgeHub {
                 yield HyperforgeEvent::Info {
                     message: "Dry run — no changes written to disk.".to_string(),
                 };
+            }
+        }
+    }
+
+    /// Show org-level configuration (SSH keys, defaults)
+    #[plexus_macros::hub_method(
+        description = "Show org-level configuration including SSH key defaults",
+        params(
+            org = "Organization name"
+        )
+    )]
+    pub async fn config_show(
+        &self,
+        org: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let org_config = OrgConfig::load(&config_dir, &org);
+            let config_path = OrgConfig::config_path(&config_dir, &org);
+
+            if org_config.ssh.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "No org config for '{}'. Expected at: {}",
+                        org,
+                        config_path.display()
+                    ),
+                };
+                yield HyperforgeEvent::Info {
+                    message: "Set SSH keys with: synapse lforge hyperforge config_set_ssh_key --org <org> --forge <forge> --key <path>".to_string(),
+                };
+            } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("Org config for '{}' ({})", org, config_path.display()),
+                };
+                yield HyperforgeEvent::Info {
+                    message: "SSH keys:".to_string(),
+                };
+                for (forge, key_path) in &org_config.ssh {
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {}: {}", forge, key_path),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Set an org-level default SSH key for a forge
+    #[plexus_macros::hub_method(
+        description = "Set or update an org-level default SSH key for a forge",
+        params(
+            org = "Organization name",
+            forge = "Forge name (github, codeberg, gitlab)",
+            key = "Path to SSH private key (e.g. ~/.ssh/id_ed25519)"
+        )
+    )]
+    pub async fn config_set_ssh_key(
+        &self,
+        org: String,
+        forge: String,
+        key: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            // Validate forge name
+            if HyperforgeConfig::parse_forge(&forge).is_none() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                };
+                return;
+            }
+
+            // Expand ~ in key path for validation
+            let expanded = if key.starts_with("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(&key[2..]))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&key))
+            } else {
+                std::path::PathBuf::from(&key)
+            };
+
+            if !expanded.exists() {
+                yield HyperforgeEvent::Error {
+                    message: format!("SSH key not found: {} (expanded: {})", key, expanded.display()),
+                };
+                return;
+            }
+
+            let mut org_config = OrgConfig::load(&config_dir, &org);
+            org_config.ssh.insert(forge.clone(), key.clone());
+
+            match org_config.save(&config_dir, &org) {
+                Ok(()) => {
+                    let config_path = OrgConfig::config_path(&config_dir, &org);
+                    yield HyperforgeEvent::Info {
+                        message: format!("Set SSH key for {} on org '{}': {}", forge, org, key),
+                    };
+                    yield HyperforgeEvent::Info {
+                        message: format!("Saved to {}", config_path.display()),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save org config: {}", e),
+                    };
+                }
             }
         }
     }

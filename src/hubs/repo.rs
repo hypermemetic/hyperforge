@@ -1112,6 +1112,18 @@ impl RepoHub {
                         };
                     }
 
+                    if report.ssh_configured {
+                        yield HyperforgeEvent::Info {
+                            message: "Configured SSH wrapper".to_string(),
+                        };
+                    }
+
+                    for warning in &report.warnings {
+                        yield HyperforgeEvent::Info {
+                            message: format!("⚠ {}", warning),
+                        };
+                    }
+
                     yield HyperforgeEvent::Info {
                         message: "Hyperforge initialized successfully".to_string(),
                     };

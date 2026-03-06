@@ -1,7 +1,12 @@
 //! Configuration management for hyperforge
 //!
 //! This module handles `.hyperforge/config.toml` files which store
-//! per-repository forge configuration.
+//! per-repository forge configuration, and org-level config at
+//! `~/.config/hyperforge/orgs/{org}.toml`.
+
+pub mod org;
+
+pub use org::OrgConfig;
 
 use crate::types::{Forge, Visibility};
 use serde::{Deserialize, Serialize};
