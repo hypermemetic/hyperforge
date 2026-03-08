@@ -123,6 +123,7 @@ impl CodebergAdapter {
             mirrors: Vec::new(),
             protected: cb_repo.archived,
             staged_for_deletion: false,
+            default_branch: cb_repo.default_branch,
         }
     }
 

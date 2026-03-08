@@ -36,6 +36,10 @@ pub struct Repo {
     /// Whether this repo is staged for deletion by `workspace reflect`
     #[serde(default, skip_serializing_if = "is_false")]
     pub staged_for_deletion: bool,
+
+    /// Default branch as reported by the forge (e.g. "main", "master")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
 }
 
 impl Repo {
@@ -49,6 +53,7 @@ impl Repo {
             mirrors: Vec::new(),
             protected: false,
             staged_for_deletion: false,
+            default_branch: None,
         }
     }
 
@@ -230,6 +235,7 @@ impl RepoRecord {
         if let Some(ref desc) = self.description {
             repo = repo.with_description(desc);
         }
+        repo.default_branch = Some(self.default_branch.clone());
         if self.dismissed {
             repo.staged_for_deletion = true;
         }

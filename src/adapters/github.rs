@@ -124,6 +124,7 @@ impl GitHubAdapter {
             mirrors: Vec::new(),
             protected: gh_repo.archived,
             staged_for_deletion: false,
+            default_branch: gh_repo.default_branch,
         }
     }
 

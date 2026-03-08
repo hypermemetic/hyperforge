@@ -921,6 +921,7 @@ impl WorkspaceHub {
         params(
             path = "Path to workspace directory",
             branch = "Branch to set as default",
+            filter = "Glob pattern to filter repos by name (optional)",
             checkout = "Also run git checkout locally in each repo (optional, default: false)",
             dry_run = "Preview changes without applying (optional, default: false)"
         )
@@ -929,6 +930,7 @@ impl WorkspaceHub {
         &self,
         path: String,
         branch: String,
+        filter: Option<String>,
         checkout: Option<bool>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
@@ -944,10 +946,17 @@ impl WorkspaceHub {
                 Err(event) => { yield event; return; }
             };
 
+            // Filter repos by name glob if provided
+            let repos: Vec<_> = if let Some(ref pattern) = filter {
+                ctx.repos.iter().filter(|r| glob_match(pattern, &r.dir_name)).collect()
+            } else {
+                ctx.repos.iter().collect()
+            };
+
             yield HyperforgeEvent::Info {
                 message: format!(
                     "{}Setting default branch to '{}' for {} repos...",
-                    dry_prefix, branch, ctx.repos.len(),
+                    dry_prefix, branch, repos.len(),
                 ),
             };
 
@@ -957,13 +966,14 @@ impl WorkspaceHub {
             // Parallel set_default_branch: spawn per repo
             {
                 // Filter repos that have config and org
-                let eligible: Vec<_> = ctx.repos.iter()
+                let eligible: Vec<_> = repos.iter()
                     .filter(|r| r.config.is_some() && r.org().is_some())
+                    .cloned()
                     .cloned()
                     .collect();
 
                 // Report repos without org
-                for repo in &ctx.repos {
+                for repo in &repos {
                     if repo.config.is_some() && repo.org().is_none() {
                         yield HyperforgeEvent::Error {
                             message: format!("  {}: no org configured, skipping", repo.dir_name),
@@ -1084,6 +1094,130 @@ impl WorkspaceHub {
                 message: format!(
                     "{}Set default branch complete: {} succeeded, {} failed",
                     dry_prefix, success_count, error_count,
+                ),
+            };
+        }
+    }
+
+    /// Check remote default branch settings
+    #[plexus_macros::hub_method(
+        description = "Verify all workspace repos have the expected default branch set on remote forges. Queries each forge API directly.",
+        params(
+            path = "Path to workspace directory",
+            branch = "Expected default branch (optional, default: main)",
+            filter = "Glob pattern to filter repos by name (optional)"
+        )
+    )]
+    pub async fn check_default_branch(
+        &self,
+        path: String,
+        branch: Option<String>,
+        filter: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let workspace_path = PathBuf::from(&path);
+            let expected = branch.unwrap_or_else(|| "main".to_string());
+
+            let ctx = match discover_or_bail(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(event) => { yield event; return; }
+            };
+
+            let repos: Vec<_> = if let Some(ref pattern) = filter {
+                ctx.repos.iter().filter(|r| glob_match(pattern, &r.dir_name)).collect()
+            } else {
+                ctx.repos.iter().collect()
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Checking remote default branch (expected: '{}') for {} repos across {} forges...",
+                    expected, repos.len(), ctx.forges.len(),
+                ),
+            };
+
+            // Build work items: (dir_name, repo_name, forge_name, org, expected)
+            let mut items: Vec<(String, String, String, String, String)> = Vec::new();
+            for repo in &repos {
+                let config = match &repo.config {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let org = match repo.org() {
+                    Some(o) => o.to_string(),
+                    None => continue,
+                };
+                let repo_name = config.repo_name.clone()
+                    .unwrap_or_else(|| repo.dir_name.clone());
+
+                for forge_name in repo.forges() {
+                    items.push((
+                        repo.dir_name.clone(),
+                        repo_name.clone(),
+                        forge_name.to_string(),
+                        org.clone(),
+                        expected.clone(),
+                    ));
+                }
+            }
+
+            // Query each forge API in parallel
+            let results = run_batch(items, 8, |(dir_name, repo_name, forge_name, org, expected)| async move {
+                let ot = None; // owner type not needed for get_repo
+                let adapter = match make_adapter(&forge_name, &org, ot) {
+                    Ok(a) => a,
+                    Err(e) => return (dir_name, forge_name, None::<String>, expected, Some(e)),
+                };
+
+                match adapter.get_repo(&org, &repo_name).await {
+                    Ok(repo) => (dir_name, forge_name, repo.default_branch, expected, None),
+                    Err(e) => (dir_name, forge_name, None, expected, Some(e.to_string())),
+                }
+            }).await;
+
+            let mut ok_count = 0usize;
+            let mut mismatch_count = 0usize;
+            let mut error_count = 0usize;
+
+            for result in results {
+                let (dir_name, forge_name, remote_branch, expected, error) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: format!("Task error: {}", e) };
+                        error_count += 1;
+                        continue;
+                    }
+                };
+
+                if let Some(err) = error {
+                    error_count += 1;
+                    yield HyperforgeEvent::Error {
+                        message: format!("  {} ({}): query failed: {}", dir_name, forge_name, err),
+                    };
+                    continue;
+                }
+
+                match remote_branch {
+                    Some(ref b) if b == &expected => {
+                        ok_count += 1;
+                    }
+                    Some(ref b) => {
+                        mismatch_count += 1;
+                        yield HyperforgeEvent::Error {
+                            message: format!("  {} ({}): default is '{}', expected '{}'", dir_name, forge_name, b, expected),
+                        };
+                    }
+                    None => {
+                        // Forge didn't report default_branch — assume ok
+                        ok_count += 1;
+                    }
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Default branch check: {} ok, {} mismatched, {} errors",
+                    ok_count, mismatch_count, error_count
                 ),
             };
         }

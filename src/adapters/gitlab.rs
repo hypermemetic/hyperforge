@@ -160,6 +160,7 @@ impl GitLabAdapter {
             mirrors: Vec::new(),
             protected: gl_project.archived,
             staged_for_deletion: false,
+            default_branch: gl_project.default_branch,
         }
     }
 
