@@ -79,6 +79,10 @@ impl DepGraph {
         for (from_idx, deps) in all_deps {
             for dep in deps {
                 if let Some(&to_idx) = name_to_idx.get(&dep.name) {
+                    // Skip self-edges (e.g. cabal exe depending on its own lib)
+                    if to_idx == *from_idx {
+                        continue;
+                    }
                     edges.push(DepEdge {
                         from: *from_idx,
                         to: to_idx,

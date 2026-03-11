@@ -5,6 +5,7 @@
 
 pub mod execution;
 pub mod gitignore;
+pub mod local_run;
 pub mod manifest;
 pub mod packaging;
 
@@ -88,15 +89,17 @@ impl BuildHub {
         description = "Show local vs published versions for workspace packages",
         params(
             path = "Path to workspace root directory",
-            filter = "Glob pattern to filter packages by name (optional)"
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
         )
     )]
     pub async fn package_diff(
         &self,
         path: String,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        packaging::package_diff(path, filter)
+        packaging::package_diff(path, include, exclude)
     }
 
     /// Publish packages with transitive dependency resolution
@@ -104,7 +107,8 @@ impl BuildHub {
         description = "Publish workspace packages in dependency order, auto-publishing transitive deps first. Dry-run by default — pass --execute to actually publish.",
         params(
             path = "Path to workspace root directory",
-            filter = "Glob pattern to filter target packages by name (optional, default: all)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             execute = "Actually publish to registries (default: false, dry-run unless set)",
             no_tag = "Skip creating git tags after publish (optional, default: false)",
             no_commit = "Skip auto-commit after version bumps (optional, default: false)",
@@ -114,13 +118,14 @@ impl BuildHub {
     pub async fn publish(
         &self,
         path: String,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         execute: Option<bool>,
         no_tag: Option<bool>,
         no_commit: Option<bool>,
         bump: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        packaging::publish(path, filter, execute, no_tag, no_commit, bump)
+        packaging::publish(path, include, exclude, execute, no_tag, no_commit, bump)
     }
 
     /// Bump versions for workspace packages
@@ -128,7 +133,8 @@ impl BuildHub {
         description = "Bump package versions across the workspace",
         params(
             path = "Path to workspace root directory",
-            filter = "Glob pattern to filter packages by name (optional, default: all)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             bump = "Version bump kind: patch, minor, major (default: patch)",
             commit = "Auto-commit after bumping (optional, default: false)",
             dry_run = "Preview without writing changes (optional, default: false)"
@@ -137,12 +143,13 @@ impl BuildHub {
     pub async fn bump(
         &self,
         path: String,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         bump: Option<String>,
         commit: Option<bool>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        packaging::bump(path, filter, bump, commit, dry_run)
+        packaging::bump(path, include, exclude, bump, commit, dry_run)
     }
 
     /// Run a command across all workspace repos
@@ -151,7 +158,8 @@ impl BuildHub {
         params(
             path = "Path to workspace directory",
             command = "Shell command to execute in each repo",
-            filter = "Glob pattern to filter repos by name (optional)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             sequential = "Run sequentially instead of in parallel (optional, default: false)",
             dirty = "Only run on repos with uncommitted changes (optional, default: false)"
         )
@@ -160,11 +168,12 @@ impl BuildHub {
         &self,
         path: String,
         command: String,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         sequential: Option<bool>,
         dirty: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        execution::exec(path, command, filter, sequential, dirty)
+        execution::exec(path, command, include, exclude, sequential, dirty)
     }
 
     /// Validate workspace builds in Docker containers
@@ -187,13 +196,38 @@ impl BuildHub {
         execution::validate(path, test, dry_run, image)
     }
 
+    /// Run build/test commands using layered CI runners
+    #[plexus_macros::hub_method(
+        description = "Run build and test commands in dependency order using [ci] runners. Level 0 = quick check, level 1 = full build, level 2 = containerized. Without --level, runs all local runners.",
+        params(
+            path = "Path to workspace directory",
+            test = "Also run test commands (optional, default: false)",
+            level = "Runner level to execute (0, 1, 2...). Without this, runs all local runners.",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            dry_run = "Preview commands without executing (optional, default: false)"
+        )
+    )]
+    pub async fn run(
+        &self,
+        path: String,
+        test: Option<bool>,
+        level: Option<usize>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        local_run::run(path, test, level, include, exclude, dry_run)
+    }
+
     /// Ensure sane .gitignore patterns across all workspace repos
     #[plexus_macros::hub_method(
         description = "Add missing .gitignore patterns across all workspace repos. Includes OS, editor, build artifact, and build-system-specific patterns. Idempotent — only adds what's missing.",
         params(
             path = "Path to workspace directory",
             patterns = "Extra patterns to add beyond defaults (optional)",
-            filter = "Glob pattern to filter repos by name (optional)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview without writing files (optional, default: false)"
         )
     )]
@@ -201,10 +235,11 @@ impl BuildHub {
         &self,
         path: String,
         patterns: Option<Vec<String>>,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        gitignore::gitignore_sync(path, patterns, filter, dry_run)
+        gitignore::gitignore_sync(path, patterns, include, exclude, dry_run)
     }
 }
 

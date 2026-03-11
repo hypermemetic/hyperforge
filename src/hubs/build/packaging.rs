@@ -9,14 +9,16 @@ use crate::commands::runner::{discover_or_bail, run_batch};
 use crate::commands::workspace::build_publish_dep_graph;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
-use crate::hubs::utils::{dry_prefix, glob_match};
+use crate::hubs::utils::{dry_prefix, RepoFilter};
 use crate::package::DriftResult;
 
 pub fn package_diff(
     path: String,
-    filter: Option<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     stream! {
+        let filter = RepoFilter::new(include, exclude);
         let workspace_path = PathBuf::from(&path);
 
         let ctx = match discover_or_bail(&workspace_path) {
@@ -36,13 +38,7 @@ pub fn package_diff(
 
         // Filter packages
         let indices: Vec<usize> = graph.nodes.iter().enumerate()
-            .filter(|(_, node)| {
-                if let Some(ref pat) = filter {
-                    glob_match(pat, &node.name)
-                } else {
-                    true
-                }
-            })
+            .filter(|(_, node)| filter.matches(&node.name))
             .map(|(i, _)| i)
             .collect();
 
@@ -175,7 +171,8 @@ pub fn package_diff(
 
 pub fn publish(
     path: String,
-    filter: Option<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     execute: Option<bool>,
     no_tag: Option<bool>,
     no_commit: Option<bool>,
@@ -186,6 +183,7 @@ pub fn publish(
     let skip_commits = no_commit.unwrap_or(false);
     let bump_kind = crate::types::VersionBump::from_str_or_patch(bump.as_deref());
     let dry_prefix = dry_prefix(is_dry_run);
+    let filter = RepoFilter::new(include, exclude);
 
     stream! {
         let workspace_path = PathBuf::from(&path);
@@ -208,14 +206,13 @@ pub fn publish(
         // Resolve targets from filter
         let targets: Vec<usize> = graph.nodes.iter().enumerate()
             .filter(|(_, node)| {
-                if let Some(ref pat) = filter {
-                    glob_match(pat, &node.name)
-                } else {
-                    // Default: all packages with a registry
+                if filter.is_empty() {
                     match node.build_system.as_str() {
                         "cargo" | "cabal" => true,
                         _ => false,
                     }
+                } else {
+                    filter.matches(&node.name)
                 }
             })
             .map(|(i, _)| i)
@@ -459,7 +456,8 @@ pub fn publish(
 
 pub fn bump(
     path: String,
-    filter: Option<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     bump: Option<String>,
     commit: Option<bool>,
     dry_run: Option<bool>,
@@ -468,6 +466,7 @@ pub fn bump(
     let auto_commit = commit.unwrap_or(false);
     let is_dry_run = dry_run.unwrap_or(false);
     let dry_prefix = dry_prefix(is_dry_run);
+    let filter = RepoFilter::new(include, exclude);
 
     stream! {
         let workspace_path = PathBuf::from(&path);
@@ -477,14 +476,10 @@ pub fn bump(
             Err(event) => { yield event; return; }
         };
 
-        let repos: Vec<_> = if let Some(ref pattern) = filter {
-            ctx.repos.iter().filter(|r| {
-                let name = r.package_name.as_deref().unwrap_or(&r.dir_name);
-                glob_match(pattern, name)
-            }).collect()
-        } else {
-            ctx.repos.iter().collect()
-        };
+        let repos: Vec<_> = ctx.repos.iter().filter(|r| {
+            let name = r.package_name.as_deref().unwrap_or(&r.dir_name);
+            filter.matches(name)
+        }).collect();
 
         if repos.is_empty() {
             yield HyperforgeEvent::Info {

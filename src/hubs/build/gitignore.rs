@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::build_system::BuildSystemKind;
 use crate::commands::runner::{discover_or_bail, run_batch_blocking};
 use crate::hub::HyperforgeEvent;
-use crate::hubs::utils::{dry_prefix, glob_match};
+use crate::hubs::utils::{dry_prefix, RepoFilter};
 
 // ---------------------------------------------------------------------------
 // Default pattern groups
@@ -207,11 +207,13 @@ fn ensure_patterns(
 pub fn gitignore_sync(
     path: String,
     patterns: Option<Vec<String>>,
-    filter: Option<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     dry_run: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let is_dry_run = dry_run.unwrap_or(false);
     let extra_patterns = patterns.unwrap_or_default();
+    let filter = RepoFilter::new(include, exclude);
 
     stream! {
         let workspace_path = PathBuf::from(&path);
@@ -233,10 +235,8 @@ pub fn gitignore_sync(
 
         // Configured repos
         for repo in &ctx.repos {
-            if let Some(ref pat) = filter {
-                if !glob_match(pat, &repo.dir_name) {
-                    continue;
-                }
+            if !filter.matches(&repo.dir_name) {
+                continue;
             }
             items.push(RepoItem {
                 dir_name: repo.dir_name.clone(),
@@ -252,10 +252,8 @@ pub fn gitignore_sync(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            if let Some(ref pat) = filter {
-                if !glob_match(pat, &dir_name) {
-                    continue;
-                }
+            if !filter.matches(&dir_name) {
+                continue;
             }
 
             let build_systems = crate::build_system::detect_all_build_systems(repo_path);

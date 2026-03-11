@@ -69,6 +69,40 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     name == pattern
 }
 
+/// Glob-based include/exclude filter for repo names.
+/// Exclude always takes priority over include.
+pub struct RepoFilter {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl RepoFilter {
+    pub fn new(include: Option<Vec<String>>, exclude: Option<Vec<String>>) -> Self {
+        Self {
+            include: include.unwrap_or_default(),
+            exclude: exclude.unwrap_or_default(),
+        }
+    }
+
+    /// Returns true if the name passes the filter.
+    /// - If excludes match, always false (exclude wins)
+    /// - If includes are non-empty, name must match at least one
+    /// - If both are empty, everything passes
+    pub fn matches(&self, name: &str) -> bool {
+        if self.exclude.iter().any(|pat| glob_match(pat, name)) {
+            return false;
+        }
+        if self.include.is_empty() {
+            return true;
+        }
+        self.include.iter().any(|pat| glob_match(pat, name))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+}
+
 /// Build a default WorkspaceSummary event with all optional fields set to None.
 pub(crate) fn workspace_summary(
     ctx: &crate::commands::workspace::WorkspaceContext,
@@ -92,5 +126,59 @@ pub fn dry_prefix(is_dry_run: bool) -> &'static str {
         "[DRY RUN] "
     } else {
         ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_filter_matches_everything() {
+        let f = RepoFilter::new(None, None);
+        assert!(f.matches("anything"));
+        assert!(f.matches("foo-bar"));
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn include_only() {
+        let f = RepoFilter::new(Some(vec!["hyper*".into(), "plexus*".into()]), None);
+        assert!(f.matches("hyperforge"));
+        assert!(f.matches("plexus-core"));
+        assert!(!f.matches("synapse"));
+        assert!(!f.is_empty());
+    }
+
+    #[test]
+    fn exclude_only() {
+        let f = RepoFilter::new(None, Some(vec!["*-test".into(), "legacy*".into()]));
+        assert!(!f.matches("core-test"));
+        assert!(!f.matches("legacy-utils"));
+        assert!(f.matches("hyperforge"));
+        assert!(f.matches("plexus-core"));
+    }
+
+    #[test]
+    fn exclude_wins_on_overlap() {
+        let f = RepoFilter::new(
+            Some(vec!["hyper*".into()]),
+            Some(vec!["*-deprecated".into()]),
+        );
+        assert!(f.matches("hyperforge"));
+        assert!(!f.matches("hyper-deprecated"));
+        assert!(!f.matches("synapse"));
+    }
+
+    #[test]
+    fn multiple_patterns() {
+        let f = RepoFilter::new(
+            Some(vec!["core*".into(), "lib*".into()]),
+            Some(vec!["core-deprecated".into()]),
+        );
+        assert!(f.matches("core-utils"));
+        assert!(f.matches("lib-common"));
+        assert!(!f.matches("core-deprecated"));
+        assert!(!f.matches("synapse"));
     }
 }

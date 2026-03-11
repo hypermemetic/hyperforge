@@ -5,7 +5,7 @@
 
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -21,7 +21,8 @@ use crate::config::HyperforgeConfig;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
-use crate::hubs::utils::{dry_prefix, glob_match, make_adapter, workspace_summary};
+use crate::hubs::repo::RepoHub;
+use crate::hubs::utils::{dry_prefix, make_adapter, workspace_summary, RepoFilter};
 use crate::services::SyncOp;
 use crate::types::Visibility;
 use std::collections::HashSet;
@@ -48,14 +49,19 @@ impl WorkspaceHub {
     #[plexus_macros::hub_method(
         description = "Scan a workspace directory and report discovered repos, orgs, and forges",
         params(
-            path = "Path to workspace directory"
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
         )
     )]
     pub async fn discover(
         &self,
         path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
+            let filter = RepoFilter::new(include, exclude);
             let workspace_path = PathBuf::from(&path);
             let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
@@ -66,8 +72,11 @@ impl WorkspaceHub {
                 message: format!("Scanning workspace: {}", ctx.root.display()),
             };
 
+            // Filter repos by name glob if provided
+            let filtered_repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).collect();
+
             // Report each discovered repo
-            for repo in &ctx.repos {
+            for repo in &filtered_repos {
                 let org = repo.org().unwrap_or("(none)");
                 let forges = repo.forges().join(", ");
                 let git_status = if repo.is_git_repo { "git" } else { "no-git" };
@@ -82,7 +91,12 @@ impl WorkspaceHub {
             }
 
             // Report unconfigured repos
-            for path in &ctx.unconfigured_repos {
+            let filtered_unconfigured: Vec<_> = ctx.unconfigured_repos.iter().filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                filter.matches(name)
+            }).collect();
+
+            for path in &filtered_unconfigured {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 yield HyperforgeEvent::Info {
                     message: format!("  {} [git, no hyperforge config]", name),
@@ -114,6 +128,8 @@ impl WorkspaceHub {
             path = "Path to workspace directory",
             org = "Organization name (inferred from workspace if only one org exists)",
             forges = "Forges to configure (inferred from existing configs if not specified)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview without writing configs (optional, default: false)",
             force = "Re-init repos that already have config (optional, default: false)",
             no_hooks = "Skip installing pre-push hook (optional, default: false)",
@@ -125,6 +141,8 @@ impl WorkspaceHub {
         path: String,
         org: Option<String>,
         forges: Option<Vec<String>>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         dry_run: Option<bool>,
         force: Option<bool>,
         no_hooks: Option<bool>,
@@ -134,6 +152,8 @@ impl WorkspaceHub {
         let is_force = force.unwrap_or(false);
         let is_no_hooks = no_hooks.unwrap_or(false);
         let is_no_ssh_wrapper = no_ssh_wrapper.unwrap_or(false);
+        let state = self.state.clone();
+        let filter = RepoFilter::new(include, exclude);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -188,6 +208,12 @@ impl WorkspaceHub {
                 }
             }
 
+            // Apply filter to targets by directory basename
+            targets.retain(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                filter.matches(name)
+            });
+
             if targets.is_empty() {
                 yield HyperforgeEvent::Info {
                     message: "No repos to initialize.".to_string(),
@@ -222,43 +248,36 @@ impl WorkspaceHub {
 
             let mut inits_performed = 0usize;
             let mut init_failed = 0usize;
+            let repo_hub = RepoHub::new(state.clone());
+            let org_str = inferred_org.as_deref().unwrap().to_string();
+            let forges_csv = inferred_forges.join(",");
 
             for repo_path in &targets {
-                let dir_name = repo_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?");
+                let stream = repo_hub.init(
+                    repo_path.display().to_string(),
+                    forges_csv.clone(),
+                    org_str.clone(),
+                    None,  // repo_name — derived from dir name inside repo init
+                    None,  // visibility
+                    None,  // description
+                    None,  // ssh_keys
+                    if is_force { Some(true) } else { None },
+                    if is_dry_run { Some(true) } else { None },
+                    if is_no_hooks { Some(true) } else { None },
+                    if is_no_ssh_wrapper { Some(true) } else { None },
+                ).await;
+                tokio::pin!(stream);
+                let events: Vec<HyperforgeEvent> = stream.collect().await;
 
-                let mut opts = InitOptions::new(inferred_forges.clone());
-                if let Some(ref o) = inferred_org {
-                    opts = opts.with_org(o.as_str());
-                }
-                if is_dry_run {
-                    opts = opts.dry_run();
-                }
-                if is_force {
-                    opts = opts.force();
-                }
-                if is_no_hooks {
-                    opts = opts.no_hooks();
-                }
-                if is_no_ssh_wrapper {
-                    opts = opts.no_ssh_wrapper();
+                let has_error = events.iter().any(|e| matches!(e, HyperforgeEvent::Error { .. }));
+                for event in events {
+                    yield event;
                 }
 
-                match init(repo_path, opts) {
-                    Ok(_report) => {
-                        inits_performed += 1;
-                        yield HyperforgeEvent::Info {
-                            message: format!("  {}Initialized {}", dry_prefix, dir_name),
-                        };
-                    }
-                    Err(e) => {
-                        init_failed += 1;
-                        yield HyperforgeEvent::Error {
-                            message: format!("  Failed to init {}: {}", dir_name, e),
-                        };
-                    }
+                if has_error {
+                    init_failed += 1;
+                } else {
+                    inits_performed += 1;
                 }
             }
 
@@ -274,6 +293,84 @@ impl WorkspaceHub {
             } else {
                 ctx
             };
+
+            // ── Phase 4: CI default injection ──
+            // For newly initialized repos with detected build systems but no CI config,
+            // generate default layered runners and persist to LocalForge + disk.
+            if inits_performed > 0 && !is_dry_run {
+                let mut ci_injected = 0usize;
+                for repo in &ctx.repos {
+                    // Skip repos with no build system or existing CI config
+                    if repo.build_systems.is_empty()
+                        || repo.build_systems.iter().all(|bs| *bs == crate::build_system::BuildSystemKind::Unknown)
+                    {
+                        continue;
+                    }
+                    let config = match repo.config.as_ref() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    if config.ci.is_some() {
+                        continue;
+                    }
+
+                    // Generate default CI and update LocalForge record
+                    let ci = crate::types::config::default_ci_config(&repo.build_systems);
+                    let name = repo.effective_name();
+                    let org_name = config.org.as_deref().unwrap_or(org_str.as_str());
+                    let local = state.get_local_forge(org_name).await;
+
+                    if let Ok(mut record) = local.get_record(&name) {
+                        if record.ci.is_none() {
+                            record.ci = Some(ci.clone());
+                            if let Err(e) = local.update_record(&record) {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("Failed to update CI for {}: {}", name, e),
+                                };
+                                continue;
+                            }
+                            // Re-materialize to write CI to config.toml
+                            if let Err(e) = crate::commands::materialize::materialize(
+                                org_name,
+                                &record,
+                                &repo.path,
+                                crate::commands::materialize::MaterializeOpts::default(),
+                            ) {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("Failed to materialize CI for {}: {}", name, e),
+                                };
+                                continue;
+                            }
+                            ci_injected += 1;
+                        }
+                    }
+                }
+                if ci_injected > 0 {
+                    yield HyperforgeEvent::Info {
+                        message: format!("Injected default CI config for {} repos", ci_injected),
+                    };
+                }
+            } else if is_dry_run && inits_performed > 0 {
+                // In dry-run mode, just report what would happen
+                let mut would_inject = 0usize;
+                for repo in &ctx.repos {
+                    if repo.build_systems.is_empty()
+                        || repo.build_systems.iter().all(|bs| *bs == crate::build_system::BuildSystemKind::Unknown)
+                    {
+                        continue;
+                    }
+                    if let Some(config) = repo.config.as_ref() {
+                        if config.ci.is_none() {
+                            would_inject += 1;
+                        }
+                    }
+                }
+                if would_inject > 0 {
+                    yield HyperforgeEvent::Info {
+                        message: format!("{}Would inject default CI config for {} repos", dry_prefix, would_inject),
+                    };
+                }
+            }
 
             // ── Summary ──
             yield HyperforgeEvent::Info {
@@ -292,15 +389,20 @@ impl WorkspaceHub {
         description = "Verify all workspace repos are on the expected branch and have a clean working tree",
         params(
             path = "Path to workspace directory",
-            branch = "Expected branch name (optional, default: main)"
+            branch = "Expected branch name (optional, default: main)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
         )
     )]
     pub async fn check(
         &self,
         path: String,
         branch: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
+            let filter = RepoFilter::new(include, exclude);
             let workspace_path = PathBuf::from(&path);
             let expected_branch = branch.unwrap_or_else(|| "main".to_string());
 
@@ -309,10 +411,13 @@ impl WorkspaceHub {
                 Err(event) => { yield event; return; }
             };
 
+            // Filter repos by name glob if provided
+            let repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).collect();
+
             yield HyperforgeEvent::Info {
                 message: format!(
                     "Checking {} repos (expected branch: {})",
-                    ctx.repos.len(),
+                    repos.len(),
                     expected_branch
                 ),
             };
@@ -322,7 +427,7 @@ impl WorkspaceHub {
             let mut wrong_branch_count = 0usize;
 
             // Collect inputs for run_batch_blocking
-            let check_inputs: Vec<_> = ctx.repos.iter()
+            let check_inputs: Vec<_> = repos.iter()
                 .filter(|r| r.is_git_repo)
                 .map(|r| (r.dir_name.clone(), r.path.clone(), expected_branch.clone()))
                 .collect();
@@ -394,6 +499,8 @@ impl WorkspaceHub {
         params(
             path = "Path to workspace directory",
             branch = "Branch to push (optional, uses current branch if not specified)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview pushes without executing (optional, default: false)",
             set_upstream = "Set upstream tracking (optional, default: false)",
             validate = "Run containerized validation before pushing (optional, default: false)"
@@ -403,11 +510,14 @@ impl WorkspaceHub {
         &self,
         path: String,
         branch: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         dry_run: Option<bool>,
         set_upstream: Option<bool>,
         validate: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let _ = branch; // push() uses current branch; param is informational
+        let filter = RepoFilter::new(include, exclude);
         stream! {
             let workspace_path = PathBuf::from(&path);
             let is_dry_run = dry_run.unwrap_or(false);
@@ -419,13 +529,17 @@ impl WorkspaceHub {
                 Err(event) => { yield event; return; }
             };
 
+            // Filter repos by name glob if provided
+            let repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).collect();
+
             // Validation gate (if --validate)
             if is_validate {
                 yield HyperforgeEvent::Info {
                     message: "Validation: Running containerized build check...".to_string(),
                 };
 
-                let gate = run_validation_gate(&ctx.repos, &ctx.root, is_dry_run);
+                let owned_repos: Vec<_> = repos.iter().map(|r| (*r).clone()).collect();
+                let gate = run_validation_gate(&owned_repos, &ctx.root, is_dry_run);
                 for event in gate.events {
                     yield event;
                 }
@@ -435,18 +549,18 @@ impl WorkspaceHub {
             }
 
             yield HyperforgeEvent::Info {
-                message: format!("{}Pushing {} repos...", dry_prefix(is_dry_run), ctx.repos.len()),
+                message: format!("{}Pushing {} repos...", dry_prefix(is_dry_run), repos.len()),
             };
 
             // Skip non-git repos
-            for repo in ctx.repos.iter().filter(|r| !r.is_git_repo) {
+            for repo in repos.iter().filter(|r| !r.is_git_repo) {
                 yield HyperforgeEvent::Info {
                     message: format!("  Skipping {} (not a git repo)", repo.dir_name),
                 };
             }
 
             // Parallel push via run_batch_blocking
-            let push_inputs: Vec<_> = ctx.repos.iter()
+            let push_inputs: Vec<_> = repos.iter()
                 .filter(|r| r.is_git_repo)
                 .map(|r| {
                     let mut options = PushOptions::new();
@@ -583,6 +697,8 @@ impl WorkspaceHub {
             path = "Path to workspace directory (required)",
             org = "Organization name (inferred from workspace if only one org exists)",
             forges = "Forges for unconfigured repos (inferred from existing configs if not specified)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview all phases without making changes (optional, default: false)",
             no_push = "Skip the git push phase (optional, default: false)",
             no_init = "Skip initializing unconfigured repos (optional, default: false)",
@@ -596,6 +712,8 @@ impl WorkspaceHub {
         path: String,
         org: Option<String>,
         forges: Option<Vec<String>>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         dry_run: Option<bool>,
         no_push: Option<bool>,
         no_init: Option<bool>,
@@ -611,6 +729,7 @@ impl WorkspaceHub {
         let is_validate = validate.unwrap_or(false);
         let is_purge = purge.unwrap_or(false);
         let is_reflect = reflect.unwrap_or(false) || is_purge;
+        let filter = RepoFilter::new(include, exclude);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -658,7 +777,16 @@ impl WorkspaceHub {
 
             let inferred_forges: Vec<String> = forges.clone().unwrap_or_else(|| ctx.forges.clone());
 
-            let has_unconfigured = !ctx.unconfigured_repos.is_empty();
+            // Apply filter to unconfigured repos
+            let unconfigured: Vec<PathBuf> = ctx.unconfigured_repos.iter()
+                .filter(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    filter.matches(name)
+                })
+                .cloned()
+                .collect();
+
+            let has_unconfigured = !unconfigured.is_empty();
 
             if has_unconfigured && inferred_org.is_none() {
                 yield HyperforgeEvent::Error {
@@ -679,14 +807,14 @@ impl WorkspaceHub {
                     message: format!(
                         "{}Phase 2/8: Initializing {} unconfigured repos (org={}, forges=[{}])...",
                         dry_prefix,
-                        ctx.unconfigured_repos.len(),
+                        unconfigured.len(),
                         inferred_org.as_deref().unwrap_or("?"),
                         inferred_forges.join(", "),
                     ),
                 };
 
                 let (events, count) = sync_init_unconfigured(
-                    &ctx.unconfigured_repos, &inferred_org, &inferred_forges, is_dry_run, dry_prefix,
+                    &unconfigured, &inferred_org, &inferred_forges, is_dry_run, dry_prefix,
                 );
                 inits_performed = count;
                 for event in events { yield event; }
@@ -713,13 +841,16 @@ impl WorkspaceHub {
                 ctx
             };
 
+            // Apply filter to discovered repos
+            let filtered_repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).cloned().collect();
+
             // ── Phase 4: Register configured repos in LocalForge ──
             yield HyperforgeEvent::Info {
-                message: format!("{}Phase 4/8: Registering {} configured repos in LocalForge...", dry_prefix, ctx.repos.len()),
+                message: format!("{}Phase 4/8: Registering {} configured repos in LocalForge...", dry_prefix, filtered_repos.len()),
             };
 
             let (events, registered, already_registered, unstaged) =
-                sync_register_repos(&ctx.repos, &ctx.orgs, &state, is_reflect, is_dry_run, dry_prefix).await;
+                sync_register_repos(&filtered_repos, &ctx.orgs, &state, is_reflect, is_dry_run, dry_prefix).await;
             for event in events { yield event; }
 
             yield HyperforgeEvent::Info {
@@ -796,18 +927,140 @@ impl WorkspaceHub {
                 }
             }
 
-            // ── Phase 7: Apply (safe — no deletes) ──
+            // ── Phase 7: Apply creates/updates via repo sync + inline privatization ──
             yield HyperforgeEvent::Info {
-                message: format!("{}Phase 7/8: Applying creates and updates (no deletes)...", dry_prefix),
+                message: format!("{}Phase 7/8: Applying creates and updates...", dry_prefix),
             };
 
-            let (events, total_created, total_updated) = sync_apply_diffs(all_diffs, &state, is_dry_run).await;
-            for event in events { yield event; }
+            // Collect unique repos needing create/update, and handle deletes (privatize) inline
+            let mut repos_to_sync: Vec<(String, String)> = Vec::new(); // (org, name)
+            let mut seen_sync = HashSet::new();
+            let mut privatize_items: Vec<(String, String, crate::types::Repo)> = Vec::new(); // (org, forge, repo)
+
+            for (org_name, forge_name, diff) in &all_diffs {
+                for repo_op in &diff.ops {
+                    match repo_op.op {
+                        SyncOp::Create | SyncOp::Update => {
+                            let key = (org_name.clone(), repo_op.repo.name.clone());
+                            if seen_sync.insert(key.clone()) {
+                                repos_to_sync.push(key);
+                            }
+                        }
+                        SyncOp::Delete => {
+                            privatize_items.push((org_name.clone(), forge_name.clone(), repo_op.repo.clone()));
+                        }
+                        SyncOp::InSync => {}
+                    }
+                }
+            }
+
+            // Delegate creates/updates to repo sync
+            let mut total_synced = 0usize;
+            let mut total_sync_errors = 0usize;
+
+            if !repos_to_sync.is_empty() {
+                let repo_hub = RepoHub::new(state.clone());
+                let sync_items: Vec<_> = repos_to_sync.into_iter().map(|(org, name)| {
+                    let hub = Clone::clone(&repo_hub);
+                    (hub, org, name)
+                }).collect();
+
+                let sync_results = run_batch(sync_items, 8, {
+                    let dry_run = Some(is_dry_run);
+                    move |(hub, org, name): (RepoHub, String, String)| async move {
+                        let stream = hub.sync(org, name.clone(), dry_run).await;
+                        tokio::pin!(stream);
+                        let events: Vec<HyperforgeEvent> = stream.collect().await;
+                        let has_error = events.iter().any(|e| matches!(e, HyperforgeEvent::Error { .. }));
+                        (name, events, has_error)
+                    }
+                }).await;
+
+                for result in sync_results {
+                    match result {
+                        Ok((_name, events, has_error)) => {
+                            for event in events { yield event; }
+                            if has_error { total_sync_errors += 1; } else { total_synced += 1; }
+                        }
+                        Err(e) => {
+                            total_sync_errors += 1;
+                            yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
+                        }
+                    }
+                }
+            }
+
+            // Handle deletes (privatization) inline — this is workspace-specific logic
+            for (org_name, forge_name, repo) in &privatize_items {
+                let local = state.get_local_forge(org_name).await;
+                let record_info = local.get_record(&repo.name).ok();
+
+                if record_info.as_ref().map_or(false, |r| r.protected) {
+                    yield HyperforgeEvent::SyncOp {
+                        repo_name: repo.name.clone(),
+                        operation: "skip_protected".to_string(),
+                        forge: forge_name.clone(),
+                    };
+                    continue;
+                }
+
+                let already_privatized = record_info.as_ref()
+                    .and_then(|rec| {
+                        HyperforgeConfig::parse_forge(forge_name)
+                            .map(|fe| rec.privatized_on.contains(&fe))
+                    })
+                    .unwrap_or(false);
+
+                if already_privatized {
+                    yield HyperforgeEvent::SyncOp {
+                        repo_name: repo.name.clone(),
+                        operation: "already_privatized".to_string(),
+                        forge: forge_name.clone(),
+                    };
+                } else {
+                    let private_repo = crate::types::Repo::new(
+                        &repo.name,
+                        repo.origin.clone(),
+                    ).with_visibility(crate::types::Visibility::Private);
+
+                    if !is_dry_run {
+                        let ot = local.owner_type();
+                        match make_adapter(forge_name, org_name, ot) {
+                            Ok(adapter) => {
+                                match adapter.update_repo(org_name, &private_repo).await {
+                                    Ok(_) => {
+                                        if let Some(forge_enum) = HyperforgeConfig::parse_forge(forge_name) {
+                                            if let Ok(mut rec) = local.get_record(&repo.name) {
+                                                rec.privatized_on.insert(forge_enum);
+                                                let _ = local.update_record(&rec);
+                                                let _ = local.save_to_yaml().await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        yield HyperforgeEvent::Error {
+                                            message: format!("  Failed to privatize {} on {}: {}", repo.name, forge_name, e),
+                                        };
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                yield HyperforgeEvent::Error { message: e };
+                            }
+                        }
+                    }
+                    yield HyperforgeEvent::SyncOp {
+                        repo_name: repo.name.clone(),
+                        operation: "privatize".to_string(),
+                        forge: forge_name.clone(),
+                    };
+                }
+            }
 
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "  {}{} created, {} updated on remotes",
-                    dry_prefix, total_created, total_updated,
+                    "  {}{} repos synced, {} sync errors, {} privatization ops",
+                    dry_prefix, total_synced, total_sync_errors, privatize_items.len(),
                 ),
             };
 
@@ -839,7 +1092,7 @@ impl WorkspaceHub {
                     message: format!("{}Validation: Running containerized build check...", dry_prefix),
                 };
 
-                let gate = run_validation_gate(&ctx.repos, &ctx.root, is_dry_run);
+                let gate = run_validation_gate(&filtered_repos, &ctx.root, is_dry_run);
                 for event in gate.events {
                     yield event;
                 }
@@ -862,11 +1115,11 @@ impl WorkspaceHub {
                 }
             } else {
                 yield HyperforgeEvent::Info {
-                    message: format!("{}Phase 8/8: Pushing {} repos...", dry_prefix, ctx.repos.len()),
+                    message: format!("{}Phase 8/8: Pushing {} repos...", dry_prefix, filtered_repos.len()),
                 };
 
                 // Parallel push: spawn_blocking per repo
-                let push_inputs: Vec<_> = ctx.repos.iter()
+                let push_inputs: Vec<_> = filtered_repos.iter()
                     .filter(|r| r.is_git_repo)
                     .map(|repo| {
                         let dir_name = repo.dir_name.clone();
@@ -921,7 +1174,8 @@ impl WorkspaceHub {
         params(
             path = "Path to workspace directory",
             branch = "Branch to set as default",
-            filter = "Glob pattern to filter repos by name (optional)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             checkout = "Also run git checkout locally in each repo (optional, default: false)",
             dry_run = "Preview changes without applying (optional, default: false)"
         )
@@ -930,12 +1184,15 @@ impl WorkspaceHub {
         &self,
         path: String,
         branch: String,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         checkout: Option<bool>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let is_dry_run = dry_run.unwrap_or(false);
         let is_checkout = checkout.unwrap_or(false);
+        let state = self.state.clone();
+        let filter = RepoFilter::new(include, exclude);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -947,11 +1204,7 @@ impl WorkspaceHub {
             };
 
             // Filter repos by name glob if provided
-            let repos: Vec<_> = if let Some(ref pattern) = filter {
-                ctx.repos.iter().filter(|r| glob_match(pattern, &r.dir_name)).collect()
-            } else {
-                ctx.repos.iter().collect()
-            };
+            let repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).collect();
 
             yield HyperforgeEvent::Info {
                 message: format!(
@@ -963,130 +1216,71 @@ impl WorkspaceHub {
             let mut success_count = 0usize;
             let mut error_count = 0usize;
 
-            // Parallel set_default_branch: spawn per repo
-            {
-                // Filter repos that have config and org
-                let eligible: Vec<_> = repos.iter()
-                    .filter(|r| r.config.is_some() && r.org().is_some())
-                    .cloned()
-                    .cloned()
-                    .collect();
+            // Report repos without org
+            for repo in &repos {
+                if repo.config.is_some() && repo.org().is_none() {
+                    yield HyperforgeEvent::Error {
+                        message: format!("  {}: no org configured, skipping", repo.dir_name),
+                    };
+                    error_count += 1;
+                }
+            }
 
-                // Report repos without org
-                for repo in &repos {
-                    if repo.config.is_some() && repo.org().is_none() {
-                        yield HyperforgeEvent::Error {
-                            message: format!("  {}: no org configured, skipping", repo.dir_name),
-                        };
-                        error_count += 1;
+            // Build items for delegation to repo hub
+            let eligible: Vec<_> = repos.iter()
+                .filter(|r| r.config.is_some() && r.org().is_some())
+                .cloned()
+                .cloned()
+                .collect();
+
+            let items: Vec<_> = eligible.into_iter().map(|repo| {
+                let config = repo.config.clone().unwrap();
+                let org = repo.org().unwrap().to_string();
+                let repo_name = config.repo_name.clone()
+                    .unwrap_or_else(|| repo.dir_name.clone());
+                let repo_path = repo.path.display().to_string();
+                (org, repo_name, repo_path)
+            }).collect();
+
+            let repo_hub = RepoHub::new(state);
+            let items: Vec<_> = items.into_iter().map(|(org, repo_name, repo_path)| {
+                let hub = Clone::clone(&repo_hub);
+                (hub, org, repo_name, repo_path)
+            }).collect();
+
+            let results = run_batch(items, 8, {
+                let branch = branch.clone();
+                move |(hub, org, repo_name, repo_path): (RepoHub, String, String, String)| {
+                    let branch = branch.clone();
+                    let path = if is_checkout { Some(repo_path) } else { None };
+                    async move {
+                        let stream = hub.set_default_branch(org, repo_name.clone(), branch, Some(is_checkout), path).await;
+                        tokio::pin!(stream);
+                        let events: Vec<HyperforgeEvent> = stream.collect().await;
+                        let has_error = events.iter().any(|e| matches!(e, HyperforgeEvent::Error { .. }));
+                        (repo_name, events, has_error)
                     }
                 }
+            }).await;
 
-                let items: Vec<_> = eligible.into_iter().map(|repo| {
-                    let config = repo.config.clone().unwrap();
-                    let org = repo.org().unwrap().to_string();
-                    let repo_name = config.repo_name.clone()
-                        .unwrap_or_else(|| repo.dir_name.clone());
-                    let dir_name = repo.dir_name.clone();
-                    let forges: Vec<String> = repo.forges().into_iter().map(|s| s.to_string()).collect();
-                    let branch = branch.clone();
-                    let dry_prefix = dry_prefix.to_string();
-                    let path = repo.path.clone();
-                    let is_git = repo.is_git_repo;
-                    (dir_name, org, repo_name, forges, branch, dry_prefix, path, is_git)
-                }).collect();
-
-                let dry_run = is_dry_run;
-                let checkout = is_checkout;
-                let results = run_batch(items, 8, move |(dir_name, org, repo_name, forges, branch, dry_prefix, path, is_git)| async move {
-                    let mut events = Vec::new();
-                    let mut errors = Vec::new();
-
-                    for forge_name in &forges {
-                        if dry_run {
-                            events.push(HyperforgeEvent::Info {
-                                message: format!(
-                                    "  {}Would set default branch on {}/{} ({})",
-                                    dry_prefix, repo_name, forge_name, branch,
-                                ),
-                            });
-                            continue;
-                        }
-
-                        let adapter = match make_adapter(forge_name, &org, None) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                errors.push(format!("{}: {}", forge_name, e));
-                                continue;
-                            }
-                        };
-
-                        match adapter.set_default_branch(&org, &repo_name, &branch).await {
-                            Ok(_) => {
-                                events.push(HyperforgeEvent::Info {
-                                    message: format!("  {} → {} default branch set to '{}'", repo_name, forge_name, branch),
-                                });
-                            }
-                            Err(e) => {
-                                errors.push(format!("{}: {}", forge_name, e));
-                            }
-                        }
-                    }
-
-                    // Optionally checkout locally (sync git op)
-                    if checkout && is_git {
-                        if dry_run {
-                            events.push(HyperforgeEvent::Info {
-                                message: format!("  {}Would checkout '{}' in {}", dry_prefix, branch, dir_name),
-                            });
-                        } else {
-                            match tokio::task::spawn_blocking({
-                                let path = path.clone();
-                                let branch = branch.clone();
-                                move || Git::checkout(&path, &branch)
-                            }).await {
-                                Ok(Ok(_)) => {
-                                    events.push(HyperforgeEvent::Info {
-                                        message: format!("  {} → checked out '{}'", dir_name, branch),
-                                    });
-                                }
-                                Ok(Err(e)) => {
-                                    errors.push(format!("checkout: {}", e));
-                                }
-                                Err(e) => {
-                                    errors.push(format!("checkout spawn error: {}", e));
-                                }
-                            }
-                        }
-                    }
-
-                    (dir_name, events, errors)
-                }).await;
-
-                for result in results {
-                    let (dir_name, events, errors) = match result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
-                            error_count += 1;
-                            continue;
-                        }
-                    };
-
-                    for event in events {
-                        yield event;
-                    }
-
-                    if errors.is_empty() {
-                        success_count += 1;
-                    } else {
+            for result in results {
+                let (_repo_name, events, has_error) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: format!("Task join error: {}", e) };
                         error_count += 1;
-                        for err in &errors {
-                            yield HyperforgeEvent::Error {
-                                message: format!("  {} error: {}", dir_name, err),
-                            };
-                        }
+                        continue;
                     }
+                };
+
+                for event in events {
+                    yield event;
+                }
+
+                if has_error {
+                    error_count += 1;
+                } else {
+                    success_count += 1;
                 }
             }
 
@@ -1105,16 +1299,19 @@ impl WorkspaceHub {
         params(
             path = "Path to workspace directory",
             branch = "Expected default branch (optional, default: main)",
-            filter = "Glob pattern to filter repos by name (optional)"
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
         )
     )]
     pub async fn check_default_branch(
         &self,
         path: String,
         branch: Option<String>,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
+            let filter = RepoFilter::new(include, exclude);
             let workspace_path = PathBuf::from(&path);
             let expected = branch.unwrap_or_else(|| "main".to_string());
 
@@ -1123,11 +1320,7 @@ impl WorkspaceHub {
                 Err(event) => { yield event; return; }
             };
 
-            let repos: Vec<_> = if let Some(ref pattern) = filter {
-                ctx.repos.iter().filter(|r| glob_match(pattern, &r.dir_name)).collect()
-            } else {
-                ctx.repos.iter().collect()
-            };
+            let repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).collect();
 
             yield HyperforgeEvent::Info {
                 message: format!(
@@ -1401,7 +1594,8 @@ impl WorkspaceHub {
         params(
             org = "Organization name (must have repos in LocalForge)",
             path = "Target workspace directory",
-            filter = "Filter repos by name glob (optional, e.g. 'plexus-*')",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             forge = "Preferred forge to clone from (optional, defaults to first in present_on)",
             concurrency = "Max parallel clones (optional, default: 4)"
         )
@@ -1410,12 +1604,14 @@ impl WorkspaceHub {
         &self,
         org: String,
         path: String,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         forge: Option<String>,
         concurrency: Option<u32>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let max_concurrent = concurrency.unwrap_or(4) as usize;
+        let filter = RepoFilter::new(include, exclude);
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -1442,11 +1638,7 @@ impl WorkspaceHub {
             }
 
             // 3. Filter by glob
-            let filtered: Vec<_> = if let Some(ref pattern) = filter {
-                records.into_iter().filter(|r| glob_match(pattern, &r.name)).collect()
-            } else {
-                records
-            };
+            let filtered: Vec<_> = records.into_iter().filter(|r| filter.matches(&r.name)).collect();
 
             // 4. Create workspace dir if needed
             if let Err(e) = std::fs::create_dir_all(&workspace_path) {
@@ -1491,62 +1683,42 @@ impl WorkspaceHub {
                 }
             }
 
-            // 6. Clone in batches using run_batch
+            // 6. Clone via delegation to repo hub
             let mut success_count = 0usize;
             let mut failed_count = 0usize;
 
+            let repo_hub = RepoHub::new(state);
             let clone_inputs: Vec<_> = to_clone.into_iter()
-                .map(|r| (r, org.clone(), forge.clone(), workspace_path.clone()))
+                .map(|r| {
+                    let hub = Clone::clone(&repo_hub);
+                    let target = workspace_path.join(&r.name).display().to_string();
+                    (hub, org.clone(), r.name.clone(), target, forge.clone())
+                })
                 .collect();
 
-            let clone_results = crate::commands::runner::run_batch(
+            let clone_results = run_batch(
                 clone_inputs,
                 max_concurrent,
-                |(record, org, forge_pref, ws_path)| async move {
-                    // Pick forge to clone from
-                    let clone_forge = if let Some(ref f) = forge_pref {
-                        f.to_lowercase()
-                    } else {
-                        match record.present_on.iter().next() {
-                            Some(f) => format!("{:?}", f).to_lowercase(),
-                            None => {
-                                return (record.name.clone(), Err("No forges in present_on".to_string()));
-                            }
-                        }
-                    };
-
-                    let clone_url = crate::git::build_remote_url(&clone_forge, &org, &record.name);
-                    let target = ws_path.join(&record.name);
-                    let target_str = target.display().to_string();
-
-                    // Clone
-                    if let Err(e) = crate::git::Git::clone(&clone_url, &target_str) {
-                        return (record.name.clone(), Err(format!("Clone failed: {}", e)));
-                    }
-
-                    // Materialize config + remotes from the record
-                    let opts = crate::commands::materialize::MaterializeOpts::default();
-                    if let Err(e) = crate::commands::materialize::materialize(&org, &record, &target, opts) {
-                        return (record.name.clone(), Err(format!("Cloned but materialize failed: {}", e)));
-                    }
-
-                    (record.name.clone(), Ok(()))
+                |(hub, org, name, target_path, forge_pref): (RepoHub, String, String, String, Option<String>)| async move {
+                    let stream = RepoHub::clone(&hub, org, name.clone(), Some(target_path), forge_pref).await;
+                    tokio::pin!(stream);
+                    let events: Vec<HyperforgeEvent> = stream.collect().await;
+                    let has_error = events.iter().any(|e| matches!(e, HyperforgeEvent::Error { .. }));
+                    (name, events, has_error)
                 },
             ).await;
 
             for result in clone_results {
                 match result {
-                    Ok((name, Ok(()))) => {
-                        success_count += 1;
-                        yield HyperforgeEvent::Info {
-                            message: format!("  Cloned: {}", name),
-                        };
-                    }
-                    Ok((name, Err(e))) => {
-                        failed_count += 1;
-                        yield HyperforgeEvent::Error {
-                            message: format!("  Failed: {} — {}", name, e),
-                        };
+                    Ok((_name, events, has_error)) => {
+                        for event in events {
+                            yield event;
+                        }
+                        if has_error {
+                            failed_count += 1;
+                        } else {
+                            success_count += 1;
+                        }
                     }
                     Err(e) => {
                         failed_count += 1;
@@ -1581,7 +1753,8 @@ impl WorkspaceHub {
             target_path = "Target workspace directory",
             target_org = "Target organization name (optional — inferred from target workspace if unambiguous)",
             repo = "Repo names to move (optional, repeat: --repo a --repo b)",
-            filter = "Glob pattern to select repos (optional, e.g. 'orcha*')",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview without making changes (optional, default: false)"
         )
     )]
@@ -1591,11 +1764,13 @@ impl WorkspaceHub {
         target_path: String,
         target_org: Option<String>,
         repo: Option<Vec<String>>,
-        filter: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let is_dry_run = dry_run.unwrap_or(false);
+        let filter = RepoFilter::new(include, exclude);
 
         stream! {
             let dry_prefix = dry_prefix(is_dry_run);
@@ -1644,9 +1819,9 @@ impl WorkspaceHub {
             };
 
             // ── Build repo list from filter and/or explicit names ──
-            if repo.is_none() && filter.is_none() {
+            if repo.is_none() && filter.is_empty() {
                 yield HyperforgeEvent::Error {
-                    message: "No repos specified. Use --repo <name> and/or --filter <glob>.".to_string(),
+                    message: "No repos specified. Use --repo <name> and/or --include <glob>.".to_string(),
                 };
                 return;
             }
@@ -1670,15 +1845,15 @@ impl WorkspaceHub {
 
             // Collect from filter
             let mut selected: HashSet<String> = HashSet::new();
-            if let Some(ref pattern) = filter {
+            if !filter.is_empty() {
                 for name in &all_source_names {
-                    if glob_match(pattern, name) {
+                    if filter.matches(name) {
                         selected.insert(name.clone());
                     }
                 }
                 if selected.is_empty() {
                     yield HyperforgeEvent::Error {
-                        message: format!("Filter '{}' matched no repos in source workspace", pattern),
+                        message: "Filter matched no repos in source workspace".to_string(),
                     };
                     return;
                 }
@@ -1731,9 +1906,10 @@ impl WorkspaceHub {
                 }
             }
 
-            let filter_info = match &filter {
-                Some(pattern) => format!(" (filter: {})", pattern),
-                None => String::new(),
+            let filter_info = if filter.is_empty() {
+                String::new()
+            } else {
+                " (filtered)".to_string()
             };
             yield HyperforgeEvent::Info {
                 message: format!(
@@ -2244,147 +2420,6 @@ async fn sync_import_remote(
     }
 
     events
-}
-
-/// Phase 7: Apply diffs to remotes (creates, updates, privatizations — no deletes).
-async fn sync_apply_diffs(
-    all_diffs: Vec<(String, String, crate::services::SyncDiff)>,
-    state: &HyperforgeState,
-    is_dry_run: bool,
-) -> (Vec<HyperforgeEvent>, usize, usize) {
-    let mut all_events = Vec::new();
-    let mut total_created = 0usize;
-    let mut total_updated = 0usize;
-
-    let dry_run = is_dry_run;
-    let items: Vec<_> = all_diffs.into_iter()
-        .map(|(org_name, forge_name, diff)| (org_name, forge_name, diff, state.clone()))
-        .collect();
-
-    let results = run_batch(items, 8, move |(org_name, forge_name, diff, state)| async move {
-        let ot = state.get_local_forge(&org_name).await.owner_type();
-        let adapter = match make_adapter(&forge_name, &org_name, ot) {
-            Ok(a) => a,
-            Err(e) => return (vec![HyperforgeEvent::Error { message: e }], 0usize, 0usize),
-        };
-
-        let mut events = Vec::new();
-        let mut created = 0usize;
-        let mut updated = 0usize;
-
-        for repo_op in &diff.ops {
-            match repo_op.op {
-                SyncOp::Create => {
-                    if !dry_run {
-                        if let Err(e) = adapter.create_repo(&org_name, &repo_op.repo).await {
-                            events.push(HyperforgeEvent::Error {
-                                message: format!("  Failed to create {} on {}: {}", repo_op.repo.name, forge_name, e),
-                            });
-                            continue;
-                        }
-                    }
-                    created += 1;
-                    events.push(HyperforgeEvent::SyncOp {
-                        repo_name: repo_op.repo.name.clone(),
-                        operation: "create".to_string(),
-                        forge: forge_name.clone(),
-                    });
-                }
-                SyncOp::Update => {
-                    if !dry_run {
-                        if let Err(e) = adapter.update_repo(&org_name, &repo_op.repo).await {
-                            events.push(HyperforgeEvent::Error {
-                                message: format!("  Failed to update {} on {}: {}", repo_op.repo.name, forge_name, e),
-                            });
-                            continue;
-                        }
-                    }
-                    updated += 1;
-                    events.push(HyperforgeEvent::SyncOp {
-                        repo_name: repo_op.repo.name.clone(),
-                        operation: "update".to_string(),
-                        forge: forge_name.clone(),
-                    });
-                }
-                SyncOp::Delete => {
-                    let local = state.get_local_forge(&org_name).await;
-                    let record_info = local.get_record(&repo_op.repo.name).ok();
-
-                    if record_info.as_ref().map_or(false, |r| r.protected) {
-                        events.push(HyperforgeEvent::SyncOp {
-                            repo_name: repo_op.repo.name.clone(),
-                            operation: "skip_protected".to_string(),
-                            forge: forge_name.clone(),
-                        });
-                        continue;
-                    }
-
-                    let already_privatized = record_info.as_ref()
-                        .and_then(|rec| {
-                            HyperforgeConfig::parse_forge(&forge_name)
-                                .map(|fe| rec.privatized_on.contains(&fe))
-                        })
-                        .unwrap_or(false);
-
-                    if already_privatized {
-                        events.push(HyperforgeEvent::SyncOp {
-                            repo_name: repo_op.repo.name.clone(),
-                            operation: "already_privatized".to_string(),
-                            forge: forge_name.clone(),
-                        });
-                    } else {
-                        let private_repo = crate::types::Repo::new(
-                            &repo_op.repo.name,
-                            repo_op.repo.origin.clone(),
-                        ).with_visibility(crate::types::Visibility::Private);
-
-                        if !dry_run {
-                            match adapter.update_repo(&org_name, &private_repo).await {
-                                Ok(_) => {
-                                    if let Some(forge_enum) = HyperforgeConfig::parse_forge(&forge_name) {
-                                        if let Ok(mut rec) = local.get_record(&repo_op.repo.name) {
-                                            rec.privatized_on.insert(forge_enum);
-                                            let _ = local.update_record(&rec);
-                                            let _ = local.save_to_yaml().await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    events.push(HyperforgeEvent::Error {
-                                        message: format!("  Failed to privatize {} on {}: {}",
-                                            repo_op.repo.name, forge_name, e),
-                                    });
-                                }
-                            }
-                        }
-                        events.push(HyperforgeEvent::SyncOp {
-                            repo_name: repo_op.repo.name.clone(),
-                            operation: "privatize".to_string(),
-                            forge: forge_name.clone(),
-                        });
-                    }
-                }
-                SyncOp::InSync => {}
-            }
-        }
-
-        (events, created, updated)
-    }).await;
-
-    for result in results {
-        match result {
-            Ok((events, created, updated)) => {
-                total_created += created;
-                total_updated += updated;
-                all_events.extend(events);
-            }
-            Err(e) => {
-                all_events.push(HyperforgeEvent::Error { message: format!("Task join error: {}", e) });
-            }
-        }
-    }
-
-    (all_events, total_created, total_updated)
 }
 
 /// Phase 7.5: Retire remote-only repos (reflect/purge mode).

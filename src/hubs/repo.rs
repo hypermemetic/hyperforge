@@ -393,14 +393,15 @@ impl RepoHub {
             // Soft-delete locally (always, even if remote privatization had errors)
             match local.delete_repo(&org, &name).await {
                 Ok(_) => {
-                    // Record which forges were successfully privatized
-                    if !privatized_forges.is_empty() {
-                        if let Ok(mut rec) = local.get_record(&name) {
-                            for f in &privatized_forges {
-                                rec.privatized_on.insert(f.clone());
-                            }
-                            let _ = local.update_record(&rec);
+                    // Record which forges were successfully privatized + update visibility
+                    if let Ok(mut rec) = local.get_record(&name) {
+                        for f in &privatized_forges {
+                            rec.privatized_on.insert(f.clone());
                         }
+                        if !privatized_forges.is_empty() {
+                            rec.visibility = Visibility::Private;
+                        }
+                        let _ = local.update_record(&rec);
                     }
 
                     if let Err(e) = local.save_to_yaml().await {
@@ -489,7 +490,9 @@ impl RepoHub {
             };
 
             let mut delete_errors = Vec::new();
-            for forge in &record.present_on {
+            let mut deleted_forges = Vec::new();
+            let forges_to_delete: Vec<_> = record.present_on.iter().cloned().collect();
+            for forge in &forges_to_delete {
                 let adapter = match make_repo_adapter(forge, auth.clone(), &org) {
                     Ok(a) => a,
                     Err(e) => {
@@ -500,6 +503,7 @@ impl RepoHub {
 
                 match adapter.delete_repo(&org, &name).await {
                     Ok(_) => {
+                        deleted_forges.push(forge.clone());
                         yield HyperforgeEvent::Info {
                             message: format!("Deleted from {:?}", forge),
                         };
@@ -507,6 +511,20 @@ impl RepoHub {
                     Err(e) => {
                         delete_errors.push(format!("{:?}: {}", forge, e));
                     }
+                }
+            }
+
+            // Track partial progress in LocalForge: update present_on and deleted_from
+            if !deleted_forges.is_empty() {
+                if let Ok(mut rec) = local.get_record(&name) {
+                    for f in &deleted_forges {
+                        rec.present_on.remove(f);
+                        if !rec.deleted_from.contains(f) {
+                            rec.deleted_from.push(f.clone());
+                        }
+                    }
+                    let _ = local.update_record(&rec);
+                    let _ = local.save_to_yaml().await;
                 }
             }
 
@@ -755,6 +773,19 @@ impl RepoHub {
                 yield HyperforgeEvent::Error {
                     message: format!("Failed to set default branch - {}", error),
                 };
+            }
+
+            // Update LocalForge record with the new default branch
+            if errors.is_empty() {
+                if let Err(e) = local.set_default_branch(&org, &name, &branch).await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to update LocalForge default_branch: {}", e),
+                    };
+                } else if let Err(e) = local.save_to_yaml().await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save repos.yaml: {}", e),
+                    };
+                }
             }
 
             // Optionally checkout locally
@@ -1466,6 +1497,198 @@ impl RepoHub {
 
             yield HyperforgeEvent::Info {
                 message: format!("Repository {} cloned and configured", name),
+            };
+        }
+    }
+
+    /// Sync a repo from LocalForge to its remote forges
+    #[plexus_macros::hub_method(
+        description = "Sync a repo from LocalForge to its remote forges (create if missing, update if drifted)",
+        params(
+            org = "Organization name",
+            name = "Repository name",
+            dry_run = "Preview changes without applying (optional, default: false)"
+        )
+    )]
+    pub async fn sync(
+        &self,
+        org: String,
+        name: String,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            let dry_prefix = if is_dry_run { "[DRY RUN] " } else { "" };
+            let local = state.get_local_forge(&org).await;
+
+            // Get repo record from LocalForge
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                    };
+                    return;
+                }
+            };
+
+            let repo = record.to_repo();
+
+            if record.forges.is_empty() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo '{}' has no target forges configured", name),
+                };
+                return;
+            }
+
+            let auth = match make_auth() {
+                Ok(a) => a,
+                Err(e) => {
+                    yield HyperforgeEvent::Error { message: e };
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Syncing repo '{}' to forges: [{}]",
+                    dry_prefix, name, record.forges.join(", "),
+                ),
+            };
+
+            let mut created = 0usize;
+            let mut updated = 0usize;
+            let mut in_sync = 0usize;
+            let mut errors = 0usize;
+            let mut record = record;
+
+            for forge_name in &record.forges.clone() {
+                let forge = match HyperforgeConfig::parse_forge(forge_name) {
+                    Some(f) => f,
+                    None => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Invalid forge: {}", forge_name),
+                        };
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                let adapter = match make_repo_adapter(&forge, auth.clone(), &org) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("{}: {}", forge_name, e),
+                        };
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                // Check if repo exists on this forge
+                let exists = match adapter.repo_exists(&org, &name).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("{}: failed to check existence: {}", forge_name, e),
+                        };
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                if !exists {
+                    // Create
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {}Creating {} on {}", dry_prefix, name, forge_name),
+                    };
+                    if !is_dry_run {
+                        match adapter.create_repo(&org, &repo).await {
+                            Ok(_) => {
+                                created += 1;
+                                record.present_on.insert(forge.clone());
+                            }
+                            Err(e) => {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("{}: create failed: {}", forge_name, e),
+                                };
+                                errors += 1;
+                            }
+                        }
+                    } else {
+                        created += 1;
+                    }
+                } else {
+                    // Check for drift
+                    let remote = match adapter.get_repo(&org, &name).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            yield HyperforgeEvent::Error {
+                                message: format!("{}: failed to fetch remote: {}", forge_name, e),
+                            };
+                            errors += 1;
+                            continue;
+                        }
+                    };
+
+                    let desc_drifted = repo.description != remote.description;
+                    let vis_drifted = repo.visibility != remote.visibility;
+
+                    if desc_drifted || vis_drifted {
+                        let mut diffs = Vec::new();
+                        if desc_drifted { diffs.push("description"); }
+                        if vis_drifted { diffs.push("visibility"); }
+
+                        yield HyperforgeEvent::Info {
+                            message: format!(
+                                "  {}Updating {} on {} (drifted: {})",
+                                dry_prefix, name, forge_name, diffs.join(", "),
+                            ),
+                        };
+
+                        if !is_dry_run {
+                            match adapter.update_repo(&org, &repo).await {
+                                Ok(_) => {
+                                    updated += 1;
+                                    record.present_on.insert(forge.clone());
+                                }
+                                Err(e) => {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("{}: update failed: {}", forge_name, e),
+                                    };
+                                    errors += 1;
+                                }
+                            }
+                        } else {
+                            updated += 1;
+                        }
+                    } else {
+                        record.present_on.insert(forge.clone());
+                        in_sync += 1;
+                    }
+                }
+            }
+
+            // Persist present_on updates to LocalForge
+            if !is_dry_run && (created > 0 || updated > 0 || in_sync > 0) {
+                if let Err(e) = local.update_record(&record) {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to update LocalForge record: {}", e),
+                    };
+                } else if let Err(e) = local.save_to_yaml().await {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to save repos.yaml: {}", e),
+                    };
+                }
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{}Sync complete: {} created, {} updated, {} in sync, {} errors",
+                    dry_prefix, created, updated, in_sync, errors,
+                ),
             };
         }
     }

@@ -8,15 +8,17 @@ use crate::commands::runner::discover_or_bail;
 use crate::commands::workspace::build_dep_graph;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
-use crate::hubs::utils::{dry_prefix, glob_match};
+use crate::hubs::utils::{dry_prefix, RepoFilter};
 
 pub fn exec(
     path: String,
     command: String,
-    filter: Option<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     sequential: Option<bool>,
     dirty: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+    let filter = RepoFilter::new(include, exclude);
     let is_sequential = sequential.unwrap_or(false);
     let only_dirty = dirty.unwrap_or(false);
 
@@ -29,13 +31,9 @@ pub fn exec(
         };
 
         // Filter repos by name glob if provided
-        let mut repos: Vec<&crate::commands::workspace::DiscoveredRepo> = if let Some(ref pattern) = filter {
-            ctx.repos.iter().filter(|r| {
-                glob_match(pattern, &r.dir_name)
-            }).collect()
-        } else {
-            ctx.repos.iter().collect()
-        };
+        let mut repos: Vec<&crate::commands::workspace::DiscoveredRepo> = ctx.repos.iter()
+            .filter(|r| filter.matches(&r.dir_name))
+            .collect();
 
         // Filter to dirty repos only
         if only_dirty {
@@ -143,6 +141,7 @@ pub fn validate(
         let graph = build_dep_graph(&ctx.repos);
 
         // Build CI configs from per-repo .hyperforge/config.toml [ci] sections
+        // For validate (Docker), find the first docker-type runner in the runners array
         let ci_configs: Vec<(String, crate::build_system::validate::RepoCiConfig)> = ctx
             .repos
             .iter()
@@ -153,16 +152,32 @@ pub fn validate(
 
                 let mut cfg = crate::build_system::validate::RepoCiConfig::default();
                 cfg.repo_name = name.clone();
-                if !ci.build.is_empty() {
-                    cfg.build_command = ci.build.clone();
-                }
-                if !ci.test.is_empty() {
-                    cfg.test_command = ci.test.clone();
-                }
-                cfg.dockerfile = ci.dockerfile.clone();
                 cfg.skip = ci.skip_validate;
-                cfg.timeout_secs = ci.timeout_secs;
-                cfg.env = ci.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+                // Find the first Docker runner for containerized validation
+                if let Some(docker_runner) = ci.runners.iter().find(|r| {
+                    r.runner_type == crate::types::config::RunnerType::Docker
+                }) {
+                    if !docker_runner.build.is_empty() {
+                        cfg.build_command = docker_runner.build.clone();
+                    }
+                    if !docker_runner.test.is_empty() {
+                        cfg.test_command = docker_runner.test.clone();
+                    }
+                    cfg.dockerfile = None; // Docker runners use image, not dockerfile
+                    cfg.timeout_secs = docker_runner.timeout_secs;
+                    cfg.env = docker_runner.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                } else if let Some(last_runner) = ci.runners.last() {
+                    // Fall back to last (most thorough) local runner
+                    if !last_runner.build.is_empty() {
+                        cfg.build_command = last_runner.build.clone();
+                    }
+                    if !last_runner.test.is_empty() {
+                        cfg.test_command = last_runner.test.clone();
+                    }
+                    cfg.timeout_secs = last_runner.timeout_secs;
+                    cfg.env = last_runner.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                }
 
                 Some((name, cfg))
             })
