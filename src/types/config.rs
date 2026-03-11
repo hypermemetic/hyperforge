@@ -148,7 +148,7 @@ pub fn default_ci_config(build_systems: &[BuildSystemKind]) -> CiConfig {
             runners: vec![
                 RunnerConfig {
                     runner_type: RunnerType::Local,
-                    build: vec!["npm".into(), "run".into(), "build".into()],
+                    build: vec!["npm install && npm run build".into()],
                     test: vec!["npm".into(), "test".into()],
                     image: None,
                     env: HashMap::new(),
@@ -156,11 +156,7 @@ pub fn default_ci_config(build_systems: &[BuildSystemKind]) -> CiConfig {
                 },
                 RunnerConfig {
                     runner_type: RunnerType::Docker,
-                    build: vec![
-                        "sh".into(),
-                        "-c".into(),
-                        "npm install && npm run build".into(),
-                    ],
+                    build: vec!["npm install && npm run build".into()],
                     test: vec!["npm".into(), "test".into()],
                     image: Some("node:lts".into()),
                     env: HashMap::new(),
