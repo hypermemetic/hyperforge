@@ -146,8 +146,8 @@ pub fn validate(
             .repos
             .iter()
             .filter_map(|repo| {
-                let config = repo.config.as_ref()?;
-                let ci = config.ci.as_ref()?;
+                let existing_ci = repo.config.as_ref().and_then(|c| c.ci.as_ref());
+                let ci = crate::types::config::resolve_ci_config(existing_ci, &repo.build_systems);
                 let name = repo.effective_name();
 
                 let mut cfg = crate::build_system::validate::RepoCiConfig::default();

@@ -315,7 +315,7 @@ impl WorkspaceHub {
                     }
 
                     // Generate default CI and update LocalForge record
-                    let ci = crate::types::config::default_ci_config(&repo.build_systems);
+                    let ci = crate::types::config::resolve_ci_config(None, &repo.build_systems);
                     let name = repo.effective_name();
                     let org_name = config.org.as_deref().unwrap_or(org_str.as_str());
                     let local = state.get_local_forge(org_name).await;

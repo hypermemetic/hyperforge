@@ -67,6 +67,22 @@ impl Default for CiConfig {
     }
 }
 
+/// Resolve CI config for a repo: use existing config if present, otherwise generate defaults.
+///
+/// This is the single entry point for CI config resolution. Used by:
+/// - `build init_configs` to persist defaults to disk
+/// - `build run` at runtime to determine what runners to execute
+/// - `workspace init` Phase 4 to inject CI into newly-initialized repos
+pub fn resolve_ci_config(
+    existing: Option<&CiConfig>,
+    build_systems: &[BuildSystemKind],
+) -> CiConfig {
+    if let Some(ci) = existing {
+        return ci.clone();
+    }
+    default_ci_config(build_systems)
+}
+
 /// Generate default CI config based on detected build systems.
 /// Returns layered runners appropriate for each build system kind.
 pub fn default_ci_config(build_systems: &[BuildSystemKind]) -> CiConfig {

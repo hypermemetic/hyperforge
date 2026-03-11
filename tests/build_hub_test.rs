@@ -100,6 +100,8 @@ fn build_hub_has_correct_methods() {
         "bump",
         "exec",
         "validate",
+        "run",
+        "init_configs",
         "gitignore_sync",
         "schema",
     ]
@@ -122,6 +124,7 @@ fn workspace_hub_has_correct_methods() {
         "diff",
         "sync",
         "set_default_branch",
+        "check_default_branch",
         "verify",
         "clone",
         "move_repos",
@@ -293,7 +296,7 @@ async fn route_build_exec_echo() {
             serde_json::json!({
                 "path": tmp.path().to_str().unwrap(),
                 "command": "echo hello",
-                "filter": "alpha",
+                "include": ["alpha"],
             }),
         )
         .await
@@ -331,7 +334,7 @@ async fn route_build_exec_filter_excludes() {
             serde_json::json!({
                 "path": tmp.path().to_str().unwrap(),
                 "command": "echo hi",
-                "filter": "nonexistent*",
+                "include": ["nonexistent*"],
             }),
         )
         .await
@@ -408,7 +411,7 @@ async fn route_build_bump_dry_run() {
                 "path": tmp.path().to_str().unwrap(),
                 "bump": "patch",
                 "dry_run": true,
-                "filter": "alpha",
+                "include": ["alpha"],
             }),
         )
         .await

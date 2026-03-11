@@ -220,6 +220,26 @@ impl BuildHub {
         local_run::run(path, test, level, include, exclude, dry_run)
     }
 
+    /// Initialize CI configs for repos that lack them
+    #[plexus_macros::hub_method(
+        description = "Generate default [ci] runner configs for workspace repos that don't have one. Detects build system (Cargo/Cabal/Node) and writes layered runners to .hyperforge/config.toml. Idempotent — repos with existing CI config are untouched.",
+        params(
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            dry_run = "Preview without writing files (optional, default: false)"
+        )
+    )]
+    pub async fn init_configs(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        local_run::init_configs(path, include, exclude, dry_run)
+    }
+
     /// Ensure sane .gitignore patterns across all workspace repos
     #[plexus_macros::hub_method(
         description = "Add missing .gitignore patterns across all workspace repos. Includes OS, editor, build artifact, and build-system-specific patterns. Idempotent — only adds what's missing.",

@@ -9,7 +9,7 @@ use crate::commands::runner::discover_or_bail;
 use crate::commands::workspace::build_publish_dep_graph;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::{dry_prefix, RepoFilter};
-use crate::types::config::{default_ci_config, RunnerConfig, RunnerType};
+use crate::types::config::{resolve_ci_config, RunnerConfig, RunnerType};
 
 /// Run build/test commands using layered CI runners in dependency order.
 ///
@@ -60,18 +60,9 @@ pub fn run(
                 continue;
             }
 
-            let (runners, skip) = if let Some(config) = repo.config.as_ref() {
-                if let Some(ci) = config.ci.as_ref() {
-                    (ci.runners.clone(), ci.skip_validate)
-                } else {
-                    // No CI section — generate defaults from build system
-                    let ci = default_ci_config(&repo.build_systems);
-                    (ci.runners, ci.skip_validate)
-                }
-            } else {
-                let ci = default_ci_config(&repo.build_systems);
-                (ci.runners, ci.skip_validate)
-            };
+            let existing_ci = repo.config.as_ref().and_then(|c| c.ci.as_ref());
+            let ci = resolve_ci_config(existing_ci, &repo.build_systems);
+            let (runners, skip) = (ci.runners, ci.skip_validate);
 
             repo_runners.insert(name, (repo.path.clone(), runners, skip));
         }
@@ -317,6 +308,99 @@ struct CmdOutput {
     #[allow(dead_code)]
     stdout: String,
     stderr: String,
+}
+
+/// Initialize CI configs for all workspace repos that lack a [ci] section.
+///
+/// For each repo with a detected build system but no CI config:
+/// - Generates default layered runners via `resolve_ci_config`
+/// - Writes the [ci] section to `.hyperforge/config.toml`
+///
+/// Repos that already have a [ci] section are left untouched.
+/// Repos with no detected build system get `skip_validate: true`.
+pub fn init_configs(
+    path: String,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    dry_run: Option<bool>,
+) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+    let filter = RepoFilter::new(include, exclude);
+    let is_dry_run = dry_run.unwrap_or(false);
+
+    stream! {
+        let workspace_path = PathBuf::from(&path);
+        let dry = dry_prefix(is_dry_run);
+
+        let ctx = match discover_or_bail(&workspace_path) {
+            Ok(ctx) => ctx,
+            Err(event) => { yield event; return; }
+        };
+
+        let mut written = 0usize;
+        let mut skipped_existing = 0usize;
+        let mut skipped_no_bs = 0usize;
+
+        for repo in &ctx.repos {
+            if !filter.matches(&repo.dir_name) {
+                continue;
+            }
+
+            // Resolve CI config — returns existing if present, defaults otherwise
+            let existing_ci = repo.config.as_ref().and_then(|c| c.ci.as_ref());
+            let ci = resolve_ci_config(existing_ci, &repo.build_systems);
+
+            // Skip if repo already has CI config
+            if existing_ci.is_some() {
+                skipped_existing += 1;
+                continue;
+            }
+
+            // Skip repos with no real build system (they get skip_validate: true)
+            if ci.skip_validate && ci.runners.is_empty() {
+                skipped_no_bs += 1;
+                continue;
+            }
+
+            let name = repo.effective_name();
+            let runner_desc: Vec<String> = ci.runners.iter().enumerate().map(|(i, r)| {
+                let ty = match r.runner_type {
+                    RunnerType::Local => "local",
+                    RunnerType::Docker => "docker",
+                };
+                format!("L{}: {} {}", i, ty, r.build.join(" "))
+            }).collect();
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}{}: {} runners [{}]", dry, name, ci.runners.len(), runner_desc.join(", ")),
+            };
+
+            if !is_dry_run {
+                // Load existing config or create minimal one
+                let mut config = repo.config.clone().unwrap_or_else(|| {
+                    crate::config::HyperforgeConfig::default()
+                });
+                config.ci = Some(ci);
+
+                match config.save(&repo.path) {
+                    Ok(_) => { written += 1; }
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to write config for {}: {}", name, e),
+                        };
+                    }
+                }
+            } else {
+                written += 1;
+            }
+        }
+
+        yield HyperforgeEvent::Info {
+            message: format!(
+                "{}CI init: {} written, {} already configured, {} no build system",
+                dry, written, skipped_existing, skipped_no_bs,
+            ),
+        };
+    }
 }
 
 async fn execute_runner_cmd(
