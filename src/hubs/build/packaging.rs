@@ -3,14 +3,137 @@
 use async_stream::stream;
 use futures::Stream;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::build_system::BuildSystemKind;
 use crate::commands::runner::{discover_or_bail, run_batch};
 use crate::commands::workspace::build_publish_dep_graph;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::{dry_prefix, RepoFilter};
 use crate::package::DriftResult;
+
+/// Result of a version bump + commit + tag operation.
+struct BumpResult {
+    events: Vec<HyperforgeEvent>,
+    success: bool,
+}
+
+/// Check that a repo is clean, bump the version, commit (manifest + lockfile), and create a git tag.
+///
+/// Returns events to yield and whether the operation succeeded.
+fn bump_commit_tag(
+    repo_path: &Path,
+    package_name: &str,
+    new_version: &str,
+    build_system: &BuildSystemKind,
+    skip_commit: bool,
+    skip_tag: bool,
+) -> BumpResult {
+    let mut events = Vec::new();
+
+    // Check repo is clean before bumping
+    match Git::repo_status(repo_path) {
+        Ok(status) => {
+            if status.has_changes || status.has_staged {
+                events.push(HyperforgeEvent::PublishStep {
+                    package_name: package_name.to_string(),
+                    version: new_version.to_string(),
+                    registry: registry_kind_for(build_system),
+                    action: crate::hub::PublishActionKind::Failed,
+                    success: false,
+                    error: Some("repo has uncommitted changes — commit or stash first".to_string()),
+                });
+                return BumpResult { events, success: false };
+            }
+        }
+        Err(e) => {
+            events.push(HyperforgeEvent::PublishStep {
+                package_name: package_name.to_string(),
+                version: new_version.to_string(),
+                registry: registry_kind_for(build_system),
+                action: crate::hub::PublishActionKind::Failed,
+                success: false,
+                error: Some(format!("git status failed: {}", e)),
+            });
+            return BumpResult { events, success: false };
+        }
+    }
+
+    // Write the new version to the manifest
+    if let Err(e) = crate::build_system::version::set_package_version(
+        repo_path,
+        build_system,
+        new_version,
+    ) {
+        events.push(HyperforgeEvent::PublishStep {
+            package_name: package_name.to_string(),
+            version: new_version.to_string(),
+            registry: registry_kind_for(build_system),
+            action: crate::hub::PublishActionKind::Failed,
+            success: false,
+            error: Some(format!("version bump failed: {}", e)),
+        });
+        return BumpResult { events, success: false };
+    }
+
+    if !skip_commit {
+        // Stage manifest file
+        match build_system {
+            BuildSystemKind::Cargo => {
+                let _ = Git::add(repo_path, "Cargo.toml");
+                // Also stage Cargo.lock if it exists and changed
+                if repo_path.join("Cargo.lock").exists() {
+                    let _ = Git::add(repo_path, "Cargo.lock");
+                }
+            }
+            BuildSystemKind::Cabal => {
+                let _ = Git::add(repo_path, "*.cabal");
+            }
+            _ => {
+                let _ = Git::add(repo_path, "package.json");
+                if repo_path.join("package-lock.json").exists() {
+                    let _ = Git::add(repo_path, "package-lock.json");
+                }
+            }
+        }
+
+        let commit_msg = format!("chore: bump {} to {}", package_name, new_version);
+        let _ = Git::commit(repo_path, &commit_msg);
+    }
+
+    if !skip_tag {
+        let tag_name = format!("{}-v{}", package_name, new_version);
+        let tag_msg = format!("Release {} v{}", package_name, new_version);
+        match Git::tag(repo_path, &tag_name, Some(&tag_msg)) {
+            Ok(_) => {
+                events.push(HyperforgeEvent::PublishStep {
+                    package_name: package_name.to_string(),
+                    version: new_version.to_string(),
+                    registry: registry_kind_for(build_system),
+                    action: crate::hub::PublishActionKind::Tag,
+                    success: true,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                events.push(HyperforgeEvent::Info {
+                    message: format!("  Warning: failed to create tag {}: {}", tag_name, e),
+                });
+            }
+        }
+    }
+
+    BumpResult { events, success: true }
+}
+
+fn registry_kind_for(bs: &BuildSystemKind) -> crate::hub::PackageRegistry {
+    match bs {
+        BuildSystemKind::Cargo => crate::hub::PackageRegistry::CratesIo,
+        BuildSystemKind::Cabal => crate::hub::PackageRegistry::Hackage,
+        _ => crate::hub::PackageRegistry::Npm,
+    }
+}
 
 pub fn package_diff(
     path: String,
@@ -324,52 +447,24 @@ pub fn publish(
                         _ => unreachable!(),
                     };
 
-                    // Auto-bump: edit manifest and optionally commit
+                    // Auto-bump: check clean, bump, commit, tag
                     if is_auto_bump && !is_dry_run {
-                        if let Err(e) = crate::build_system::version::set_package_version(
+                        let bump_result = bump_commit_tag(
                             &step.path,
-                            build_system,
+                            &step.name,
                             &step.target_version,
-                        ) {
+                            build_system,
+                            skip_commits,
+                            true, // skip tag here — tag after successful publish
+                        );
+                        for event in bump_result.events {
+                            yield event;
+                        }
+                        if !bump_result.success {
                             failed_nodes.insert(step.node_idx);
                             failed_count += 1;
-                            yield HyperforgeEvent::PublishStep {
-                                package_name: step.name.clone(),
-                                version: step.target_version.clone(),
-                                registry: registry_kind,
-                                action: crate::hub::PublishActionKind::Failed,
-                                success: false,
-                                error: Some(format!("version bump failed: {}", e)),
-                            };
                             continue;
                         }
-
-                        if !skip_commits {
-                            // Stage and commit the version bump
-                            let manifest_file = match build_system {
-                                crate::build_system::BuildSystemKind::Cargo => "Cargo.toml",
-                                crate::build_system::BuildSystemKind::Cabal => {
-                                    // Find .cabal file name
-                                    &step.name
-                                }
-                                _ => "package.json",
-                            };
-
-                            // For cabal, we need the actual filename
-                            if *build_system == crate::build_system::BuildSystemKind::Cabal {
-                                // Stage all .cabal files
-                                let _ = Git::add(&step.path, "*.cabal");
-                            } else {
-                                let _ = Git::add(&step.path, manifest_file);
-                            }
-
-                            let commit_msg = format!(
-                                "chore: bump {} to {}",
-                                step.name, step.target_version
-                            );
-                            let _ = Git::commit(&step.path, &commit_msg);
-                        }
-
                         auto_bumped_count += 1;
                     } else if is_auto_bump {
                         // Dry run auto-bump
@@ -392,7 +487,7 @@ pub fn publish(
                                 error: None,
                             };
 
-                            // Git tag
+                            // Git tag after successful publish
                             if !skip_tags && !is_dry_run {
                                 let tag_name = format!("{}-v{}", step.name, step.target_version);
                                 let tag_msg = format!("Release {} v{}", step.name, step.target_version);
@@ -520,32 +615,22 @@ pub fn bump(
             let new_version = parsed.bump(&bump_kind).to_string();
 
             if !is_dry_run {
-                match crate::build_system::version::set_package_version(
+                let result = bump_commit_tag(
                     &repo.path,
-                    &repo.build_system,
+                    name,
                     &new_version,
-                ) {
-                    Ok(_) => {
-                        bumped += 1;
-
-                        if auto_commit {
-                            let manifest_file = match repo.build_system {
-                                crate::build_system::BuildSystemKind::Cargo => "Cargo.toml",
-                                crate::build_system::BuildSystemKind::Cabal => "*.cabal",
-                                _ => "package.json",
-                            };
-                            let _ = Git::add(&repo.path, manifest_file);
-                            let commit_msg = format!("chore: bump {} to {}", name, new_version);
-                            let _ = Git::commit(&repo.path, &commit_msg);
-                        }
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        yield HyperforgeEvent::Error {
-                            message: format!("  {}: bump failed: {}", name, e),
-                        };
-                        continue;
-                    }
+                    &repo.build_system,
+                    !auto_commit,  // skip_commit = !auto_commit
+                    !auto_commit,  // skip_tag = !auto_commit (tags go with commits)
+                );
+                for event in result.events {
+                    yield event;
+                }
+                if result.success {
+                    bumped += 1;
+                } else {
+                    failed += 1;
+                    continue;
                 }
             } else {
                 bumped += 1;
@@ -554,11 +639,7 @@ pub fn bump(
             yield HyperforgeEvent::PublishStep {
                 package_name: name.to_string(),
                 version: new_version.clone(),
-                registry: match repo.build_system {
-                    crate::build_system::BuildSystemKind::Cargo => crate::hub::PackageRegistry::CratesIo,
-                    crate::build_system::BuildSystemKind::Cabal => crate::hub::PackageRegistry::Hackage,
-                    _ => crate::hub::PackageRegistry::Npm,
-                },
+                registry: registry_kind_for(&repo.build_system),
                 action: crate::hub::PublishActionKind::AutoBump,
                 success: true,
                 error: None,
