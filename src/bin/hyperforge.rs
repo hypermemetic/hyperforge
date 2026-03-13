@@ -2,6 +2,7 @@ use clap::Parser;
 use plexus_core::plexus::DynamicHub;
 use plexus_transport::TransportServer;
 use hyperforge::HyperforgeHub;
+use hyperforge::auth_hub::AuthHub;
 use hyperforge::registry::{RegistryClient, RegistryConfig};
 use std::sync::Arc;
 
@@ -25,6 +26,10 @@ struct Args {
     /// Skip registry registration on startup
     #[arg(long)]
     no_register: bool,
+
+    /// Skip auto-starting the secrets (hyperforge-auth) sidecar
+    #[arg(long)]
+    no_secrets: bool,
 
     /// Port where the Plexus registry is listening
     #[arg(long, default_value = "4444")]
@@ -106,6 +111,47 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Auto-start secrets sidecar in-process on port + 1
+    let secrets_handle = if !args.no_secrets && !args.stdio {
+        let secrets_port = args.port + 1;
+        match AuthHub::new().await {
+            Ok(auth_hub) => {
+                let secrets = Arc::new(
+                    DynamicHub::new("secrets")
+                        .register(auth_hub)
+                );
+                let rpc_conv = |arc: Arc<DynamicHub>| {
+                    DynamicHub::arc_into_rpc_module(arc)
+                        .map_err(|e| anyhow::anyhow!("Failed to create RPC module: {}", e))
+                };
+                match TransportServer::builder(secrets, rpc_conv)
+                    .with_websocket(secrets_port)
+                    .build()
+                    .await
+                {
+                    Ok(server) => {
+                        tracing::info!("secrets sidecar listening on port {secrets_port}");
+                        Some(tokio::spawn(async move {
+                            if let Err(e) = server.serve().await {
+                                tracing::warn!("secrets sidecar exited: {e}");
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to start secrets sidecar (non-fatal): {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to init secrets hub (non-fatal): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Configure transport server
     let rpc_converter = |arc: Arc<DynamicHub>| {
         DynamicHub::arc_into_rpc_module(arc)
@@ -153,6 +199,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     };
+
+    // Abort secrets sidecar on shutdown
+    if let Some(handle) = secrets_handle {
+        handle.abort();
+    }
 
     // Best-effort deregistration on shutdown
     if let Some(client) = registry_client {

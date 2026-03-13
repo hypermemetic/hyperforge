@@ -6,6 +6,8 @@
 //! `cabal sdist` build.
 
 use super::{DriftResult, PublishResult, PublishedVersion, RegistryClient};
+use crate::auth::YamlAuthProvider;
+use crate::auth::AuthProvider;
 use crate::build_system::BuildSystemKind;
 use crate::hub::PackageRegistry;
 use async_trait::async_trait;
@@ -28,7 +30,8 @@ impl HackageClient {
 
     /// Resolve the Hackage auth token. Tries in order:
     /// 1. `HACKAGE_TOKEN` env var
-    /// 2. `password-command` from `~/.cabal/config`
+    /// 2. Secrets store (`hackage/token`)
+    /// 3. `password-command` from `~/.cabal/config`
     async fn resolve_token(&self) -> Option<String> {
         // 1. Env var
         if let Ok(token) = std::env::var("HACKAGE_TOKEN") {
@@ -37,7 +40,16 @@ impl HackageClient {
             }
         }
 
-        // 2. Parse password-command from cabal config
+        // 2. Secrets store
+        if let Ok(provider) = YamlAuthProvider::new() {
+            if let Ok(Some(token)) = provider.get_secret("hackage/token").await {
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+
+        // 3. Parse password-command from cabal config
         let config_path = dirs::home_dir()?.join(".cabal/config");
         let config = tokio::fs::read_to_string(&config_path).await.ok()?;
         let cmd = config

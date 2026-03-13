@@ -5,7 +5,7 @@
 //! Usage:
 //!   hyperforge-auth [--port PORT]
 //!
-//! Default port: 4445
+//! Default port: 44105 (lforge default + 1)
 
 use clap::Parser;
 use plexus_core::plexus::DynamicHub;
@@ -18,8 +18,8 @@ use tracing::{info, error};
 #[command(name = "hyperforge-auth")]
 #[command(about = "Hyperforge Auth Hub - Secret management", long_about = None)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value = "4445")]
+    /// Port to listen on (default: lforge port + 1 = 44105)
+    #[arg(short, long, default_value = "44105")]
     port: u16,
 }
 
