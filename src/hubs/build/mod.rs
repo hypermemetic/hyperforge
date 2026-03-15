@@ -3,11 +3,14 @@
 //! These methods never write LocalForge or call forge APIs. They operate purely
 //! on the filesystem via workspace discovery.
 
+pub mod dirty;
 pub mod execution;
 pub mod gitignore;
+pub mod large_files;
 pub mod local_run;
 pub mod manifest;
 pub mod packaging;
+pub mod repo_size;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -260,6 +263,64 @@ impl BuildHub {
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         gitignore::gitignore_sync(path, patterns, include, exclude, dry_run)
+    }
+
+    /// Find large tracked files across workspace repos
+    #[plexus_macros::hub_method(
+        description = "Find large tracked files across all workspace repos. Scans git-tracked files only.",
+        params(
+            path = "Path to workspace directory",
+            threshold_kb = "Size threshold in KB (optional, default: 100)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
+        )
+    )]
+    pub async fn large_files(
+        &self,
+        path: String,
+        threshold_kb: Option<u64>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        large_files::large_files(path, threshold_kb, include, exclude)
+    }
+
+    /// Show total tracked-file size for each workspace repo
+    #[plexus_macros::hub_method(
+        description = "Show total size of git-tracked files per repo, sorted by size descending",
+        params(
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
+        )
+    )]
+    pub async fn repo_sizes(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        repo_size::repo_sizes(path, include, exclude)
+    }
+
+    /// Check which repos have uncommitted changes
+    #[plexus_macros::hub_method(
+        description = "Find repos with staged, unstaged, or untracked changes. Only reports dirty repos by default.",
+        params(
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            all_git = "Include all git repos, not just hyperforge-configured ones (optional, default: false)"
+        )
+    )]
+    pub async fn dirty(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        all_git: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        dirty::dirty(path, include, exclude, all_git)
     }
 }
 

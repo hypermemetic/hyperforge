@@ -217,6 +217,29 @@ pub enum HyperforgeEvent {
         failed: usize,
         tags_created: usize,
     },
+    /// Large tracked file detected in a repository
+    LargeFile {
+        repo_name: String,
+        file_path: String,
+        size_bytes: u64,
+        /// True if the file is only in git history (deleted from working tree)
+        #[serde(default, skip_serializing_if = "crate::types::repo::is_false")]
+        history_only: bool,
+    },
+    /// Repository size summary
+    RepoSize {
+        repo_name: String,
+        tracked_files: usize,
+        total_bytes: u64,
+    },
+    /// Repository dirty status
+    RepoDirty {
+        repo_name: String,
+        has_staged: bool,
+        has_changes: bool,
+        has_untracked: bool,
+        branch: String,
+    },
 }
 
 /// Root hub for hyperforge operations

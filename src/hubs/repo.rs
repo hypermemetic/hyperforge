@@ -1692,6 +1692,254 @@ impl RepoHub {
             };
         }
     }
+
+    /// Find large tracked files in a repository
+    #[plexus_macros::hub_method(
+        description = "Find large tracked files in a repository",
+        params(
+            org = "Organization name",
+            name = "Repository name",
+            threshold_kb = "Size threshold in KB (optional, default: 100)"
+        )
+    )]
+    pub async fn large_files(
+        &self,
+        org: String,
+        name: String,
+        threshold_kb: Option<u64>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+        let threshold = threshold_kb.unwrap_or(100) * 1024;
+
+        stream! {
+            let local = state.get_local_forge(&org).await;
+
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                    };
+                    return;
+                }
+            };
+
+            let repo_path = match &record.local_path {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
+                    };
+                    return;
+                }
+            };
+
+            if !repo_path.exists() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo path does not exist: {}", repo_path.display()),
+                };
+                return;
+            }
+
+            // Scan tracked files + git history
+            let scan = crate::hubs::build::large_files::scan_repo(&repo_path, threshold);
+
+            match scan {
+                Ok(results) if results.is_empty() => {
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "No files over {}KB in '{}' (tracked or history)",
+                            threshold / 1024,
+                            name,
+                        ),
+                    };
+                }
+                Ok(results) => {
+                    for entry in &results {
+                        yield HyperforgeEvent::LargeFile {
+                            repo_name: name.clone(),
+                            file_path: entry.path.clone(),
+                            size_bytes: entry.size,
+                            history_only: entry.history_only,
+                        };
+                    }
+                    let history_count = results.iter().filter(|e| e.history_only).count();
+                    let tracked_count = results.len() - history_count;
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "Found {} large file(s) over {}KB in '{}' ({} tracked, {} history-only)",
+                            results.len(),
+                            threshold / 1024,
+                            name,
+                            tracked_count,
+                            history_count,
+                        ),
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Scan failed for '{}': {}", name, e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Show total size of tracked files in a repository
+    #[plexus_macros::hub_method(
+        description = "Show total size of git-tracked files in a repository",
+        params(
+            org = "Organization name",
+            name = "Repository name"
+        )
+    )]
+    pub async fn size(
+        &self,
+        org: String,
+        name: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            let local = state.get_local_forge(&org).await;
+
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                    };
+                    return;
+                }
+            };
+
+            let repo_path = match &record.local_path {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
+                    };
+                    return;
+                }
+            };
+
+            if !repo_path.exists() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo path does not exist: {}", repo_path.display()),
+                };
+                return;
+            }
+
+            let output = match std::process::Command::new("git")
+                .args(["ls-files"])
+                .current_dir(&repo_path)
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to run git ls-files: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            if !output.status.success() {
+                yield HyperforgeEvent::Error {
+                    message: format!(
+                        "git ls-files failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                };
+                return;
+            }
+
+            let files_str = String::from_utf8_lossy(&output.stdout);
+            let mut total_bytes: u64 = 0;
+            let mut tracked_files: usize = 0;
+
+            for line in files_str.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                let full_path = repo_path.join(line);
+                if let Ok(meta) = std::fs::metadata(&full_path) {
+                    total_bytes += meta.len();
+                    tracked_files += 1;
+                }
+            }
+
+            yield HyperforgeEvent::RepoSize {
+                repo_name: name,
+                tracked_files,
+                total_bytes,
+            };
+        }
+    }
+
+    /// Check if a repository has uncommitted changes
+    #[plexus_macros::hub_method(
+        description = "Check if a repository has staged, unstaged, or untracked changes",
+        params(
+            org = "Organization name",
+            name = "Repository name"
+        )
+    )]
+    pub async fn dirty(
+        &self,
+        org: String,
+        name: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            let local = state.get_local_forge(&org).await;
+
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                    };
+                    return;
+                }
+            };
+
+            let repo_path = match &record.local_path {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
+                    };
+                    return;
+                }
+            };
+
+            if !repo_path.exists() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo path does not exist: {}", repo_path.display()),
+                };
+                return;
+            }
+
+            match crate::git::Git::repo_status(&repo_path) {
+                Ok(s) => {
+                    yield HyperforgeEvent::RepoDirty {
+                        repo_name: name,
+                        has_staged: s.has_staged,
+                        has_changes: s.has_changes,
+                        has_untracked: s.has_untracked,
+                        branch: s.branch,
+                    };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to get status for '{}': {}", name, e),
+                    };
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]

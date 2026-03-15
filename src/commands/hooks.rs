@@ -32,6 +32,28 @@ if [ ! -f "$CONFIG" ]; then
     exit 0
 fi
 
+# --- Large file check (100KB threshold) ---
+THRESHOLD=102400
+LARGE_FILES=$(git ls-files -z | xargs -0 stat -f '%z %N' 2>/dev/null || git ls-files -z | xargs -0 stat --format='%s %n' 2>/dev/null)
+if [ -n "$LARGE_FILES" ]; then
+    BLOCKED=""
+    echo "$LARGE_FILES" | while IFS= read -r line; do
+        SIZE=$(echo "$line" | awk '{print $1}')
+        FILE=$(echo "$line" | cut -d' ' -f2-)
+        if [ "$SIZE" -gt "$THRESHOLD" ] 2>/dev/null; then
+            KB=$(( SIZE / 1024 ))
+            echo "hyperforge: large tracked file: $FILE (${KB}KB)" >&2
+            echo "BLOCKED" > /tmp/.hyperforge_blocked_$$
+        fi
+    done
+    if [ -f /tmp/.hyperforge_blocked_$$ ]; then
+        rm -f /tmp/.hyperforge_blocked_$$
+        echo "hyperforge: BLOCKED — large tracked files detected (threshold: 100KB)" >&2
+        echo "hyperforge: Remove or .gitignore these files, then commit. Use --no-verify to skip." >&2
+        exit 1
+    fi
+fi
+
 # Determine forge from URL
 FORGE=""
 case "$URL" in

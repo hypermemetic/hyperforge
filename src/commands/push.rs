@@ -15,6 +15,9 @@ use thiserror::Error;
 use crate::config::HyperforgeConfig;
 use crate::git::{Git, GitError};
 
+/// Default large file threshold (100KB)
+const LARGE_FILE_THRESHOLD: u64 = 100 * 1024;
+
 /// Errors that can occur during push
 #[derive(Debug, Error)]
 pub enum PushError {
@@ -42,6 +45,9 @@ pub enum PushError {
 
     #[error("No branch to push. Create a commit first.")]
     NoBranch,
+
+    #[error("Large files detected — push blocked:\n{details}")]
+    LargeFilesBlocked { details: String },
 }
 
 pub type PushResult<T> = Result<T, PushError>;
@@ -198,6 +204,31 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
     let branch = Git::current_branch(path)?;
     if branch.is_empty() {
         return Err(PushError::NoBranch);
+    }
+
+    // Check for large tracked files before pushing
+    if !options.dry_run {
+        if let Ok(entries) = crate::hubs::build::large_files::scan_repo(path, LARGE_FILE_THRESHOLD)
+        {
+            let blocked: Vec<_> = entries
+                .iter()
+                .filter(|e| !e.history_only)
+                .collect();
+            if !blocked.is_empty() {
+                let details = blocked
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "  {} ({:.1}KB)",
+                            e.path,
+                            e.size as f64 / 1024.0,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(PushError::LargeFilesBlocked { details });
+            }
+        }
     }
 
     // Determine which forges to push to
