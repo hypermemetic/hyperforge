@@ -207,8 +207,14 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
     }
 
     // Check for large tracked files before pushing
-    if !options.dry_run {
-        if let Ok(entries) = crate::hubs::build::large_files::scan_repo(path, LARGE_FILE_THRESHOLD)
+    // Use per-repo threshold from config, falling back to default (100KB).
+    // Set to 0 in config to disable the guard entirely.
+    let threshold = config
+        .large_file_threshold_kb
+        .map(|kb| kb * 1024)
+        .unwrap_or(LARGE_FILE_THRESHOLD);
+    if !options.dry_run && threshold > 0 {
+        if let Ok(entries) = crate::hubs::build::large_files::scan_repo(path, threshold)
         {
             let blocked: Vec<_> = entries
                 .iter()

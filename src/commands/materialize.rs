@@ -100,6 +100,7 @@ pub fn materialize(
         forge_config: record.forge_config.clone(),
         default_branch,
         ci: record.ci.clone(),
+        large_file_threshold_kb: None,
     };
 
     // ── Step 1: config ──────────────────────────────────────────────────

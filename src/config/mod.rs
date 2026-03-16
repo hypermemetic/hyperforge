@@ -86,6 +86,10 @@ pub struct HyperforgeConfig {
     /// CI/validation configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ci: Option<CiConfig>,
+
+    /// Large file threshold in KB for push guard (default: 100)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_file_threshold_kb: Option<u64>,
 }
 
 impl Default for HyperforgeConfig {
@@ -100,6 +104,7 @@ impl Default for HyperforgeConfig {
             forge_config: HashMap::new(),
             default_branch: None,
             ci: None,
+            large_file_threshold_kb: None,
         }
     }
 }
