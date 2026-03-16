@@ -1272,7 +1272,8 @@ impl RepoHub {
             set_upstream = "Set upstream tracking (optional, default: false)",
             force = "Force push (optional, default: false)",
             dry_run = "Preview push without executing (optional, default: false)",
-            only_forges = "Only push to specific forges, comma-separated (optional)"
+            only_forges = "Only push to specific forges, comma-separated (optional)",
+            large_file_threshold_kb = "Large file threshold in KB; 0 disables check (optional, default: 100)"
         )
     )]
     pub async fn push(
@@ -1282,6 +1283,7 @@ impl RepoHub {
         force: Option<bool>,
         dry_run: Option<bool>,
         only_forges: Option<String>,
+        large_file_threshold_kb: Option<u64>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             let repo_path = std::path::Path::new(&path);
@@ -1307,6 +1309,10 @@ impl RepoHub {
                     .filter(|s| !s.is_empty())
                     .collect();
                 options = options.only(forges);
+            }
+
+            if let Some(kb) = large_file_threshold_kb {
+                options = options.large_file_threshold_kb(kb);
             }
 
             // Execute push
@@ -1869,10 +1875,30 @@ impl RepoHub {
                 }
             }
 
+            // Get git pack size (history size) via git count-objects -v
+            let pack_bytes = match std::process::Command::new("git")
+                .args(["count-objects", "-v"])
+                .current_dir(&repo_path)
+                .output()
+            {
+                Ok(co) if co.status.success() => {
+                    let stdout = String::from_utf8_lossy(&co.stdout);
+                    stdout.lines()
+                        .find_map(|line| {
+                            line.strip_prefix("size-pack:")
+                                .and_then(|rest| rest.trim().parse::<u64>().ok())
+                                .map(|kb| kb * 1024)
+                        })
+                        .unwrap_or(0)
+                }
+                _ => 0,
+            };
+
             yield HyperforgeEvent::RepoSize {
                 repo_name: name,
                 tracked_files,
                 total_bytes,
+                pack_bytes,
             };
         }
     }

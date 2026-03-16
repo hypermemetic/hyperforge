@@ -23,7 +23,7 @@ use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
 use crate::hubs::repo::RepoHub;
 use crate::hubs::utils::{dry_prefix, make_adapter, workspace_summary, RepoFilter};
-use crate::services::SyncOp;
+use crate::services::{RepoOp, SyncOp};
 use crate::types::Visibility;
 use std::collections::HashSet;
 
@@ -503,7 +503,8 @@ impl WorkspaceHub {
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview pushes without executing (optional, default: false)",
             set_upstream = "Set upstream tracking (optional, default: false)",
-            validate = "Run containerized validation before pushing (optional, default: false)"
+            validate = "Run containerized validation before pushing (optional, default: false)",
+            large_file_threshold_kb = "Large file threshold in KB; 0 disables check (optional, default: 100)"
         )
     )]
     pub async fn push_all(
@@ -515,6 +516,7 @@ impl WorkspaceHub {
         dry_run: Option<bool>,
         set_upstream: Option<bool>,
         validate: Option<bool>,
+        large_file_threshold_kb: Option<u64>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let _ = branch; // push() uses current branch; param is informational
         let filter = RepoFilter::new(include, exclude);
@@ -523,6 +525,7 @@ impl WorkspaceHub {
             let is_dry_run = dry_run.unwrap_or(false);
             let is_set_upstream = set_upstream.unwrap_or(false);
             let is_validate = validate.unwrap_or(false);
+            let threshold_kb = large_file_threshold_kb;
 
             let ctx = match discover_or_bail(&workspace_path) {
                 Ok(ctx) => ctx,
@@ -566,6 +569,7 @@ impl WorkspaceHub {
                     let mut options = PushOptions::new();
                     if is_dry_run { options = options.dry_run(); }
                     if is_set_upstream { options = options.set_upstream(); }
+                    if let Some(kb) = threshold_kb { options = options.large_file_threshold_kb(kb); }
                     (r.dir_name.clone(), r.path.clone(), options)
                 })
                 .collect();
@@ -664,20 +668,72 @@ impl WorkspaceHub {
 
                     match entry.diff_result {
                         Ok(diff) => {
+                            // Enrich ops with git ahead/behind info
+                            let local = state.get_local_forge(&entry.org_name).await;
+                            let records = local.all_records().unwrap_or_default();
+                            let record_map: std::collections::HashMap<_, _> =
+                                records.iter().map(|r| (r.name.as_str(), r)).collect();
+
+                            let mut enriched_ops: Vec<RepoOp> = Vec::with_capacity(diff.ops.len());
+                            for mut op in diff.ops {
+                                if let Some(record) = record_map.get(op.repo.name.as_str()) {
+                                    if let Some(ref local_path) = record.local_path {
+                                        if local_path.exists() {
+                                            // Determine remote name: same logic as HyperforgeConfig::remote_for_forge
+                                            let remote_name = if let Some(fc) = record.forge_config.get(&entry.forge_name) {
+                                                if let Some(ref r) = fc.remote {
+                                                    r.clone()
+                                                } else if record.forges.first().map(|f| f.as_str()) == Some(&entry.forge_name) {
+                                                    "origin".to_string()
+                                                } else {
+                                                    entry.forge_name.clone()
+                                                }
+                                            } else if record.forges.first().map(|f| f.as_str()) == Some(&entry.forge_name) {
+                                                "origin".to_string()
+                                            } else {
+                                                entry.forge_name.clone()
+                                            };
+
+                                            if let Ok((ahead, behind)) = Git::ahead_behind(local_path, &remote_name, &record.default_branch) {
+                                                if ahead > 0 {
+                                                    op.details.push(format!("{} commits ahead", ahead));
+                                                }
+                                                if behind > 0 {
+                                                    op.details.push(format!("{} commits behind", behind));
+                                                }
+                                                // Upgrade InSync to Update if there are commit differences
+                                                if op.op == SyncOp::InSync && !op.details.is_empty() {
+                                                    op.op = SyncOp::Update;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                enriched_ops.push(op);
+                            }
+
+                            // Re-count after enrichment
+                            let total = enriched_ops.len();
+                            let to_create = enriched_ops.iter().filter(|o| o.op == SyncOp::Create).count();
+                            let to_update = enriched_ops.iter().filter(|o| o.op == SyncOp::Update).count();
+                            let to_delete = enriched_ops.iter().filter(|o| o.op == SyncOp::Delete).count();
+                            let in_sync = enriched_ops.iter().filter(|o| o.op == SyncOp::InSync).count();
+
                             yield HyperforgeEvent::SyncSummary {
                                 forge: entry.forge_name.clone(),
-                                total: diff.ops.len(),
-                                to_create: diff.to_create().len(),
-                                to_update: diff.to_update().len(),
-                                to_delete: diff.to_delete().len(),
-                                in_sync: diff.in_sync().len(),
+                                total,
+                                to_create,
+                                to_update,
+                                to_delete,
+                                in_sync,
                             };
 
-                            for op in diff.ops {
+                            for op in enriched_ops {
                                 yield HyperforgeEvent::SyncOp {
                                     repo_name: op.repo.name.clone(),
                                     operation: format!("{:?}", op.op).to_lowercase(),
                                     forge: entry.forge_name.clone(),
+                                    details: op.details,
                                 };
                             }
                         }
@@ -704,7 +760,8 @@ impl WorkspaceHub {
             no_init = "Skip initializing unconfigured repos (optional, default: false)",
             validate = "Run containerized validation before pushing (optional, default: false)",
             reflect = "Enable reflect mode: retire remote-only repos (optional, default: false)",
-            purge = "Delete repos previously staged for deletion. Implies --reflect (optional, default: false)"
+            purge = "Delete repos previously staged for deletion. Implies --reflect (optional, default: false)",
+            large_file_threshold_kb = "Large file threshold in KB; 0 disables check (optional, default: 100)"
         )
     )]
     pub async fn sync(
@@ -720,6 +777,7 @@ impl WorkspaceHub {
         validate: Option<bool>,
         reflect: Option<bool>,
         purge: Option<bool>,
+        large_file_threshold_kb: Option<u64>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let sync_service = self.state.sync_service.clone();
@@ -730,6 +788,7 @@ impl WorkspaceHub {
         let is_purge = purge.unwrap_or(false);
         let is_reflect = reflect.unwrap_or(false) || is_purge;
         let filter = RepoFilter::new(include, exclude);
+        let threshold_kb = large_file_threshold_kb;
 
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -1000,6 +1059,7 @@ impl WorkspaceHub {
                         repo_name: repo.name.clone(),
                         operation: "skip_protected".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     };
                     continue;
                 }
@@ -1016,6 +1076,7 @@ impl WorkspaceHub {
                         repo_name: repo.name.clone(),
                         operation: "already_privatized".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     };
                 } else {
                     let private_repo = crate::types::Repo::new(
@@ -1053,6 +1114,7 @@ impl WorkspaceHub {
                         repo_name: repo.name.clone(),
                         operation: "privatize".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     };
                 }
             }
@@ -1126,6 +1188,7 @@ impl WorkspaceHub {
                         let path = repo.path.clone();
                         let mut options = PushOptions::new();
                         if is_dry_run { options = options.dry_run(); }
+                        if let Some(kb) = threshold_kb { options = options.large_file_threshold_kb(kb); }
                         (dir_name, path, options)
                     })
                     .collect();
@@ -2530,6 +2593,7 @@ async fn sync_retire_remote_only(
                         repo_name: remote_repo.name.clone(),
                         operation: "staged".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     });
                     continue;
                 }
@@ -2566,6 +2630,7 @@ async fn sync_retire_remote_only(
                     repo_name: remote_repo.name.clone(),
                     operation: "purged".to_string(),
                     forge: forge_name.clone(),
+                    details: vec![],
                 });
             } else {
                 // Default: stage for deletion (make private + flag)
@@ -2593,6 +2658,7 @@ async fn sync_retire_remote_only(
                     repo_name: remote_repo.name.clone(),
                     operation: "staged".to_string(),
                     forge: forge_name.clone(),
+                    details: vec![],
                 });
             }
         }

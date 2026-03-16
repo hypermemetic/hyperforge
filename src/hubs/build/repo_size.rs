@@ -8,8 +8,31 @@ use crate::commands::runner::discover_or_bail;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::RepoFilter;
 
-/// Measure total tracked-file size for a single repo.
-fn measure_repo(repo_path: &std::path::Path) -> Result<(usize, u64), String> {
+/// Measure git pack size (history size) for a repo via `git count-objects -v`.
+/// Returns size in bytes (the `size-pack` line reports KB, so we multiply by 1024).
+fn measure_pack_size(repo_path: &std::path::Path) -> u64 {
+    let output = match std::process::Command::new("git")
+        .args(["count-objects", "-v"])
+        .current_dir(repo_path)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("size-pack:") {
+            if let Ok(kb) = rest.trim().parse::<u64>() {
+                return kb * 1024;
+            }
+        }
+    }
+    0
+}
+
+/// Measure total tracked-file size and pack size for a single repo.
+fn measure_repo(repo_path: &std::path::Path) -> Result<(usize, u64, u64), String> {
     let output = std::process::Command::new("git")
         .args(["ls-files"])
         .current_dir(repo_path)
@@ -38,7 +61,9 @@ fn measure_repo(repo_path: &std::path::Path) -> Result<(usize, u64), String> {
         }
     }
 
-    Ok((tracked_files, total_bytes))
+    let pack_bytes = measure_pack_size(repo_path);
+
+    Ok((tracked_files, total_bytes, pack_bytes))
 }
 
 pub fn repo_sizes(
@@ -76,23 +101,23 @@ pub fn repo_sizes(
             8,
             |(repo_name, repo_path)| {
                 match measure_repo(&repo_path) {
-                    Ok((tracked_files, total_bytes)) => (repo_name, tracked_files, total_bytes, None),
-                    Err(e) => (repo_name, 0, 0, Some(e)),
+                    Ok((tracked_files, total_bytes, pack_bytes)) => (repo_name, tracked_files, total_bytes, pack_bytes, None),
+                    Err(e) => (repo_name, 0, 0, 0, Some(e)),
                 }
             },
         ).await;
 
-        let mut entries: Vec<(String, usize, u64)> = Vec::new();
+        let mut entries: Vec<(String, usize, u64, u64)> = Vec::new();
 
         for result in results {
             match result {
-                Ok((repo_name, tracked_files, total_bytes, error)) => {
+                Ok((repo_name, tracked_files, total_bytes, pack_bytes, error)) => {
                     if let Some(e) = error {
                         yield HyperforgeEvent::Error {
                             message: format!("{}: {}", repo_name, e),
                         };
                     } else {
-                        entries.push((repo_name, tracked_files, total_bytes));
+                        entries.push((repo_name, tracked_files, total_bytes, pack_bytes));
                     }
                 }
                 Err(e) => {
@@ -108,22 +133,26 @@ pub fn repo_sizes(
 
         let mut workspace_total: u64 = 0;
         let mut workspace_files: usize = 0;
+        let mut workspace_pack: u64 = 0;
 
-        for (repo_name, tracked_files, total_bytes) in &entries {
+        for (repo_name, tracked_files, total_bytes, pack_bytes) in &entries {
             workspace_total += total_bytes;
             workspace_files += tracked_files;
+            workspace_pack += pack_bytes;
             yield HyperforgeEvent::RepoSize {
                 repo_name: repo_name.clone(),
                 tracked_files: *tracked_files,
                 total_bytes: *total_bytes,
+                pack_bytes: *pack_bytes,
             };
         }
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "Workspace total: {} files, {:.1}MB across {} repos",
+                "Workspace total: {} files, {:.1}MB tracked, {:.1}MB pack across {} repos",
                 workspace_files,
                 workspace_total as f64 / (1024.0 * 1024.0),
+                workspace_pack as f64 / (1024.0 * 1024.0),
                 entries.len(),
             ),
         };

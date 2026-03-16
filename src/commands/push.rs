@@ -53,7 +53,7 @@ pub enum PushError {
 pub type PushResult<T> = Result<T, PushError>;
 
 /// Options for the push command
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PushOptions {
     /// Set upstream tracking when pushing
     pub set_upstream: bool,
@@ -66,6 +66,9 @@ pub struct PushOptions {
 
     /// Only push to specific forges (empty = all)
     pub only_forges: Vec<String>,
+
+    /// Large file threshold in KB (0 = disable check)
+    pub large_file_threshold_kb: u64,
 }
 
 impl PushOptions {
@@ -91,6 +94,23 @@ impl PushOptions {
     pub fn only(mut self, forges: Vec<String>) -> Self {
         self.only_forges = forges;
         self
+    }
+
+    pub fn large_file_threshold_kb(mut self, kb: u64) -> Self {
+        self.large_file_threshold_kb = kb;
+        self
+    }
+}
+
+impl Default for PushOptions {
+    fn default() -> Self {
+        Self {
+            set_upstream: false,
+            dry_run: false,
+            force: false,
+            only_forges: Vec::new(),
+            large_file_threshold_kb: LARGE_FILE_THRESHOLD / 1024,
+        }
     }
 }
 
@@ -206,9 +226,10 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
         return Err(PushError::NoBranch);
     }
 
-    // Check for large tracked files before pushing
-    if !options.dry_run {
-        if let Ok(entries) = crate::hubs::build::large_files::scan_repo(path, LARGE_FILE_THRESHOLD)
+    // Check for large tracked files before pushing (force or threshold=0 bypasses)
+    let threshold = options.large_file_threshold_kb * 1024;
+    if !options.dry_run && !options.force && threshold > 0 {
+        if let Ok(entries) = crate::hubs::build::large_files::scan_repo(path, threshold)
         {
             let blocked: Vec<_> = entries
                 .iter()
