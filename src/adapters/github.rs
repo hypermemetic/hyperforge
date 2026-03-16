@@ -519,9 +519,11 @@ impl ForgePort for GitHubAdapter {
 
 impl GitHubAdapter {
     /// List repos for a user (fallback when org doesn't exist)
-    async fn list_user_repos(&self, username: &str) -> ForgeResult<Vec<Repo>> {
+    async fn list_user_repos(&self, _username: &str) -> ForgeResult<Vec<Repo>> {
         let headers = self.auth_headers().await?;
-        let base_url = format!("{}/users/{}/repos?per_page=100", self.api_url, username);
+        // Use /user/repos (authenticated) instead of /users/{name}/repos (public)
+        // so that private repos are included in the listing.
+        let base_url = format!("{}/user/repos?per_page=100&affiliation=owner", self.api_url);
 
         let response = self.client.get(&base_url)
             .headers(headers)
