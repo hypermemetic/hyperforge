@@ -1633,7 +1633,13 @@ impl RepoHub {
                         }
                     };
 
-                    let desc_drifted = repo.description != remote.description;
+                    let norm_desc = |d: &Option<String>| -> Option<String> {
+                        match d.as_deref() {
+                            None | Some("") => None,
+                            Some(s) => Some(s.to_string()),
+                        }
+                    };
+                    let desc_drifted = norm_desc(&repo.description) != norm_desc(&remote.description);
                     let vis_drifted = repo.visibility != remote.visibility;
 
                     if desc_drifted || vis_drifted {
