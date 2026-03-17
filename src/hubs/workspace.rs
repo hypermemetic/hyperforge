@@ -663,7 +663,13 @@ impl WorkspaceHub {
                     };
 
                     match entry.diff_result {
-                        Ok(diff) => {
+                        Ok(mut diff) => {
+                            // Enrich with git ahead/behind state
+                            let local = state.get_local_forge(&entry.org_name).await;
+                            if let Ok(records) = local.all_records() {
+                                enrich_diff_with_git_state(&mut diff, &entry.forge_name, &state, &records);
+                            }
+
                             yield HyperforgeEvent::SyncSummary {
                                 forge: entry.forge_name.clone(),
                                 total: diff.ops.len(),
@@ -678,6 +684,7 @@ impl WorkspaceHub {
                                     repo_name: op.repo.name.clone(),
                                     operation: format!("{:?}", op.op).to_lowercase(),
                                     forge: entry.forge_name.clone(),
+                                    details: op.details.clone(),
                                 };
                             }
                         }
@@ -898,7 +905,13 @@ impl WorkspaceHub {
                     };
 
                     match entry.diff_result {
-                        Ok(diff) => {
+                        Ok(mut diff) => {
+                            // Enrich with git ahead/behind state
+                            let local = state.get_local_forge(&entry.org_name).await;
+                            if let Ok(records) = local.all_records() {
+                                enrich_diff_with_git_state(&mut diff, &entry.forge_name, &state, &records);
+                            }
+
                             yield HyperforgeEvent::SyncSummary {
                                 forge: entry.forge_name.clone(),
                                 total: diff.ops.len(),
@@ -1000,6 +1013,7 @@ impl WorkspaceHub {
                         repo_name: repo.name.clone(),
                         operation: "skip_protected".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     };
                     continue;
                 }
@@ -1016,6 +1030,7 @@ impl WorkspaceHub {
                         repo_name: repo.name.clone(),
                         operation: "already_privatized".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     };
                 } else {
                     let private_repo = crate::types::Repo::new(
@@ -1053,6 +1068,7 @@ impl WorkspaceHub {
                         repo_name: repo.name.clone(),
                         operation: "privatize".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     };
                 }
             }
@@ -2140,6 +2156,73 @@ impl WorkspaceHub {
     }
 }
 
+// ── Diff enrichment ──────────────────────────────────────────────────────
+
+/// Enrich a SyncDiff with git ahead/behind info from local repos.
+///
+/// For each repo in the diff, looks up the LocalForge record to find the
+/// local clone path, then runs `git ahead_behind` against the appropriate
+/// remote. If commits are ahead/behind, adds details like "3 commits ahead".
+/// Repos that were InSync on metadata but have unpushed commits are upgraded
+/// to Update.
+fn enrich_diff_with_git_state(
+    diff: &mut crate::services::SyncDiff,
+    forge_name: &str,
+    state: &HyperforgeState,
+    records: &[crate::types::repo::RepoRecord],
+) {
+    use crate::services::SyncOp as SOp;
+
+    let record_map: std::collections::HashMap<&str, &crate::types::repo::RepoRecord> = records
+        .iter()
+        .map(|r| (r.name.as_str(), r))
+        .collect();
+    let _ = state;
+
+    for repo_op in &mut diff.ops {
+        let record = match record_map.get(repo_op.repo.name.as_str()) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let local_path = match &record.local_path {
+            Some(p) if p.exists() => p,
+            _ => continue,
+        };
+
+        // Determine remote name for this forge (same logic as HyperforgeConfig::remote_for_forge)
+        let remote_name = record.forge_config.get(forge_name)
+            .and_then(|fc| fc.remote.clone())
+            .unwrap_or_else(|| {
+                if record.forges.first().map(|f| f.as_str()) == Some(forge_name) {
+                    "origin".to_string()
+                } else {
+                    forge_name.to_string()
+                }
+            });
+
+        // Fetch latest state from remote before comparing
+        let _ = Git::fetch(local_path, &remote_name);
+
+        let (ahead, behind) = match Git::ahead_behind(local_path, &remote_name, &record.default_branch) {
+            Ok(ab) => ab,
+            Err(_) => continue,
+        };
+
+        if ahead > 0 {
+            repo_op.details.push(format!("{} commit{} ahead", ahead, if ahead == 1 { "" } else { "s" }));
+        }
+        if behind > 0 {
+            repo_op.details.push(format!("{} commit{} behind", behind, if behind == 1 { "" } else { "s" }));
+        }
+
+        // Upgrade InSync → Update if we found commit differences
+        if repo_op.op == SOp::InSync && (ahead > 0 || behind > 0) {
+            repo_op.op = SOp::Update;
+        }
+    }
+}
+
 // ── Sync phase helpers (private) ──────────────────────────────────────────
 
 /// Phase 2: Initialize unconfigured repos.
@@ -2530,6 +2613,7 @@ async fn sync_retire_remote_only(
                         repo_name: remote_repo.name.clone(),
                         operation: "staged".to_string(),
                         forge: forge_name.clone(),
+                        details: vec![],
                     });
                     continue;
                 }
@@ -2566,6 +2650,7 @@ async fn sync_retire_remote_only(
                     repo_name: remote_repo.name.clone(),
                     operation: "purged".to_string(),
                     forge: forge_name.clone(),
+                    details: vec![],
                 });
             } else {
                 // Default: stage for deletion (make private + flag)
@@ -2593,6 +2678,7 @@ async fn sync_retire_remote_only(
                     repo_name: remote_repo.name.clone(),
                     operation: "staged".to_string(),
                     forge: forge_name.clone(),
+                    details: vec![],
                 });
             }
         }

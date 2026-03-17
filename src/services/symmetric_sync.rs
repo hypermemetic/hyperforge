@@ -32,6 +32,8 @@ pub enum SyncOp {
 pub struct RepoOp {
     pub repo: Repo,
     pub op: SyncOp,
+    /// What specifically differs (e.g. "description", "visibility", "3 commits ahead")
+    pub details: Vec<String>,
 }
 
 /// Diff between source and target forges
@@ -130,6 +132,7 @@ impl SymmetricSyncService {
                     ops.push(RepoOp {
                         repo: source_repo,
                         op: SyncOp::Delete,
+                        details: vec![],
                     });
                 }
                 continue;
@@ -137,15 +140,18 @@ impl SymmetricSyncService {
 
             if let Some(target_repo) = target_map.remove(&source_repo.name) {
                 // Repo exists on both - check if update needed
-                if repos_differ(&source_repo, &target_repo) {
+                let details = repo_diff_details(&source_repo, &target_repo);
+                if details.is_empty() {
                     ops.push(RepoOp {
                         repo: source_repo,
-                        op: SyncOp::Update,
+                        op: SyncOp::InSync,
+                        details: vec![],
                     });
                 } else {
                     ops.push(RepoOp {
                         repo: source_repo,
-                        op: SyncOp::InSync,
+                        op: SyncOp::Update,
+                        details,
                     });
                 }
             } else {
@@ -153,6 +159,7 @@ impl SymmetricSyncService {
                 ops.push(RepoOp {
                     repo: source_repo,
                     op: SyncOp::Create,
+                    details: vec![],
                 });
             }
         }
@@ -162,6 +169,7 @@ impl SymmetricSyncService {
             ops.push(RepoOp {
                 repo: target_repo,
                 op: SyncOp::Delete,
+                details: vec![],
             });
         }
 
@@ -293,9 +301,16 @@ fn norm_desc(d: &Option<String>) -> Option<&str> {
     }
 }
 
-/// Check if two repos differ in meaningful ways
-fn repos_differ(a: &Repo, b: &Repo) -> bool {
-    norm_desc(&a.description) != norm_desc(&b.description) || a.visibility != b.visibility
+/// Return list of fields that differ between two repos (empty = in sync)
+fn repo_diff_details(a: &Repo, b: &Repo) -> Vec<String> {
+    let mut details = Vec::new();
+    if norm_desc(&a.description) != norm_desc(&b.description) {
+        details.push("description".to_string());
+    }
+    if a.visibility != b.visibility {
+        details.push("visibility".to_string());
+    }
+    details
 }
 
 #[cfg(test)]
@@ -434,24 +449,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_repos_differ_description() {
+    async fn test_repo_diff_details_description() {
         let repo1 = Repo::new("test", Forge::GitHub).with_description("Desc 1");
         let repo2 = Repo::new("test", Forge::GitHub).with_description("Desc 2");
-        assert!(repos_differ(&repo1, &repo2));
+        let details = repo_diff_details(&repo1, &repo2);
+        assert_eq!(details, vec!["description"]);
     }
 
     #[tokio::test]
-    async fn test_repos_differ_visibility() {
+    async fn test_repo_diff_details_visibility() {
         let repo1 = Repo::new("test", Forge::GitHub).with_visibility(Visibility::Public);
         let repo2 = Repo::new("test", Forge::GitHub).with_visibility(Visibility::Private);
-        assert!(repos_differ(&repo1, &repo2));
+        let details = repo_diff_details(&repo1, &repo2);
+        assert_eq!(details, vec!["visibility"]);
     }
 
     #[tokio::test]
-    async fn test_repos_same() {
+    async fn test_repo_diff_details_both() {
+        let repo1 = Repo::new("test", Forge::GitHub)
+            .with_description("A")
+            .with_visibility(Visibility::Public);
+        let repo2 = Repo::new("test", Forge::GitHub)
+            .with_description("B")
+            .with_visibility(Visibility::Private);
+        let details = repo_diff_details(&repo1, &repo2);
+        assert_eq!(details, vec!["description", "visibility"]);
+    }
+
+    #[tokio::test]
+    async fn test_repo_diff_details_same() {
         let repo1 = Repo::new("test", Forge::GitHub).with_description("Same");
         let repo2 = Repo::new("test", Forge::GitHub).with_description("Same");
-        assert!(!repos_differ(&repo1, &repo2));
+        let details = repo_diff_details(&repo1, &repo2);
+        assert!(details.is_empty());
     }
 
     #[tokio::test]
