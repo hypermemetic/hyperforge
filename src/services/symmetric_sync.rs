@@ -285,9 +285,17 @@ impl Default for SymmetricSyncService {
     }
 }
 
+/// Normalize description: treat None and Some("") as equivalent
+fn norm_desc(d: &Option<String>) -> Option<&str> {
+    match d.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(s),
+    }
+}
+
 /// Check if two repos differ in meaningful ways
 fn repos_differ(a: &Repo, b: &Repo) -> bool {
-    a.description != b.description || a.visibility != b.visibility
+    norm_desc(&a.description) != norm_desc(&b.description) || a.visibility != b.visibility
 }
 
 #[cfg(test)]
