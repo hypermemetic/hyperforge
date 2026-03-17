@@ -104,6 +104,8 @@ pub enum HyperforgeEvent {
         repo_name: String,
         operation: String, // "create", "update", "delete", "in_sync"
         forge: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        details: Vec<String>,
     },
     /// Sync summary
     SyncSummary {
