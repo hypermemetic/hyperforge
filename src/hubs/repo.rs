@@ -1877,6 +1877,109 @@ impl RepoHub {
         }
     }
 
+    /// Count lines of code in a repository
+    #[plexus_macros::hub_method(
+        description = "Count lines of code in a repository, broken down by file extension",
+        params(
+            org = "Organization name",
+            name = "Repository name"
+        )
+    )]
+    pub async fn loc(
+        &self,
+        org: String,
+        name: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            let local = state.get_local_forge(&org).await;
+
+            let record = match local.get_record(&name) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                    };
+                    return;
+                }
+            };
+
+            let repo_path = match &record.local_path {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
+                    };
+                    return;
+                }
+            };
+
+            if !repo_path.exists() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo path does not exist: {}", repo_path.display()),
+                };
+                return;
+            }
+
+            let output = match std::process::Command::new("git")
+                .args(["ls-files"])
+                .current_dir(&repo_path)
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to run git ls-files: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            if !output.status.success() {
+                yield HyperforgeEvent::Error {
+                    message: format!(
+                        "git ls-files failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                };
+                return;
+            }
+
+            let files_str = String::from_utf8_lossy(&output.stdout);
+            let mut total_lines: usize = 0;
+            let mut total_files: usize = 0;
+            let mut by_extension: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+            for line in files_str.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                let full_path = repo_path.join(line);
+                let ext = std::path::Path::new(line)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("(none)")
+                    .to_string();
+
+                if let Ok(file) = std::fs::File::open(&full_path) {
+                    let reader = std::io::BufReader::new(file);
+                    let count = std::io::BufRead::lines(reader).count();
+                    total_lines += count;
+                    total_files += 1;
+                    *by_extension.entry(ext).or_insert(0) += count;
+                }
+            }
+
+            yield HyperforgeEvent::RepoLoc {
+                repo_name: name,
+                total_lines,
+                total_files,
+                by_extension,
+            };
+        }
+    }
+
     /// Check if a repository has uncommitted changes
     #[plexus_macros::hub_method(
         description = "Check if a repository has staged, unstaged, or untracked changes",

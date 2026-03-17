@@ -103,6 +103,10 @@ fn build_hub_has_correct_methods() {
         "run",
         "init_configs",
         "gitignore_sync",
+        "large_files",
+        "repo_sizes",
+        "dirty",
+        "loc",
         "schema",
     ]
     .into_iter()

@@ -7,6 +7,7 @@ pub mod dirty;
 pub mod execution;
 pub mod gitignore;
 pub mod large_files;
+pub mod loc;
 pub mod local_run;
 pub mod manifest;
 pub mod packaging;
@@ -301,6 +302,24 @@ impl BuildHub {
         exclude: Option<Vec<String>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         repo_size::repo_sizes(path, include, exclude)
+    }
+
+    /// Count lines of code per repo
+    #[plexus_macros::hub_method(
+        description = "Count lines of code per repo, sorted by total lines descending. Breaks down by file extension.",
+        params(
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
+        )
+    )]
+    pub async fn loc(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        loc::loc(path, include, exclude)
     }
 
     /// Check which repos have uncommitted changes
