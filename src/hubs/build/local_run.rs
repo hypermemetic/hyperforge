@@ -23,10 +23,12 @@ pub fn run(
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
     dry_run: Option<bool>,
+    parallel: Option<usize>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let filter = RepoFilter::new(include, exclude);
     let is_dry_run = dry_run.unwrap_or(false);
     let run_tests = test.unwrap_or(false);
+    let concurrency = parallel.unwrap_or(0); // 0 = unbounded
 
     stream! {
         let workspace_path = PathBuf::from(&path);
@@ -192,7 +194,7 @@ pub fn run(
             let run_tests_copy = run_tests;
             let results = crate::commands::runner::run_batch(
                 batch_inputs,
-                0, // unbounded parallelism within tier
+                concurrency,
                 move |(repo_name, repo_path, runners, indices)| async move {
                     let run_tests = run_tests_copy;
                     let mut steps = Vec::new();

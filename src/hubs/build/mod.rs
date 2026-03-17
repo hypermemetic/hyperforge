@@ -209,7 +209,8 @@ impl BuildHub {
             level = "Runner level to execute (0, 1, 2...). Without this, runs all local runners.",
             include = "Glob patterns — repo must match at least one (optional, repeatable)",
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
-            dry_run = "Preview commands without executing (optional, default: false)"
+            dry_run = "Preview commands without executing (optional, default: false)",
+            parallel = "Max concurrent repos per tier (optional, default: unbounded)"
         )
     )]
     pub async fn run(
@@ -220,8 +221,9 @@ impl BuildHub {
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
         dry_run: Option<bool>,
+        parallel: Option<usize>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        local_run::run(path, test, level, include, exclude, dry_run)
+        local_run::run(path, test, level, include, exclude, dry_run, parallel)
     }
 
     /// Initialize CI configs for repos that lack them
