@@ -234,6 +234,13 @@ pub enum HyperforgeEvent {
         tracked_files: usize,
         total_bytes: u64,
     },
+    /// Lines-of-code count for a repository
+    RepoLoc {
+        repo_name: String,
+        total_lines: usize,
+        total_files: usize,
+        by_extension: std::collections::HashMap<String, usize>,
+    },
     /// Repository dirty status
     RepoDirty {
         repo_name: String,
