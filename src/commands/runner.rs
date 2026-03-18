@@ -179,6 +179,8 @@ pub struct PushBatchResult {
     pub success_count: usize,
     /// Number of repos where at least one push failed
     pub failed_count: usize,
+    /// Names of repos that failed
+    pub failed_repos: Vec<String>,
 }
 
 /// Process the results of a parallel push batch into events and counts.
@@ -190,12 +192,15 @@ pub fn collect_push_results(
     let mut events = Vec::new();
     let mut success_count = 0usize;
     let mut failed_count = 0usize;
+    let mut failed_repos = Vec::new();
 
     for result in results {
         let (dir_name, path, push_result) = match result {
             Ok(v) => v,
             Err(e) => {
-                events.push(crate::hub::HyperforgeEvent::Error { message: e });
+                events.push(crate::hub::HyperforgeEvent::Error {
+                    message: format!("Task error: {}", e),
+                });
                 failed_count += 1;
                 continue;
             }
@@ -203,19 +208,23 @@ pub fn collect_push_results(
 
         match push_result {
             Ok(report) => {
+                // Only emit events for failures
                 for r in &report.results {
-                    events.push(crate::hub::HyperforgeEvent::RepoPush {
-                        repo_name: dir_name.clone(),
-                        path: path.display().to_string(),
-                        forge: r.forge.clone(),
-                        success: r.success,
-                        error: r.error.clone(),
-                    });
+                    if !r.success {
+                        events.push(crate::hub::HyperforgeEvent::RepoPush {
+                            repo_name: dir_name.clone(),
+                            path: path.display().to_string(),
+                            forge: r.forge.clone(),
+                            success: false,
+                            error: r.error.clone(),
+                        });
+                    }
                 }
                 if report.all_success {
                     success_count += 1;
                 } else {
                     failed_count += 1;
+                    failed_repos.push(dir_name.clone());
                 }
             }
             Err(e) => {
@@ -227,6 +236,7 @@ pub fn collect_push_results(
                     error: Some(e.to_string()),
                 });
                 failed_count += 1;
+                failed_repos.push(dir_name.clone());
             }
         }
     }
@@ -235,6 +245,7 @@ pub fn collect_push_results(
         events,
         success_count,
         failed_count,
+        failed_repos,
     }
 }
 

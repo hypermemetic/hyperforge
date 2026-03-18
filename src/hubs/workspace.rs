@@ -1156,12 +1156,22 @@ impl WorkspaceHub {
                     yield event;
                 }
 
-                yield HyperforgeEvent::Info {
-                    message: format!(
-                        "  {}{} pushed successfully, {} failed",
-                        dry_prefix, batch.success_count, batch.failed_count,
-                    ),
-                };
+                if batch.failed_repos.is_empty() {
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "  {}{} pushed successfully",
+                            dry_prefix, batch.success_count,
+                        ),
+                    };
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "  {}{} pushed successfully, {} failed: {}",
+                            dry_prefix, batch.success_count, batch.failed_count,
+                            batch.failed_repos.join(", "),
+                        ),
+                    };
+                }
             }
 
             // ── Summary ──
