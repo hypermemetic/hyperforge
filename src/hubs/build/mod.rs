@@ -3,6 +3,7 @@
 //! These methods never write LocalForge or call forge APIs. They operate purely
 //! on the filesystem via workspace discovery.
 
+pub mod activity;
 pub mod dirty;
 pub mod execution;
 pub mod gitignore;
@@ -342,6 +343,34 @@ impl BuildHub {
         all_git: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         dirty::dirty(path, include, exclude, all_git)
+    }
+
+    /// Show commit activity across workspace repos over a time range
+    #[plexus_macros::hub_method(
+        description = "Show commit activity (commits, insertions, deletions, authors) per repo and across the workspace over a time range. Includes per-extension breakdown. Supports composable file-level filters to exclude noise.",
+        params(
+            path = "Path to workspace directory",
+            since = "Start of time range (optional, default: '7 days ago'). Accepts any git date format.",
+            until = "End of time range (optional, default: 'now'). Accepts any git date format.",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            exclude_ext = "File extensions to exclude (e.g. json,lock). Comma-separated or repeatable.",
+            exclude_path = "Glob patterns on file paths — matching files excluded from stats (e.g. generated/*). Comma-separated or repeatable.",
+            min_file_net = "Per-file minimum |insertions - deletions| across the range. 0 = no filter (default). 1 = drop fully-reverted files."
+        )
+    )]
+    pub async fn activity(
+        &self,
+        path: String,
+        since: Option<String>,
+        until: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        exclude_ext: Option<Vec<String>>,
+        exclude_path: Option<Vec<String>>,
+        min_file_net: Option<usize>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        activity::activity(path, since, until, include, exclude, exclude_ext, exclude_path, min_file_net)
     }
 }
 

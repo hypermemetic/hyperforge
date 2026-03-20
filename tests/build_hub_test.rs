@@ -107,6 +107,7 @@ fn build_hub_has_correct_methods() {
         "repo_sizes",
         "dirty",
         "loc",
+        "activity",
         "schema",
     ]
     .into_iter()

@@ -75,6 +75,24 @@ pub enum PublishActionKind {
     Failed,
 }
 
+/// A single day's commit activity bucket
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ActivityDay {
+    pub date: String,
+    pub commits: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// Per-extension activity breakdown
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExtensionStats {
+    pub extension: String,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub files: usize,
+}
+
 /// Hyperforge event types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -248,6 +266,29 @@ pub enum HyperforgeEvent {
         has_changes: bool,
         has_untracked: bool,
         branch: String,
+    },
+    /// Per-repo commit activity over a time range
+    RepoActivity {
+        repo_name: String,
+        commits: usize,
+        insertions: usize,
+        deletions: usize,
+        files_changed: usize,
+        authors: Vec<String>,
+        daily: Vec<ActivityDay>,
+        by_extension: Vec<ExtensionStats>,
+    },
+    /// Workspace-wide activity summary with merged daily totals
+    WorkspaceActivity {
+        since: String,
+        until: String,
+        total_repos: usize,
+        total_commits: usize,
+        total_insertions: usize,
+        total_deletions: usize,
+        total_authors: Vec<String>,
+        daily: Vec<ActivityDay>,
+        by_extension: Vec<ExtensionStats>,
     },
 }
 

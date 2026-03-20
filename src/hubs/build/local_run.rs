@@ -125,6 +125,7 @@ pub fn run(
 
         // Process tiers sequentially; within each tier, repos in parallel
         for (tier_idx, tier_nodes) in tiers.iter().enumerate() {
+            let tier_failed_before = failed;
             // Collect repos in this tier that we need to run
             let tier_repos: Vec<_> = tier_nodes.iter().filter_map(|&node_idx| {
                 let node = &graph.nodes[node_idx];
@@ -284,12 +285,11 @@ pub fn run(
                 }
             }
 
-            // If any failures in this tier, stop (deps failed, downstream won't work)
-            if failed > 0 {
-                yield HyperforgeEvent::Error {
-                    message: format!("Tier {} had failures — stopping", tier_idx),
+            let tier_failed = failed - tier_failed_before;
+            if tier_failed > 0 {
+                yield HyperforgeEvent::Info {
+                    message: format!("Tier {} had {} failure(s) — continuing", tier_idx, tier_failed),
                 };
-                break;
             }
         }
 
