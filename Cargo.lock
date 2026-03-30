@@ -548,7 +548,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -954,8 +954,8 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "oci-client",
- "plexus-core 0.3.13",
- "plexus-macros 0.3.10",
+ "plexus-core",
+ "plexus-macros 0.4.0",
  "plexus-transport",
  "regex",
  "reqwest",
@@ -1619,31 +1619,6 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "plexus-core"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ff2d6c3fedbf981a3accd17596cfa77faf8e6d3019f52ee06d1ee86cf52efda"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "chrono",
- "futures",
- "futures-util",
- "jsonrpsee",
- "plexus-macros 0.2.2",
- "rmcp",
- "schemars 1.2.0",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "plexus-core"
 version = "0.4.0"
 dependencies = [
  "anyhow",
@@ -1679,9 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "plexus-macros"
-version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ba5bd8dc4526fea205abb1c3d40ba6f2ecfc21c6a23ed715d1bed133b6017c8"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1700,7 +1673,7 @@ dependencies = [
  "futures",
  "http",
  "jsonrpsee",
- "plexus-core 0.4.0",
+ "plexus-core",
  "rmcp",
  "serde",
  "serde_json",
@@ -2048,7 +2021,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2515,7 +2488,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3540,7 +3513,3 @@ name = "zmij"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc5a66a20078bf1251bde995aa2fdcc4b800c70b5d92dd2c62abc5c60f679f8"
-
-[[patch.unused]]
-name = "plexus-macros"
-version = "0.4.0"
