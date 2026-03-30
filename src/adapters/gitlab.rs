@@ -44,6 +44,8 @@ struct UpdateProjectRequest {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived: Option<bool>,
 }
 
 /// Request body for renaming a project
@@ -374,6 +376,7 @@ impl ForgePort for GitLabAdapter {
         let request = UpdateProjectRequest {
             description: repo.description.clone(),
             visibility: Some(Self::to_gitlab_visibility(&repo.visibility)),
+            archived: None,
         };
 
         let response = self.client.put(&url)
@@ -385,6 +388,40 @@ impl ForgePort for GitLabAdapter {
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(ForgeError::RepoNotFound { name: repo.name.clone() });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitLab API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn set_archived(&self, org: &str, name: &str, archived: bool) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let project_path = format!("{}/{}", org, name);
+        let encoded_path = urlencoding::encode(&project_path);
+        let url = format!("{}/projects/{}", self.api_url, encoded_path);
+
+        let request = UpdateProjectRequest {
+            description: None,
+            visibility: None,
+            archived: Some(archived),
+        };
+
+        let response = self.client.put(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: name.to_string() });
         }
 
         if !response.status().is_success() {

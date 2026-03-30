@@ -15,6 +15,7 @@ use crate::commands::materialize::{materialize, MaterializeOpts, MaterializeRepo
 use crate::commands::{push, status};
 use crate::config::HyperforgeConfig;
 use crate::hub::HyperforgeEvent;
+use crate::hubs::images::ImagesHub;
 use crate::hubs::HyperforgeState;
 use crate::types::{Forge, Repo, RepoRecord, Visibility};
 
@@ -102,26 +103,49 @@ impl RepoHub {
 #[plexus_macros::hub_methods(
     namespace = "repo",
     description = "Single-repo operations and registry CRUD",
-    crate_path = "plexus_core"
+    crate_path = "plexus_core",
+    hub
 )]
 impl RepoHub {
     /// List repositories for an organization (from LocalForge)
     #[plexus_macros::hub_method(
         description = "List all repositories in the local forge for an organization",
-        params(org = "Organization name")
+        params(
+            org = "Organization name",
+            filter = "Regex pattern to filter repo names (optional)"
+        )
     )]
     pub async fn list(
         &self,
         org: String,
+        filter: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
 
         stream! {
+            let re = match &filter {
+                Some(pattern) => match regex::Regex::new(pattern) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Invalid regex '{}': {}", pattern, e),
+                        };
+                        return;
+                    }
+                },
+                None => None,
+            };
+
             let local = state.get_local_forge(&org).await;
 
             match local.list_repos(&org).await {
                 Ok(repos) => {
                     for repo in repos {
+                        if let Some(ref re) = re {
+                            if !re.is_match(&repo.name) {
+                                continue;
+                            }
+                        }
                         yield repo_event(&repo);
                     }
                 }
@@ -688,6 +712,89 @@ impl RepoHub {
             } else {
                 yield HyperforgeEvent::Error {
                     message: format!("Rename completed with {} error(s)", errors.len()),
+                };
+            }
+        }
+    }
+
+    /// Set or unset archive status on remote forges
+    #[plexus_macros::hub_method(
+        description = "Archive or unarchive a repository on its remote forges",
+        params(
+            org = "Organization name",
+            name = "Repository name",
+            archived = "Set archived (true) or unarchived (false)"
+        )
+    )]
+    pub async fn set_archived(
+        &self,
+        org: String,
+        name: String,
+        archived: bool,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let state = self.state.clone();
+
+        stream! {
+            let local = state.get_local_forge(&org).await;
+
+            let repo = match local.get_repo(&org, &name).await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Repository not found in local config: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            let mut target_forges = vec![repo.origin.clone()];
+            for mirror in &repo.mirrors {
+                if !target_forges.contains(mirror) {
+                    target_forges.push(mirror.clone());
+                }
+            }
+
+            let auth = match make_auth() {
+                Ok(a) => a,
+                Err(e) => {
+                    yield HyperforgeEvent::Error { message: e };
+                    return;
+                }
+            };
+
+            let action = if archived { "Archived" } else { "Unarchived" };
+            let mut errors = Vec::new();
+            for forge in &target_forges {
+                let adapter = match make_repo_adapter(forge, auth.clone(), &org) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
+                    }
+                };
+
+                match adapter.set_archived(&org, &name, archived).await {
+                    Ok(_) => {
+                        yield HyperforgeEvent::Info {
+                            message: format!("{} '{}' on {:?}", action, name, forge),
+                        };
+                    }
+                    Err(e) => {
+                        errors.push(format!("{:?}: {}", forge, e));
+                    }
+                }
+            }
+
+            for error in &errors {
+                yield HyperforgeEvent::Error {
+                    message: format!("  Error: {}", error),
+                };
+            }
+
+            // Update local state
+            if let Err(e) = local.set_archived(&org, &name, archived).await {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to update local state: {}", e),
                 };
             }
         }
@@ -2049,6 +2156,16 @@ impl RepoHub {
             }
         }
     }
+    /// Get child plugin summaries for the hub schema
+    pub fn plugin_children(&self) -> Vec<plexus_core::plexus::ChildSummary> {
+        let images = ImagesHub::new(self.state.clone());
+        let schema = Activation::plugin_schema(&images);
+        vec![plexus_core::plexus::ChildSummary {
+            namespace: schema.namespace,
+            description: schema.description,
+            hash: schema.hash,
+        }]
+    }
 }
 
 #[async_trait]
@@ -2061,7 +2178,10 @@ impl ChildRouter for RepoHub {
         Activation::call(self, method, params).await
     }
 
-    async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
-        None // Leaf plugin
+    async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
+        match name {
+            "images" => Some(Box::new(ImagesHub::new(self.state.clone()))),
+            _ => None,
+        }
     }
 }

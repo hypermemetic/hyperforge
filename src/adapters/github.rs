@@ -43,6 +43,8 @@ struct UpdateRepoRequest {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     private: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived: Option<bool>,
 }
 
 /// Request body for renaming a repository
@@ -337,6 +339,7 @@ impl ForgePort for GitHubAdapter {
         let request = UpdateRepoRequest {
             description: repo.description.clone(),
             private: Some(repo.visibility == Visibility::Private),
+            archived: None,
         };
 
         let response = self.client.patch(&url)
@@ -348,6 +351,38 @@ impl ForgePort for GitHubAdapter {
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(ForgeError::RepoNotFound { name: repo.name.clone() });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ForgeError::ApiError(format!(
+                "GitHub API error {}: {}", status, body
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn set_archived(&self, org: &str, name: &str, archived: bool) -> ForgeResult<()> {
+        let headers = self.auth_headers().await?;
+        let url = format!("{}/repos/{}/{}", self.api_url, org, name);
+
+        let request = UpdateRepoRequest {
+            description: None,
+            private: None,
+            archived: Some(archived),
+        };
+
+        let response = self.client.patch(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ForgeError::RepoNotFound { name: name.to_string() });
         }
 
         if !response.status().is_success() {

@@ -355,6 +355,14 @@ impl ForgePort for LocalForge {
         Ok(())
     }
 
+    async fn set_archived(&self, _org: &str, name: &str, archived: bool) -> ForgeResult<()> {
+        let mut repos = self.write_repos()?;
+        if let Some(record) = repos.get_mut(name) {
+            record.protected = archived;
+        }
+        Ok(())
+    }
+
     async fn set_default_branch(&self, _org: &str, name: &str, branch: &str) -> ForgeResult<()> {
         // LocalForge now tracks default branch in RepoRecord
         let mut repos = self.write_repos()?;

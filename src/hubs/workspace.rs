@@ -708,7 +708,7 @@ impl WorkspaceHub {
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview all phases without making changes (optional, default: false)",
             no_push = "Skip the git push phase (optional, default: false)",
-            no_init = "Skip initializing unconfigured repos (optional, default: false)",
+            no_init = "Skip initializing unconfigured repos (optional, default: true)",
             validate = "Run containerized validation before pushing (optional, default: false)",
             reflect = "Enable reflect mode: retire remote-only repos (optional, default: false)",
             purge = "Delete repos previously staged for deletion. Implies --reflect (optional, default: false)"
@@ -732,7 +732,7 @@ impl WorkspaceHub {
         let sync_service = self.state.sync_service.clone();
         let is_dry_run = dry_run.unwrap_or(false);
         let is_no_push = no_push.unwrap_or(false);
-        let is_no_init = no_init.unwrap_or(false);
+        let is_no_init = no_init.unwrap_or(true);
         let is_validate = validate.unwrap_or(false);
         let is_purge = purge.unwrap_or(false);
         let is_reflect = reflect.unwrap_or(false) || is_purge;

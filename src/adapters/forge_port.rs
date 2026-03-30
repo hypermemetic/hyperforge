@@ -83,6 +83,9 @@ pub trait ForgePort: Send + Sync {
     /// Set the default branch for a repository
     async fn set_default_branch(&self, org: &str, name: &str, branch: &str) -> ForgeResult<()>;
 
+    /// Set the archived status of a repository
+    async fn set_archived(&self, org: &str, name: &str, archived: bool) -> ForgeResult<()>;
+
     /// Check if a repository exists
     async fn repo_exists(&self, org: &str, name: &str) -> ForgeResult<bool> {
         match self.get_repo(org, name).await {

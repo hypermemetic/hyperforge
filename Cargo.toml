@@ -1,6 +1,6 @@
 [package]
 name = "hyperforge"
-version = "4.0.3"
+version = "4.1.0"
 edition = "2021"
 description = "Multi-forge repository management"
 license = "MIT"
@@ -67,12 +67,17 @@ clap = { version = "4", features = ["derive"] }
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
 
+# Container/OCI
+bollard = "0.18"
+oci-client = { version = "0.14", default-features = false, features = ["native-tls"] }
+
 # Crypto
 sha2 = "0.10"
 
 # Utilities
 dirs = "5"
 urlencoding = "2"
+tar = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

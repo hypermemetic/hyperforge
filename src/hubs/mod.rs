@@ -3,6 +3,7 @@
 //! Each sub-hub is a leaf plugin under the root `hyperforge` hub.
 
 pub mod build;
+pub mod images;
 pub mod repo;
 pub mod utils;
 pub mod workspace;
@@ -87,6 +88,12 @@ impl HyperforgeState {
             reloaded.push(org.clone());
         }
         reloaded
+    }
+
+    /// Evict a cached LocalForge instance for an org
+    pub async fn evict_org(&self, org: &str) {
+        let mut forges = self.local_forges.write().unwrap();
+        forges.remove(org);
     }
 }
 

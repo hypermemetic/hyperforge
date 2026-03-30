@@ -249,6 +249,34 @@ pub enum HyperforgeEvent {
         has_untracked: bool,
         branch: String,
     },
+    /// Container image tag
+    ImageTag {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        digest: String,
+        size_bytes: u64,
+        created_at: String,
+    },
+    /// Container image push result
+    ImagePush {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        image: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Container image delete result
+    ImageDelete {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Root hub for hyperforge operations
@@ -310,11 +338,13 @@ impl HyperforgeHub {
 
     /// Bootstrap an org — import all repos from remote forges into LocalForge
     #[plexus_macros::hub_method(
-        description = "Bootstrap an org — import all repos from remote forges into LocalForge, creating the canonical state mirror",
+        description = "Bootstrap an org — import all repos from remote forges into LocalForge, creating the canonical state mirror. Can generate SSH keys and set a workspace path.",
         params(
             org = "Organization name",
             forges = "Forges to import from (e.g. github,codeberg)",
-            dry_run = "Preview without writing state (optional, default: false)"
+            dry_run = "Preview without writing state (optional, default: false)",
+            generate_ssh_key = "Generate ed25519 SSH keys for each forge (optional, default: false)",
+            workspace_path = "Workspace directory path for this org's repos (optional)"
         )
     )]
     pub async fn begin(
@@ -322,9 +352,13 @@ impl HyperforgeHub {
         org: String,
         forges: Vec<String>,
         dry_run: Option<bool>,
+        generate_ssh_key: Option<bool>,
+        workspace_path: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let is_dry_run = dry_run.unwrap_or(false);
+        let do_keygen = generate_ssh_key.unwrap_or(false);
+        let config_dir = self.state.config_dir.clone();
 
         stream! {
             let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -365,6 +399,65 @@ impl HyperforgeHub {
                     parsed_forges.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", "),
                 ),
             };
+
+            // Phase: SSH keygen + workspace path
+            if do_keygen || workspace_path.is_some() {
+                let mut org_config = OrgConfig::load(&config_dir, &org);
+
+                if do_keygen {
+                    for (forge_str, _) in &parsed_forges {
+                        let key_path = OrgConfig::ssh_key_path(&config_dir, &org, forge_str);
+                        if key_path.exists() {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  Using existing SSH key for {}: {}", forge_str, key_path.display()),
+                            };
+                        } else if is_dry_run {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  {}Would generate SSH key for {}: {}", dry_prefix, forge_str, key_path.display()),
+                            };
+                        } else {
+                            match OrgConfig::generate_ssh_key(&config_dir, &org, forge_str) {
+                                Ok(path) => {
+                                    yield HyperforgeEvent::Info {
+                                        message: format!("  Generated SSH key for {}: {}", forge_str, path.display()),
+                                    };
+                                    yield HyperforgeEvent::Info {
+                                        message: format!("  Public key: {}.pub", path.display()),
+                                    };
+                                }
+                                Err(e) => {
+                                    yield HyperforgeEvent::Error {
+                                        message: format!("  Failed to generate SSH key for {}: {}", forge_str, e),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+
+                        if !is_dry_run {
+                            org_config.ssh.insert(forge_str.clone(), key_path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+
+                if let Some(ref wp) = workspace_path {
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {}Workspace path: {}", dry_prefix, wp),
+                    };
+                    if !is_dry_run {
+                        org_config.workspace_path = Some(wp.clone());
+                    }
+                }
+
+                if !is_dry_run {
+                    if let Err(e) = org_config.save(&config_dir, &org) {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Failed to save org config: {}", e),
+                        };
+                        return;
+                    }
+                }
+            }
 
             // Phase 1: Verify auth by creating adapters
             let mut adapters: Vec<(String, Forge, Arc<dyn ForgePort>)> = Vec::new();
@@ -591,6 +684,201 @@ impl HyperforgeHub {
                     };
                 }
             }
+        }
+    }
+
+    /// Show the public SSH key for an org/forge (pipe to pbcopy)
+    #[plexus_macros::hub_method(
+        description = "Show the public SSH key for an org/forge — pipe output to pbcopy",
+        params(
+            org = "Organization name",
+            forge = "Forge name (github, codeberg, gitlab)"
+        )
+    )]
+    pub async fn config_show_ssh_key(
+        &self,
+        org: String,
+        forge: String,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            if HyperforgeConfig::parse_forge(&forge).is_none() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                };
+                return;
+            }
+
+            let org_config = OrgConfig::load(&config_dir, &org);
+            if org_config.ssh_key_for_forge(&forge).is_none() {
+                yield HyperforgeEvent::Error {
+                    message: format!("No SSH key configured for {} on org '{}'. Run begin with --generate_ssh_key true first.", forge, org),
+                };
+                return;
+            }
+
+            match OrgConfig::read_public_key(&config_dir, &org, &forge) {
+                Ok(pubkey) => {
+                    yield HyperforgeEvent::Info { message: pubkey };
+                }
+                Err(e) => {
+                    yield HyperforgeEvent::Error { message: e };
+                }
+            }
+        }
+    }
+
+    /// List all known organizations
+    #[plexus_macros::hub_method(description = "List all organizations configured in hyperforge")]
+    pub async fn orgs_list(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let orgs_dir = config_dir.join("orgs");
+            if !orgs_dir.exists() {
+                yield HyperforgeEvent::Info {
+                    message: "No organizations configured.".to_string(),
+                };
+                return;
+            }
+
+            let mut orgs: Vec<String> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&orgs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "toml") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            orgs.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+
+            orgs.sort();
+
+            if orgs.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No organizations configured.".to_string(),
+                };
+                return;
+            }
+
+            for org in &orgs {
+                let org_config = OrgConfig::load(&config_dir, org);
+                let forges: Vec<&str> = org_config.ssh.keys().map(|k| k.as_str()).collect();
+                let wp = org_config.workspace_path.as_deref().unwrap_or("(not set)");
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "  {} — workspace: {}, forges: [{}]",
+                        org,
+                        wp,
+                        forges.join(", "),
+                    ),
+                };
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("{} org(s) configured.", orgs.len()),
+            };
+        }
+    }
+
+    /// Delete an organization — removes config, keys, repos.yaml, and optionally workspace dir
+    #[plexus_macros::hub_method(
+        description = "Delete an organization — removes org config, SSH keys, LocalForge data, and optionally the workspace directory. Dry-run by default; pass --confirm true to actually delete.",
+        params(
+            org = "Organization name to delete",
+            remove_workspace = "Also remove the workspace directory (optional, default: false)",
+            confirm = "Actually delete (optional, default: false — dry-run unless confirmed)"
+        )
+    )]
+    pub async fn orgs_delete(
+        &self,
+        org: String,
+        remove_workspace: Option<bool>,
+        confirm: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        let state = self.state.clone();
+        let is_dry_run = !confirm.unwrap_or(false);
+        let do_remove_workspace = remove_workspace.unwrap_or(false);
+
+        stream! {
+            let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+            let org_config = OrgConfig::load(&config_dir, &org);
+
+            // Check the org actually exists
+            let config_path = OrgConfig::config_path(&config_dir, &org);
+            let org_data_dir = config_dir.join("orgs").join(&org);
+            if !config_path.exists() && !org_data_dir.exists() {
+                yield HyperforgeEvent::Error {
+                    message: format!("Organization '{}' not found.", org),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}Deleting organization '{}'...", dry_prefix, org),
+            };
+
+            // 1. Remove org config TOML
+            if config_path.exists() {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}Remove config: {}", dry_prefix, config_path.display()),
+                };
+                if !is_dry_run {
+                    if let Err(e) = std::fs::remove_file(&config_path) {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to remove config: {}", e),
+                        };
+                    }
+                }
+            }
+
+            // 2. Remove org data dir (keys/ + repos.yaml)
+            if org_data_dir.exists() {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {}Remove data dir: {}", dry_prefix, org_data_dir.display()),
+                };
+                if !is_dry_run {
+                    if let Err(e) = std::fs::remove_dir_all(&org_data_dir) {
+                        yield HyperforgeEvent::Error {
+                            message: format!("  Failed to remove data dir: {}", e),
+                        };
+                    }
+                }
+            }
+
+            // 3. Remove workspace dir if requested
+            if do_remove_workspace {
+                if let Some(ref wp) = org_config.workspace_path {
+                    let wp_path = std::path::PathBuf::from(wp);
+                    if wp_path.exists() {
+                        yield HyperforgeEvent::Info {
+                            message: format!("  {}Remove workspace: {}", dry_prefix, wp),
+                        };
+                        if !is_dry_run {
+                            if let Err(e) = std::fs::remove_dir_all(&wp_path) {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("  Failed to remove workspace dir: {}", e),
+                                };
+                            }
+                        }
+                    }
+                } else {
+                    yield HyperforgeEvent::Info {
+                        message: "  No workspace path configured — nothing to remove.".to_string(),
+                    };
+                }
+            }
+
+            // 4. Evict from in-memory cache
+            if !is_dry_run {
+                state.evict_org(&org).await;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("{}Organization '{}' deleted.", dry_prefix, org),
+            };
         }
     }
 

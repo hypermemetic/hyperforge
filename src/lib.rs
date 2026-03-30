@@ -9,6 +9,7 @@ pub mod auth_hub;
 pub mod build_system;
 pub mod commands;
 pub mod config;
+pub mod docker;
 pub mod git;
 pub mod hub;
 pub mod hubs;

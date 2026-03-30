@@ -14,6 +14,10 @@ pub struct OrgConfig {
     /// SSH key paths per forge (forge_name -> key_path)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ssh: HashMap<String, String>,
+
+    /// Workspace path for this org's repos
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
 }
 
 impl OrgConfig {
@@ -54,6 +58,59 @@ impl OrgConfig {
     pub fn ssh_key_for_forge(&self, forge: &str) -> Option<&str> {
         self.ssh.get(forge).map(|s| s.as_str())
     }
+
+    /// Directory for generated SSH keys: ~/.config/hyperforge/orgs/{org}/keys/
+    pub fn keys_dir(config_dir: &Path, org: &str) -> PathBuf {
+        config_dir.join("orgs").join(org).join("keys")
+    }
+
+    /// Path to a generated SSH key for an org/forge: keys/{forge}_ed25519
+    pub fn ssh_key_path(config_dir: &Path, org: &str, forge: &str) -> PathBuf {
+        Self::keys_dir(config_dir, org).join(format!("{}_ed25519", forge))
+    }
+
+    /// Generate an ed25519 SSH keypair for an org/forge combination.
+    /// Returns the path to the private key. Idempotent — reuses existing keys.
+    pub fn generate_ssh_key(config_dir: &Path, org: &str, forge: &str) -> Result<PathBuf, String> {
+        let key_path = Self::ssh_key_path(config_dir, org, forge);
+
+        // Idempotent: if key already exists, return it
+        if key_path.exists() {
+            return Ok(key_path);
+        }
+
+        let keys_dir = Self::keys_dir(config_dir, org);
+        std::fs::create_dir_all(&keys_dir)
+            .map_err(|e| format!("Failed to create keys dir {}: {}", keys_dir.display(), e))?;
+
+        let comment = format!("hyperforge:{}@{}", org, forge);
+        let output = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t", "ed25519",
+                "-f", &key_path.to_string_lossy(),
+                "-N", "",
+                "-C", &comment,
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run ssh-keygen: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("ssh-keygen failed: {}", stderr.trim()));
+        }
+
+        Ok(key_path)
+    }
+
+    /// Read the public key contents for an org/forge SSH key.
+    pub fn read_public_key(config_dir: &Path, org: &str, forge: &str) -> Result<String, String> {
+        let key_path = Self::ssh_key_path(config_dir, org, forge);
+        // ssh-keygen creates {name}.pub, so for github_ed25519 it's github_ed25519.pub
+        let pub_path = PathBuf::from(format!("{}.pub", key_path.display()));
+        std::fs::read_to_string(&pub_path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("Failed to read public key {}: {}", pub_path.display(), e))
+    }
 }
 
 #[cfg(test)]
@@ -90,5 +147,67 @@ mod tests {
         let mut with_keys = OrgConfig::default();
         with_keys.ssh.insert("github".to_string(), "~/.ssh/key".to_string());
         assert!(with_keys.has_ssh_keys());
+    }
+
+    #[test]
+    fn test_workspace_path_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = OrgConfig::default();
+        config.workspace_path = Some("/home/user/workspace".to_string());
+        config.save(tmp.path(), "myorg").unwrap();
+
+        let loaded = OrgConfig::load(tmp.path(), "myorg");
+        assert_eq!(loaded.workspace_path.as_deref(), Some("/home/user/workspace"));
+    }
+
+    #[test]
+    fn test_workspace_path_absent_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let config = OrgConfig::load(tmp.path(), "nonexistent");
+        assert!(config.workspace_path.is_none());
+    }
+
+    #[test]
+    fn test_generate_ssh_key() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = OrgConfig::generate_ssh_key(tmp.path(), "testorg", "github").unwrap();
+
+        assert!(key_path.exists(), "Private key should exist");
+        let pub_path = PathBuf::from(format!("{}.pub", key_path.display()));
+        assert!(pub_path.exists(), "Public key should exist");
+
+        // Verify the key path is where we expect
+        let expected = OrgConfig::ssh_key_path(tmp.path(), "testorg", "github");
+        assert_eq!(key_path, expected);
+    }
+
+    #[test]
+    fn test_generate_ssh_key_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let path1 = OrgConfig::generate_ssh_key(tmp.path(), "testorg", "github").unwrap();
+        let content1 = std::fs::read_to_string(&path1).unwrap();
+
+        let path2 = OrgConfig::generate_ssh_key(tmp.path(), "testorg", "github").unwrap();
+        let content2 = std::fs::read_to_string(&path2).unwrap();
+
+        assert_eq!(path1, path2);
+        assert_eq!(content1, content2, "Key should not be regenerated");
+    }
+
+    #[test]
+    fn test_read_public_key() {
+        let tmp = TempDir::new().unwrap();
+        OrgConfig::generate_ssh_key(tmp.path(), "testorg", "github").unwrap();
+
+        let pubkey = OrgConfig::read_public_key(tmp.path(), "testorg", "github").unwrap();
+        assert!(pubkey.starts_with("ssh-ed25519 "), "Should be an ed25519 public key");
+        assert!(pubkey.contains("hyperforge:testorg@github"), "Should contain the comment");
+    }
+
+    #[test]
+    fn test_read_public_key_missing() {
+        let tmp = TempDir::new().unwrap();
+        let result = OrgConfig::read_public_key(tmp.path(), "testorg", "github");
+        assert!(result.is_err());
     }
 }
