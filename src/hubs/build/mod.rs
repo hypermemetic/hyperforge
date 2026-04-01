@@ -361,7 +361,8 @@ impl BuildHub {
             title = "Release title (optional, defaults to tag)",
             body = "Release description/notes (optional)",
             draft = "Create as draft release (optional, default: false)",
-            dry_run = "Preview everything without side effects (optional, default: false)"
+            dry_run = "Preview everything without side effects (optional, default: false)",
+            skip_auth_check = "Skip pre-flight credential check (optional, default: false)"
         )
     )]
     pub async fn release(
@@ -376,8 +377,9 @@ impl BuildHub {
         body: Option<String>,
         draft: Option<bool>,
         dry_run: Option<bool>,
+        skip_auth_check: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        release::release(path, tag, targets, include, exclude, forge, title, body, draft, dry_run)
+        release::release(path, tag, targets, include, exclude, forge, title, body, draft, dry_run, skip_auth_check)
     }
 
     /// Release all binary-producing packages in workspace in dependency order
@@ -393,7 +395,8 @@ impl BuildHub {
             title = "Release title (optional, defaults to tag)",
             body = "Release description/notes (optional)",
             draft = "Create as draft release (optional, default: false)",
-            dry_run = "Preview everything without side effects (optional, default: false)"
+            dry_run = "Preview everything without side effects (optional, default: false)",
+            skip_auth_check = "Skip pre-flight credential check (optional, default: false)"
         )
     )]
     pub async fn release_all(
@@ -408,8 +411,9 @@ impl BuildHub {
         body: Option<String>,
         draft: Option<bool>,
         dry_run: Option<bool>,
+        skip_auth_check: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        release::release_all(path, tag, targets, include, exclude, forge, title, body, draft, dry_run)
+        release::release_all(path, tag, targets, include, exclude, forge, title, body, draft, dry_run, skip_auth_check)
     }
 
     /// Inject cargo-binstall metadata into Cargo.toml files

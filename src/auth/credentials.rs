@@ -234,6 +234,135 @@ pub fn credentials_for_forge(forge: &Forge, org: &str) -> Vec<ResolvedCredential
 }
 
 // ---------------------------------------------------------------------------
+// Pre-flight auth checking
+// ---------------------------------------------------------------------------
+
+use crate::auth_hub::storage::YamlStorage;
+use crate::auth_hub::types::SecretPath;
+use crate::hub::HyperforgeEvent;
+use std::collections::HashSet;
+
+/// Result of a pre-flight credential check for a single credential.
+#[derive(Debug, Clone)]
+pub struct PreflightFailure {
+    pub key_path: String,
+    pub display_name: &'static str,
+    pub needed_by: String,
+    pub setup_url: &'static str,
+    pub fix_command: String,
+}
+
+/// Run pre-flight auth checks for a set of forges and dist channels.
+/// Returns error events for any missing credentials.
+/// Empty vec = all clear, proceed.
+///
+/// This only checks existence in the secrets store (no HTTP validation).
+/// Full validation is for `auth check`.
+pub async fn preflight_check(
+    forges: &[String],
+    channels: &[DistChannel],
+    org: &str,
+    _auth: &dyn super::AuthProvider,
+) -> Vec<HyperforgeEvent> {
+    // Initialize storage
+    let storage = match YamlStorage::default_location() {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![HyperforgeEvent::Error {
+                message: format!("Pre-flight: failed to initialize secrets storage: {}", e),
+            }];
+        }
+    };
+    if let Err(e) = storage.load().await {
+        return vec![HyperforgeEvent::Error {
+            message: format!("Pre-flight: failed to load secrets: {}", e),
+        }];
+    }
+
+    // Collect all required credentials, deduplicating by key_path
+    let mut seen_keys = HashSet::new();
+    let mut all_creds: Vec<ResolvedCredential> = Vec::new();
+
+    // Forge credentials (primary tokens for API access)
+    for forge_name in forges {
+        if let Some(forge_enum) = crate::config::HyperforgeConfig::parse_forge(forge_name) {
+            for cred in credentials_for_forge(&forge_enum, org) {
+                if seen_keys.insert(cred.key_path.clone()) {
+                    all_creds.push(cred);
+                }
+            }
+        }
+    }
+
+    // Channel credentials (crates-io token, hackage creds, etc.)
+    if !channels.is_empty() {
+        for cred in credentials_for_channels(channels, org) {
+            if seen_keys.insert(cred.key_path.clone()) {
+                all_creds.push(cred);
+            }
+        }
+    }
+
+    if all_creds.is_empty() {
+        return Vec::new();
+    }
+
+    // Check existence of each credential
+    let mut failures: Vec<PreflightFailure> = Vec::new();
+
+    for cred in &all_creds {
+        let secret_path = SecretPath::new(&cred.key_path);
+        let exists = match storage.get(&secret_path) {
+            Ok(secret) => !secret.value.is_empty(),
+            Err(_) => false,
+        };
+
+        if !exists {
+            let needed_by = cred
+                .spec
+                .required_by
+                .join(", ");
+            let fix_command = format!(
+                "synapse -P 44105 secrets auth set_secret --secret_key \"{}\" --value \"$(pbpaste)\"",
+                cred.key_path,
+            );
+            failures.push(PreflightFailure {
+                key_path: cred.key_path.clone(),
+                display_name: cred.spec.display_name,
+                needed_by,
+                setup_url: cred.spec.setup_url,
+                fix_command,
+            });
+        }
+    }
+
+    if failures.is_empty() {
+        return Vec::new();
+    }
+
+    // Build error events
+    let mut events = Vec::new();
+
+    let mut detail_lines = String::from("Pre-flight auth check failed:\n");
+    for f in &failures {
+        detail_lines.push_str(&format!(
+            "\n  ✗ {} — MISSING\n    Needed for: {}\n    Fix: {}\n    Create at: {}\n",
+            f.key_path, f.needed_by, f.fix_command, f.setup_url,
+        ));
+    }
+    detail_lines.push_str(&format!(
+        "\nAborting. Run `auth setup --org {}` to configure missing credentials.",
+        org,
+    ));
+
+    events.push(HyperforgeEvent::Error {
+        message: detail_lines,
+    });
+
+    events
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

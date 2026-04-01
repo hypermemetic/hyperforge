@@ -14,6 +14,8 @@ use chrono::Utc;
 
 use crate::adapters::{ForgePort, ForgeSyncState};
 use crate::commands::init::{init, InitOptions};
+use crate::auth::credentials::preflight_check;
+use crate::auth::YamlAuthProvider;
 use crate::commands::push::{push, PushOptions};
 use crate::commands::runner::{collect_push_results, discover_or_bail, run_batch, run_batch_blocking, run_diff_batch, run_validation_gate};
 use crate::commands::workspace::{repo_from_config, DiscoveredRepo, WorkspaceContext};
@@ -503,7 +505,8 @@ impl WorkspaceHub {
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
             dry_run = "Preview pushes without executing (optional, default: false)",
             set_upstream = "Set upstream tracking (optional, default: false)",
-            validate = "Run containerized validation before pushing (optional, default: false)"
+            validate = "Run containerized validation before pushing (optional, default: false)",
+            skip_auth_check = "Skip pre-flight credential check (optional, default: false)"
         )
     )]
     pub async fn push_all(
@@ -515,9 +518,11 @@ impl WorkspaceHub {
         dry_run: Option<bool>,
         set_upstream: Option<bool>,
         validate: Option<bool>,
+        skip_auth_check: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let push_branch = branch; // passed through to PushOptions
         let filter = RepoFilter::new(include, exclude);
+        let is_skip_auth = skip_auth_check.unwrap_or(false);
         stream! {
             let workspace_path = PathBuf::from(&path);
             let is_dry_run = dry_run.unwrap_or(false);
@@ -531,6 +536,17 @@ impl WorkspaceHub {
 
             // Filter repos by name glob if provided
             let repos: Vec<_> = ctx.repos.iter().filter(|r| filter.matches(&r.dir_name)).collect();
+
+            // ── Pre-flight auth check ──
+            if !is_skip_auth && !is_dry_run {
+                let preflight_errors = run_workspace_preflight(&repos, &ctx).await;
+                if !preflight_errors.is_empty() {
+                    for event in preflight_errors {
+                        yield event;
+                    }
+                    return;
+                }
+            }
 
             // Validation gate (if --validate)
             if is_validate {
@@ -713,7 +729,8 @@ impl WorkspaceHub {
             validate = "Run containerized validation before pushing (optional, default: false)",
             reflect = "Enable reflect mode: retire remote-only repos (optional, default: false)",
             purge = "Delete repos previously staged for deletion. Implies --reflect (optional, default: false)",
-            branch = "Branch to push (optional, default: current checked-out branch per repo)"
+            branch = "Branch to push (optional, default: current checked-out branch per repo)",
+            skip_auth_check = "Skip pre-flight credential check (optional, default: false)"
         )
     )]
     pub async fn sync(
@@ -730,6 +747,7 @@ impl WorkspaceHub {
         reflect: Option<bool>,
         purge: Option<bool>,
         branch: Option<String>,
+        skip_auth_check: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let sync_service = self.state.sync_service.clone();
@@ -739,6 +757,7 @@ impl WorkspaceHub {
         let is_validate = validate.unwrap_or(false);
         let is_purge = purge.unwrap_or(false);
         let is_reflect = reflect.unwrap_or(false) || is_purge;
+        let is_skip_auth = skip_auth_check.unwrap_or(false);
         let filter = RepoFilter::new(include, exclude);
 
         stream! {
@@ -885,6 +904,17 @@ impl WorkspaceHub {
                 yield HyperforgeEvent::Info {
                     message: format!("{}Phase 5/8: Import skipped (reflect mode).", dry_prefix),
                 };
+            }
+
+            // ── Pre-flight auth check (between import and diff) ──
+            if !is_skip_auth && !is_dry_run {
+                let preflight_errors = run_sync_preflight(&pairs).await;
+                if !preflight_errors.is_empty() {
+                    for event in preflight_errors {
+                        yield event;
+                    }
+                    return;
+                }
             }
 
             // ── Phase 6: Diff ──
@@ -2235,6 +2265,58 @@ fn enrich_diff_with_git_state(
             repo_op.op = SOp::Update;
         }
     }
+}
+
+// ── Pre-flight auth helpers (private) ─────────────────────────────────────
+
+/// Run pre-flight auth check for workspace push_all.
+/// Collects all unique org/forge pairs from discovered repos.
+async fn run_workspace_preflight(
+    _repos: &[&crate::commands::workspace::DiscoveredRepo],
+    ctx: &crate::commands::workspace::WorkspaceContext,
+) -> Vec<HyperforgeEvent> {
+    let pairs = ctx.org_forge_pairs();
+    run_sync_preflight(&pairs).await
+}
+
+/// Run pre-flight auth check for sync and push_all.
+/// Takes org/forge pairs and checks that forge tokens exist.
+async fn run_sync_preflight(
+    pairs: &[(String, String)],
+) -> Vec<HyperforgeEvent> {
+    use std::collections::{HashMap, HashSet};
+
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    // Group forges by org
+    let mut org_forges: HashMap<String, HashSet<String>> = HashMap::new();
+    for (org, forge) in pairs {
+        org_forges
+            .entry(org.clone())
+            .or_default()
+            .insert(forge.clone());
+    }
+
+    let auth = match YamlAuthProvider::new() {
+        Ok(a) => std::sync::Arc::new(a),
+        Err(e) => {
+            return vec![HyperforgeEvent::Error {
+                message: format!("Pre-flight: failed to create auth provider: {}", e),
+            }];
+        }
+    };
+
+    let mut all_errors = Vec::new();
+    for (org, forge_set) in &org_forges {
+        let forges: Vec<String> = forge_set.iter().cloned().collect();
+        // sync/push only needs forge tokens (tagged "sync"), no dist channels
+        let errors = preflight_check(&forges, &[], org, auth.as_ref()).await;
+        all_errors.extend(errors);
+    }
+
+    all_errors
 }
 
 // ── Sync phase helpers (private) ──────────────────────────────────────────

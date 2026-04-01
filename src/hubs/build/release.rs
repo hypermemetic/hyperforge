@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::adapters::releases::codeberg::CodebergReleaseAdapter;
 use crate::adapters::releases::github::GitHubReleaseAdapter;
 use crate::adapters::releases::ReleasePort;
+use crate::auth::credentials::preflight_check;
 use crate::auth::YamlAuthProvider;
 use crate::build_system::cross_compile::{compile_and_package, host_triple, TargetTriple};
 use crate::build_system::{self, BinaryTarget};
@@ -205,6 +206,72 @@ fn resolve_forges_with_dist(
     }
     // No dist config — fall back to repo's configured forges
     repo.forges().iter().map(|s| s.to_string()).collect()
+}
+
+/// Collect org/forge/channel data from repos and run pre-flight auth.
+/// Accepts an iterator of repo references to work with both owned and borrowed slices.
+async fn run_release_preflight(
+    repos: &[&DiscoveredRepo],
+    forge_override: &Option<String>,
+) -> Vec<HyperforgeEvent> {
+    use std::collections::HashSet;
+
+    let mut org_forges: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut org_channels: std::collections::HashMap<String, Vec<DistChannel>> =
+        std::collections::HashMap::new();
+
+    for repo in repos {
+        let org = match repo.org() {
+            Some(o) => o.to_string(),
+            None => continue,
+        };
+
+        // Collect forges
+        let forges: Vec<String> = if let Some(ref f) = forge_override {
+            f.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            repo.forges().iter().map(|s| s.to_string()).collect()
+        };
+
+        let forge_set = org_forges.entry(org.clone()).or_default();
+        for f in forges {
+            forge_set.insert(f);
+        }
+
+        // Collect dist channels
+        if let Some(dist) = load_dist_config(repo) {
+            let ch = org_channels.entry(org.clone()).or_default();
+            for c in dist.channels {
+                if !ch.contains(&c) {
+                    ch.push(c);
+                }
+            }
+        }
+    }
+
+    // Run preflight for each org
+    let auth = match make_auth() {
+        Ok(a) => a,
+        Err(e) => {
+            return vec![HyperforgeEvent::Error {
+                message: format!("Pre-flight: {}", e),
+            }];
+        }
+    };
+
+    let mut all_errors = Vec::new();
+    for (org, forge_set) in &org_forges {
+        let forges: Vec<String> = forge_set.iter().cloned().collect();
+        let channels = org_channels.get(org).cloned().unwrap_or_default();
+        let errors = preflight_check(&forges, &channels, org, auth.as_ref()).await;
+        all_errors.extend(errors);
+    }
+
+    all_errors
 }
 
 /// Release a single repo: detect binaries, compile for all targets, create git tag,
@@ -550,10 +617,12 @@ pub fn release(
     body: Option<String>,
     draft: Option<bool>,
     dry_run: Option<bool>,
+    skip_auth_check: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let filter = RepoFilter::new(include, exclude);
     let is_dry_run = dry_run.unwrap_or(false);
     let is_draft = draft.unwrap_or(false);
+    let is_skip_auth = skip_auth_check.unwrap_or(false);
     let release_title = title.unwrap_or_else(|| tag.clone());
     let release_body = body.unwrap_or_default();
 
@@ -591,6 +660,18 @@ pub fn release(
                 message: "No repos matched filter.".to_string(),
             };
             return;
+        }
+
+        // ── Pre-flight auth check ──
+        if !is_skip_auth && !is_dry_run {
+            let repo_refs: Vec<&DiscoveredRepo> = repos.iter().collect();
+            let preflight_errors = run_release_preflight(&repo_refs, &forge).await;
+            if !preflight_errors.is_empty() {
+                for event in preflight_errors {
+                    yield event;
+                }
+                return;
+            }
         }
 
         yield HyperforgeEvent::Info {
@@ -682,10 +763,12 @@ pub fn release_all(
     body: Option<String>,
     draft: Option<bool>,
     dry_run: Option<bool>,
+    skip_auth_check: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let filter = RepoFilter::new(include, exclude);
     let is_dry_run = dry_run.unwrap_or(false);
     let is_draft = draft.unwrap_or(false);
+    let is_skip_auth = skip_auth_check.unwrap_or(false);
     let release_title = title.unwrap_or_else(|| tag.clone());
     let release_body = body.unwrap_or_default();
 
@@ -703,6 +786,21 @@ pub fn release_all(
         };
 
         let all_repos = ctx.repos;
+
+        // ── Pre-flight auth check ──
+        if !is_skip_auth && !is_dry_run {
+            let filtered_for_preflight: Vec<_> = all_repos
+                .iter()
+                .filter(|r| filter.matches(&r.dir_name))
+                .collect::<Vec<_>>();
+            let preflight_errors = run_release_preflight(&filtered_for_preflight, &forge).await;
+            if !preflight_errors.is_empty() {
+                for event in preflight_errors {
+                    yield event;
+                }
+                return;
+            }
+        }
 
         // Build dependency graph for ordering
         let dep_graph = build_publish_dep_graph(&all_repos);
