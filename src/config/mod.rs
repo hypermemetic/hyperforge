@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // Re-export shared config types from types::config
-pub use crate::types::config::{CiConfig, ForgeConfig};
+pub use crate::types::config::{CiConfig, DistConfig, ForgeConfig};
 
 /// Configuration directory name
 pub const CONFIG_DIR: &str = ".hyperforge";
@@ -90,6 +90,10 @@ pub struct HyperforgeConfig {
     /// Large file threshold in KB for push guard (default: 100)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub large_file_threshold_kb: Option<u64>,
+
+    /// Distribution configuration for binary releases
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dist: Option<DistConfig>,
 }
 
 impl Default for HyperforgeConfig {
@@ -105,6 +109,7 @@ impl Default for HyperforgeConfig {
             default_branch: None,
             ci: None,
             large_file_threshold_kb: None,
+            dist: None,
         }
     }
 }

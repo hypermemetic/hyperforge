@@ -752,6 +752,7 @@ mod tests {
             ssh: std::collections::HashMap::new(),
             forge_config: std::collections::HashMap::new(),
             ci: None,
+            dist: None,
         };
         forge.upsert_record(record).unwrap();
 

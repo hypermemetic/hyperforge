@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use super::{CiConfig, ForgeConfig, Forge, Visibility};
+use super::{CiConfig, DistConfig, ForgeConfig, Forge, Visibility};
 
 pub(crate) fn is_false(b: &bool) -> bool {
     !*b
@@ -157,6 +157,10 @@ pub struct RepoRecord {
     /// CI/validation configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci: Option<CiConfig>,
+
+    /// Distribution configuration for binary releases
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dist: Option<DistConfig>,
 }
 
 fn default_branch() -> String {
@@ -189,6 +193,7 @@ impl RepoRecord {
             ssh: HashMap::new(),
             forge_config: HashMap::new(),
             ci: None,
+            dist: None,
         }
     }
 
@@ -208,6 +213,9 @@ impl RepoRecord {
         }
         if self.ci.is_none() {
             self.ci = config.ci.clone();
+        }
+        if self.dist.is_none() {
+            self.dist = config.dist.clone();
         }
         if self.default_branch == "main" {
             if let Some(ref branch) = config.default_branch {

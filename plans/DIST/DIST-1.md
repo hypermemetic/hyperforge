@@ -2,81 +2,86 @@
 
 ## Goal
 
-Enable hyperforge to build, package, and distribute pre-built binaries across multiple channels — forge releases (cargo binstall), Homebrew, and future package managers — for both Rust and Haskell projects in the workspace.
+Enable hyperforge to build, package, and distribute pre-built binaries across multiple channels — forge releases (cargo binstall), Homebrew, and future package managers — for both Rust and Haskell projects in the workspace. Distribution targets are configured per-repo.
+
+## Status
+
+| Ticket | Status | Description |
+|--------|--------|-------------|
+| DIST-2 | **DONE** | ReleasePort trait + GitHub/Codeberg adapters |
+| DIST-3 | **DONE** | Binary target detection from Cargo.toml/.cabal |
+| DIST-4 | **DONE** | ReleasesHub subactivation (list/create/upload/delete/assets) |
+| DIST-5 | **DONE** | Cross-compile engine + tar.gz packaging |
+| DIST-6 | **DONE** | `build release` all-in-one orchestrator |
+| DIST-7 | **DONE** | Homebrew formula generation |
+| DIST-8 | **DONE** | Binstall metadata injection |
+| DIST-9 | **DONE** | Workspace-wide release with dependency ordering |
+| DIST-10 | IN PROGRESS | Distribution config as source of truth |
 
 ## Context
 
-Today hyperforge can publish **source packages** (crates.io via `package_publish`, Hackage via `package_publish`) and **container images** (ghcr.io/codeberg via `ImagesHub`). But there's no way to distribute **pre-built binaries**.
-
-Users want to run `cargo binstall plexus-substrate` or `brew install hypermemetic/tap/synapse` and get a binary without compiling from source. This requires:
-
-1. Cross-compiling for multiple target triples
-2. Packaging binaries with the right naming conventions
-3. Creating forge releases and uploading assets
-4. Generating package manager metadata (Homebrew formulas, binstall config)
+Today hyperforge can publish **source packages** (crates.io via `package_publish`, Hackage via `package_publish`) and **container images** (ghcr.io/codeberg via `ImagesHub`). DIST adds **pre-built binary distribution**.
 
 ### Language-specific considerations
 
 | Language | Source publish | Binary install | Cross-compile |
 |----------|--------------|----------------|---------------|
 | **Rust** | crates.io | cargo binstall (forge releases) | `cross` crate or `cargo build --target` |
-| **Haskell** | Hackage | Homebrew, direct download | Native only (cross-GHC is hard); Docker for Linux targets |
-
-Haskell has no `cargo binstall` equivalent. The practical channels for Haskell binaries are Homebrew (macOS/Linux) and direct download from forge releases.
+| **Haskell** | Hackage | Homebrew, direct download | Native only; Docker for Linux targets |
 
 ## Dependency DAG
 
 ```
-DIST-2 (ReleasePort trait + forge adapters)
+DIST-2 (ReleasePort trait + adapters)         ✅
   │
-  ├──► DIST-4 (ReleasesHub — create/upload/list/delete releases)
+  ├──► DIST-4 (ReleasesHub subactivation)     ✅
+  │      │
+  │      ├──► DIST-7 (Homebrew formulas)      ✅
+  │      └──► DIST-8 (Binstall metadata)      ✅
   │
-  └──► DIST-6 (build release — all-in-one orchestrator)
-
-DIST-3 (Binary target detection)
-  │
-  └──► DIST-5 (Cross-compile + package engine)
+  └──► DIST-6 (build release orchestrator)    ✅
+         ▲          │
+         │          └──► DIST-9 (workspace)   ✅
          │
-         └──► DIST-6 (build release — all-in-one orchestrator)
+DIST-3 (binary detection)                     ✅
+  │
+  └──► DIST-5 (cross-compile engine)          ✅
 
-DIST-7 (Homebrew formula generation) ◄── DIST-4
-DIST-8 (Binstall metadata injection) ◄── DIST-4
-DIST-9 (Workspace-wide release) ◄── DIST-6
+DIST-10 (dist config as source of truth)      🔧 IN PROGRESS
+  └── depends on DIST-6
+  └── makes release/release_all config-driven
 ```
 
-## Phases
+## Commands (all implemented)
 
-### Phase 1: Foundation (DIST-2, DIST-3) — parallelizable
-- ReleasePort trait with GitHub and Codeberg adapters
-- Binary target extraction from Cargo.toml / .cabal files
+```bash
+# Per-repo release management
+synapse lforge hyperforge repo releases list --org x --name y
+synapse lforge hyperforge repo releases create --org x --name y --tag v1.0
+synapse lforge hyperforge repo releases upload --org x --name y --tag v1.0 --file ./app.tar.gz
+synapse lforge hyperforge repo releases assets --org x --name y --tag v1.0
+synapse lforge hyperforge repo releases delete --org x --name y --tag v1.0 --confirm true
 
-### Phase 2: Forge Releases (DIST-4) — depends on DIST-2
-- ReleasesHub subactivation under RepoHub (list, create, upload, delete)
-- First usable milestone: manual upload of pre-built binaries
+# Single-repo build + release
+synapse lforge hyperforge build release --path . --tag v1.0 --targets x86_64-unknown-linux-gnu,aarch64-apple-darwin
 
-### Phase 3: Cross-Compilation (DIST-5) — depends on DIST-3
-- Target triple type system
-- Compilation via native cargo, cross, or Docker
-- Archive packaging with binstall-compatible naming
-- Haskell: native target + static linking
+# Workspace-wide release (dependency ordered)
+synapse lforge hyperforge build release_all --path . --tag v1.0
 
-### Phase 4: All-in-One (DIST-6) — depends on DIST-4 + DIST-5
-- `build release` command: compile → package → create release → upload
-- Streaming progress events
-- Second usable milestone: one command to release
+# Package manager integration
+synapse lforge hyperforge build brew_formula --org x --name y --tag v1.0 --tap_path /path/to/tap
+synapse lforge hyperforge build binstall_init --path . --forge github
 
-### Phase 5: Package Managers (DIST-7, DIST-8) — depends on DIST-4
-- Homebrew formula generation from release assets
-- `[package.metadata.binstall]` injection into Cargo.toml
-- Future: Nix flake generation
-
-### Phase 6: Workspace Scale (DIST-9) — depends on DIST-6
-- Release all packages in dependency order
-- Parallel cross-compilation across repos
+# Coming (DIST-10):
+synapse lforge hyperforge build dist_show --path .
+synapse lforge hyperforge build dist_init --path .
+```
 
 ## Success Criteria
 
-- `synapse lforge hyperforge build release --path . --tag v4.1.0 --targets x86_64-unknown-linux-gnu,aarch64-apple-darwin` builds and uploads binaries
-- `cargo binstall hyperforge` installs from the release
-- `brew install hypermemetic/tap/synapse` installs the Haskell binary
-- Both GitHub and Codeberg releases are populated
+- [x] `build release` builds and uploads binaries to forge releases
+- [x] `cargo binstall {crate}` installable after binstall_init + release
+- [x] `brew install org/tap/name` installable after brew_formula
+- [x] Both GitHub and Codeberg releases supported
+- [x] Workspace-wide release in dependency order
+- [ ] Distribution config per-repo (DIST-10)

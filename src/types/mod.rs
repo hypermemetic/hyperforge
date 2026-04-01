@@ -11,7 +11,7 @@ pub use repo::Repo;
 pub use repo::RepoRecord;
 
 // Re-export config types
-pub use config::{CiConfig, ForgeConfig};
+pub use config::{CiConfig, DistChannel, DistConfig, ForgeConfig};
 
 // Re-export registry types
 pub use registry::{ContainerRegistry, ImageRef, RegistryAuth};

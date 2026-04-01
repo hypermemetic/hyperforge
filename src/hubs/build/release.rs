@@ -14,9 +14,11 @@ use crate::build_system::cross_compile::{compile_and_package, host_triple, Targe
 use crate::build_system::{self, BinaryTarget};
 use crate::commands::runner::discover_or_bail;
 use crate::commands::workspace::{build_publish_dep_graph, DiscoveredRepo};
+use crate::config::HyperforgeConfig;
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::RepoFilter;
+use crate::types::config::DistChannel;
 
 pub(crate) fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
@@ -77,6 +79,7 @@ fn resolve_org(repo: &DiscoveredRepo) -> Option<String> {
 }
 
 /// Parse comma-separated target triples, defaulting to native
+#[allow(dead_code)]
 fn parse_targets(targets: &Option<String>) -> Vec<TargetTriple> {
     match targets {
         Some(s) if !s.is_empty() => s
@@ -147,6 +150,61 @@ struct SingleRepoReleaseCounts {
     forges: HashSet<String>,
     assets_uploaded: usize,
     failed: usize,
+}
+
+/// Load the dist config for a discovered repo from its .hyperforge/config.toml.
+fn load_dist_config(repo: &DiscoveredRepo) -> Option<crate::types::config::DistConfig> {
+    HyperforgeConfig::load(&repo.path)
+        .ok()
+        .and_then(|c| c.dist)
+}
+
+/// Resolve target triples for a repo, consulting dist config when no CLI override is provided.
+fn resolve_targets_with_dist(
+    cli_targets: &Option<String>,
+    repo: &DiscoveredRepo,
+) -> Vec<TargetTriple> {
+    // CLI override takes priority
+    if let Some(ref s) = cli_targets {
+        if !s.is_empty() {
+            return s.split(',').map(|t| TargetTriple::new(t.trim())).collect();
+        }
+    }
+    // Check dist config
+    if let Some(dist) = load_dist_config(repo) {
+        if !dist.targets.is_empty() {
+            return dist.targets.iter().map(|t| TargetTriple::new(t)).collect();
+        }
+    }
+    // Fallback to native host
+    vec![TargetTriple::new(host_triple())]
+}
+
+/// Resolve forges for a repo, consulting dist config channels when no CLI override is provided.
+fn resolve_forges_with_dist(
+    cli_forge: &Option<String>,
+    repo: &DiscoveredRepo,
+) -> Vec<String> {
+    // CLI override takes priority
+    if let Some(ref f) = cli_forge {
+        let parsed: Vec<String> = f.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    // Check dist config: if forge-release is not in channels, return empty (skip)
+    if let Some(dist) = load_dist_config(repo) {
+        if !dist.channels.is_empty() {
+            if !dist.channels.contains(&DistChannel::ForgeRelease) {
+                // Dist config exists but doesn't include forge-release — skip
+                return Vec::new();
+            }
+            // forge-release is in channels — use repo's configured forges
+            return repo.forges().iter().map(|s| s.to_string()).collect();
+        }
+    }
+    // No dist config — fall back to repo's configured forges
+    repo.forges().iter().map(|s| s.to_string()).collect()
 }
 
 /// Release a single repo: detect binaries, compile for all targets, create git tag,
@@ -498,7 +556,6 @@ pub fn release(
     let is_draft = draft.unwrap_or(false);
     let release_title = title.unwrap_or_else(|| tag.clone());
     let release_body = body.unwrap_or_default();
-    let target_triples = parse_targets(&targets);
 
     stream! {
         let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -538,11 +595,10 @@ pub fn release(
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Release {} -- {} repo(s), {} target(s)",
+                "{}Release {} -- {} repo(s)",
                 dry_prefix,
                 tag,
                 repos.len(),
-                target_triples.len(),
             ),
         };
 
@@ -553,11 +609,34 @@ pub fn release(
         let mut summary_failed = 0usize;
 
         for repo in &repos {
+            // Resolve targets and forges per-repo, consulting dist config
+            let repo_targets = resolve_targets_with_dist(&targets, repo);
+            let repo_forges = resolve_forges_with_dist(&forge, repo);
+
+            // If dist config says no forge-release, skip
+            if repo_forges.is_empty() && forge.is_none() {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "Skipping {} (no forge-release channel in dist config)",
+                        repo.dir_name,
+                    ),
+                };
+                continue;
+            }
+
+            let forge_override_for_repo = if forge.is_some() {
+                forge.clone()
+            } else if !repo_forges.is_empty() {
+                Some(repo_forges.join(","))
+            } else {
+                None
+            };
+
             let (repo_events, repo_counts) = release_single_repo(
                 repo,
                 &tag,
-                &target_triples,
-                &forge,
+                &repo_targets,
+                &forge_override_for_repo,
                 &release_title,
                 &release_body,
                 is_draft,
@@ -609,7 +688,6 @@ pub fn release_all(
     let is_draft = draft.unwrap_or(false);
     let release_title = title.unwrap_or_else(|| tag.clone());
     let release_body = body.unwrap_or_default();
-    let target_triples = parse_targets(&targets);
 
     stream! {
         let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -663,11 +741,10 @@ pub fn release_all(
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Release all {} -- {} repo(s) in dependency order, {} target(s)",
+                "{}Release all {} -- {} repo(s) in dependency order",
                 dry_prefix,
                 tag,
                 repos.len(),
-                target_triples.len(),
             ),
         };
 
@@ -678,6 +755,24 @@ pub fn release_all(
         let mut summary_failed = 0usize;
 
         for (i, repo) in repos.iter().enumerate() {
+            // Resolve targets and forges per-repo, consulting dist config
+            let repo_targets = resolve_targets_with_dist(&targets, repo);
+            let repo_forges = resolve_forges_with_dist(&forge, repo);
+
+            // If dist config says no forge-release, skip
+            if repo_forges.is_empty() && forge.is_none() {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "{}[{}/{}] Skipping {} (no forge-release channel in dist config)",
+                        dry_prefix,
+                        i + 1,
+                        repos.len(),
+                        repo.dir_name,
+                    ),
+                };
+                continue;
+            }
+
             yield HyperforgeEvent::Info {
                 message: format!(
                     "{}[{}/{}] Processing {}...",
@@ -688,11 +783,19 @@ pub fn release_all(
                 ),
             };
 
+            let forge_override_for_repo = if forge.is_some() {
+                forge.clone()
+            } else if !repo_forges.is_empty() {
+                Some(repo_forges.join(","))
+            } else {
+                None
+            };
+
             let (repo_events, repo_counts) = release_single_repo(
                 repo,
                 &tag,
-                &target_triples,
-                &forge,
+                &repo_targets,
+                &forge_override_for_repo,
                 &release_title,
                 &release_body,
                 is_draft,

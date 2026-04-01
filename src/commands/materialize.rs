@@ -101,6 +101,7 @@ pub fn materialize(
         default_branch,
         ci: record.ci.clone(),
         large_file_threshold_kb: None,
+        dist: record.dist.clone(),
     };
 
     // ── Step 1: config ──────────────────────────────────────────────────

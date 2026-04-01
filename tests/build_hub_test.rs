@@ -107,6 +107,12 @@ fn build_hub_has_correct_methods() {
         "repo_sizes",
         "dirty",
         "loc",
+        "release",
+        "release_all",
+        "binstall_init",
+        "brew_formula",
+        "dist_show",
+        "dist_init",
         "schema",
     ]
     .into_iter()

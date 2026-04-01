@@ -1164,6 +1164,7 @@ impl RepoHub {
                     ssh: HashMap::new(),
                     forge_config: HashMap::new(),
                     ci: None,
+                    dist: None,
                 },
             };
 

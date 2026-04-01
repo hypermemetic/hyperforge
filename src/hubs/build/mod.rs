@@ -5,6 +5,7 @@
 
 pub mod binstall;
 pub mod dirty;
+pub mod dist;
 pub mod execution;
 pub mod gitignore;
 pub mod homebrew;
@@ -457,6 +458,52 @@ impl BuildHub {
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         homebrew::brew_formula(org, name, tag, forge, tap_path, description, dry_run)
+    }
+
+    /// Show distribution config for workspace repos
+    #[plexus_macros::hub_method(
+        description = "Show distribution configuration ([dist] section) for each repo in the workspace. Shows channels, targets, and brew tap settings.",
+        params(
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)"
+        )
+    )]
+    pub async fn dist_show(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        dist::dist_show(path, include, exclude)
+    }
+
+    /// Initialize distribution config for workspace repos
+    #[plexus_macros::hub_method(
+        description = "Populate [dist] sections in .hyperforge/config.toml for workspace repos. Auto-detects sensible defaults based on build system (Rust: forge-release + crates-io + binstall; Haskell: forge-release + hackage + brew). CLI flags override auto-detected defaults.",
+        params(
+            path = "Path to workspace directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            channels = "Comma-separated distribution channels (optional, overrides auto-detect)",
+            targets = "Comma-separated target triples (optional, overrides auto-detect)",
+            brew_tap = "Homebrew tap repo (e.g. hypermemetic/homebrew-tap) (optional)",
+            force = "Overwrite existing [dist] config (optional, default: false)",
+            dry_run = "Preview without writing files (optional, default: false)"
+        )
+    )]
+    pub async fn dist_init(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        channels: Option<String>,
+        targets: Option<String>,
+        brew_tap: Option<String>,
+        force: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        dist::dist_init(path, include, exclude, channels, targets, brew_tap, force, dry_run)
     }
 }
 

@@ -171,6 +171,44 @@ pub fn default_ci_config(build_systems: &[BuildSystemKind]) -> CiConfig {
     }
 }
 
+/// Distribution channel for binary releases
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum DistChannel {
+    ForgeRelease,
+    CratesIo,
+    Hackage,
+    Brew,
+    Ghcr,
+    Binstall,
+}
+
+impl std::fmt::Display for DistChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForgeRelease => write!(f, "forge-release"),
+            Self::CratesIo => write!(f, "crates-io"),
+            Self::Hackage => write!(f, "hackage"),
+            Self::Brew => write!(f, "brew"),
+            Self::Ghcr => write!(f, "ghcr"),
+            Self::Binstall => write!(f, "binstall"),
+        }
+    }
+}
+
+/// Per-repo distribution configuration
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DistConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<DistChannel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brew_tap: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brew_tap_path: Option<String>,
+}
+
 /// Per-forge configuration overrides
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForgeConfig {
