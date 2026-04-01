@@ -277,6 +277,73 @@ pub enum HyperforgeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Release information
+    ReleaseInfo {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        title: String,
+        asset_count: usize,
+        draft: bool,
+        prerelease: bool,
+        created_at: String,
+    },
+    /// Release creation result
+    ReleaseCreate {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Release asset upload result
+    ReleaseUpload {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        asset_name: String,
+        size_bytes: u64,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Release deletion result
+    ReleaseDelete {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Release asset information
+    AssetInfo {
+        repo_name: String,
+        forge: String,
+        tag: String,
+        asset_name: String,
+        size_bytes: u64,
+        content_type: String,
+        download_url: String,
+        created_at: String,
+    },
+    /// Progress step during build release orchestration
+    ReleaseBuildStep {
+        repo_name: String,
+        target: String,
+        status: String, // "compiling", "packaging", "uploading"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Summary of a build release run
+    ReleaseSummary {
+        repos: usize,
+        targets: usize,
+        forges: usize,
+        assets_uploaded: usize,
+        failed: usize,
+    },
 }
 
 /// Root hub for hyperforge operations

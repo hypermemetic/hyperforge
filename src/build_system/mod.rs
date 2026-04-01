@@ -8,6 +8,7 @@ pub mod cabal;
 pub mod cabal_project;
 pub mod cargo;
 pub mod cargo_config;
+pub mod cross_compile;
 pub mod dep_graph;
 pub mod node;
 pub mod publish;
@@ -15,7 +16,7 @@ pub mod validate;
 pub mod version;
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Known build system types
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -53,6 +54,32 @@ pub struct DepRef {
     /// Whether this is a dev/test-only dependency
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_dev: bool,
+}
+
+/// A binary/executable target detected from a build manifest
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BinaryTarget {
+    /// Binary/executable name
+    pub name: String,
+    /// Build system that produces this binary
+    pub build_system: BuildSystemKind,
+    /// Path to the repo containing this binary
+    pub repo_path: PathBuf,
+}
+
+/// Detect binary targets in a project by auto-detecting the build system.
+///
+/// Dispatches to `cargo_binary_targets` or `cabal_binary_targets` based on
+/// which build system is detected. Returns an empty vec for Node or Unknown.
+pub fn binary_targets(path: &Path) -> Vec<BinaryTarget> {
+    let mut targets = Vec::new();
+    if cargo::is_cargo_project(path) {
+        targets.extend(cargo::cargo_binary_targets(path));
+    }
+    if cabal::is_cabal_project(path) {
+        targets.extend(cabal::cabal_binary_targets(path));
+    }
+    targets
 }
 
 /// Detect the build system for a directory by checking filesystem markers.
@@ -185,6 +212,45 @@ mod tests {
     fn test_detect_unknown() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(detect_build_system(tmp.path()), BuildSystemKind::Unknown);
+    }
+
+    #[test]
+    fn test_binary_targets_cargo() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let targets = binary_targets(tmp.path());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "my-app");
+        assert_eq!(targets[0].build_system, BuildSystemKind::Cargo);
+    }
+
+    #[test]
+    fn test_binary_targets_cabal() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("app.cabal"),
+            "name: app\nversion: 0.1.0\n\nexecutable app\n  main-is: Main.hs\n",
+        )
+        .unwrap();
+
+        let targets = binary_targets(tmp.path());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "app");
+        assert_eq!(targets[0].build_system, BuildSystemKind::Cabal);
+    }
+
+    #[test]
+    fn test_binary_targets_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let targets = binary_targets(tmp.path());
+        assert!(targets.is_empty());
     }
 
     #[test]

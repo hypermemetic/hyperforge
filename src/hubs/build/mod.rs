@@ -11,6 +11,7 @@ pub mod loc;
 pub mod local_run;
 pub mod manifest;
 pub mod packaging;
+pub mod release;
 pub mod repo_size;
 
 use async_trait::async_trait;
@@ -342,6 +343,38 @@ impl BuildHub {
         all_git: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         dirty::dirty(path, include, exclude, all_git)
+    }
+
+    /// Cross-compile, package, create forge releases, and upload assets
+    #[plexus_macros::hub_method(
+        description = "All-in-one release orchestrator: cross-compile binaries, package archives, create tagged releases on forges, and upload assets. Works for a single repo or entire workspace.",
+        params(
+            path = "Path to workspace or repo directory",
+            tag = "Git tag for the release (e.g. v4.1.0)",
+            targets = "Comma-separated target triples (optional, defaults to native host)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            forge = "Target forges, comma-separated (optional, defaults to all configured)",
+            title = "Release title (optional, defaults to tag)",
+            body = "Release description/notes (optional)",
+            draft = "Create as draft release (optional, default: false)",
+            dry_run = "Preview everything without side effects (optional, default: false)"
+        )
+    )]
+    pub async fn release(
+        &self,
+        path: String,
+        tag: String,
+        targets: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        forge: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        draft: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        release::release(path, tag, targets, include, exclude, forge, title, body, draft, dry_run)
     }
 }
 

@@ -6,6 +6,7 @@ pub mod github;
 pub mod gitlab;
 pub mod local_forge;
 pub mod registry;
+pub mod releases;
 
 pub use codeberg::CodebergAdapter;
 pub use forge_port::{ForgeError, ForgePort, ForgeResult, ListResult};

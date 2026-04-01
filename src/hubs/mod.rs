@@ -4,6 +4,7 @@
 
 pub mod build;
 pub mod images;
+pub mod releases;
 pub mod repo;
 pub mod utils;
 pub mod workspace;

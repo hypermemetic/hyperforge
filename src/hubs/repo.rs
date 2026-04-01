@@ -16,6 +16,7 @@ use crate::commands::{push, status};
 use crate::config::HyperforgeConfig;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::images::ImagesHub;
+use crate::hubs::releases::ReleasesHub;
 use crate::hubs::HyperforgeState;
 use crate::types::{Forge, Repo, RepoRecord, Visibility};
 
@@ -2159,12 +2160,23 @@ impl RepoHub {
     /// Get child plugin summaries for the hub schema
     pub fn plugin_children(&self) -> Vec<plexus_core::plexus::ChildSummary> {
         let images = ImagesHub::new(self.state.clone());
-        let schema = Activation::plugin_schema(&images);
-        vec![plexus_core::plexus::ChildSummary {
-            namespace: schema.namespace,
-            description: schema.description,
-            hash: schema.hash,
-        }]
+        let images_schema = Activation::plugin_schema(&images);
+
+        let releases = ReleasesHub::new(self.state.clone());
+        let releases_schema = Activation::plugin_schema(&releases);
+
+        vec![
+            plexus_core::plexus::ChildSummary {
+                namespace: images_schema.namespace,
+                description: images_schema.description,
+                hash: images_schema.hash,
+            },
+            plexus_core::plexus::ChildSummary {
+                namespace: releases_schema.namespace,
+                description: releases_schema.description,
+                hash: releases_schema.hash,
+            },
+        ]
     }
 }
 
@@ -2181,6 +2193,7 @@ impl ChildRouter for RepoHub {
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
         match name {
             "images" => Some(Box::new(ImagesHub::new(self.state.clone()))),
+            "releases" => Some(Box::new(ReleasesHub::new(self.state.clone()))),
             _ => None,
         }
     }

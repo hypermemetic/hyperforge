@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "native-tls-vendored"] }
 
 # Container/OCI
 bollard = "0.18"
@@ -78,6 +78,7 @@ sha2 = "0.10"
 dirs = "5"
 urlencoding = "2"
 tar = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

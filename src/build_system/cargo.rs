@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::DepRef;
+use super::{BinaryTarget, BuildSystemKind, DepRef};
 
 /// Check if a directory contains a Cargo.toml
 pub fn is_cargo_project(path: &Path) -> bool {
@@ -28,6 +28,93 @@ pub fn cargo_package_version(path: &Path) -> Option<String> {
         .get("version")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// Detect binary targets from Cargo.toml
+///
+/// Finds binaries by:
+/// 1. Explicit `[[bin]]` sections with `name` fields
+/// 2. Implicit binary: if `src/main.rs` exists and no `[[bin]]` sections, the package name is used
+/// 3. Workspace members: recurses into workspace member directories for their binaries
+pub fn cargo_binary_targets(path: &Path) -> Vec<BinaryTarget> {
+    let cargo_path = path.join("Cargo.toml");
+    let content = match std::fs::read_to_string(&cargo_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let doc: toml::Value = match toml::from_str(&content) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut targets = Vec::new();
+    let repo_path = path.to_path_buf();
+
+    // Check for explicit [[bin]] sections
+    let explicit_bins: Vec<String> = doc
+        .get("bin")
+        .and_then(|v| v.as_array())
+        .map(|bins| {
+            bins.iter()
+                .filter_map(|b| b.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !explicit_bins.is_empty() {
+        for name in explicit_bins {
+            targets.push(BinaryTarget {
+                name,
+                build_system: BuildSystemKind::Cargo,
+                repo_path: repo_path.clone(),
+            });
+        }
+    } else if path.join("src/main.rs").exists() {
+        // Implicit binary: package name is the binary name
+        if let Some(pkg_name) = doc
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            targets.push(BinaryTarget {
+                name: pkg_name.to_string(),
+                build_system: BuildSystemKind::Cargo,
+                repo_path: repo_path.clone(),
+            });
+        }
+    }
+
+    // Recurse into workspace members
+    if let Some(members) = doc
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+    {
+        for member in members {
+            if let Some(pattern) = member.as_str() {
+                // Handle glob patterns like "crates/*" and direct paths like "my-crate"
+                if pattern.contains('*') {
+                    let base = path.join(pattern.trim_end_matches("/*").trim_end_matches("\\*"));
+                    if let Ok(entries) = std::fs::read_dir(&base) {
+                        for entry in entries.flatten() {
+                            let member_path = entry.path();
+                            if member_path.is_dir() && member_path.join("Cargo.toml").exists() {
+                                targets.extend(cargo_binary_targets(&member_path));
+                            }
+                        }
+                    }
+                } else {
+                    let member_path = path.join(pattern);
+                    if member_path.is_dir() && member_path.join("Cargo.toml").exists() {
+                        targets.extend(cargo_binary_targets(&member_path));
+                    }
+                }
+            }
+        }
+    }
+
+    targets
 }
 
 /// Parse dependencies from Cargo.toml
@@ -127,6 +214,32 @@ fn parse_dep_table(table: &toml::map::Map<String, toml::Value>, is_dev: bool) ->
     deps
 }
 
+/// Expand a workspace member pattern to concrete paths.
+///
+/// Handles direct paths (e.g., "crates/foo") and simple trailing wildcards
+/// (e.g., "crates/*"). Does not support full glob syntax.
+fn expand_workspace_member(root: &Path, pattern: &str) -> Vec<std::path::PathBuf> {
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        // Glob: list subdirectories of the prefix
+        let parent = root.join(prefix);
+        match std::fs::read_dir(&parent) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    } else if pattern.contains('*') {
+        // More complex glob patterns — skip rather than pull in a glob crate.
+        // In practice, Cargo workspaces use "dir/*" or literal paths.
+        Vec::new()
+    } else {
+        // Direct path
+        vec![root.join(pattern)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +322,117 @@ path-only = { path = "../path-only" }
         let path_only = deps.iter().find(|d| d.name == "path-only").unwrap();
         assert!(path_only.is_path_dep);
         assert_eq!(path_only.version_req, None);
+    }
+
+    #[test]
+    fn test_cargo_binary_targets_explicit_bins() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "hyperforge"
+version = "0.1.0"
+
+[[bin]]
+name = "hyperforge"
+path = "src/main.rs"
+
+[[bin]]
+name = "hyperforge-auth"
+path = "src/bin/auth.rs"
+
+[[bin]]
+name = "hyperforge-ssh"
+path = "src/bin/ssh.rs"
+"#,
+        )
+        .unwrap();
+
+        let targets = cargo_binary_targets(tmp.path());
+        assert_eq!(targets.len(), 3);
+        assert!(targets.iter().any(|t| t.name == "hyperforge"));
+        assert!(targets.iter().any(|t| t.name == "hyperforge-auth"));
+        assert!(targets.iter().any(|t| t.name == "hyperforge-ssh"));
+        for t in &targets {
+            assert_eq!(t.build_system, super::BuildSystemKind::Cargo);
+            assert_eq!(t.repo_path, tmp.path().to_path_buf());
+        }
+    }
+
+    #[test]
+    fn test_cargo_binary_targets_implicit() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "my-tool"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let targets = cargo_binary_targets(tmp.path());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "my-tool");
+    }
+
+    #[test]
+    fn test_cargo_binary_targets_lib_only() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "my-lib"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn hello() {}").unwrap();
+
+        let targets = cargo_binary_targets(tmp.path());
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_cargo_binary_targets_workspace() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/*"]
+"#,
+        )
+        .unwrap();
+
+        // Create two member crates
+        let crate_a = tmp.path().join("crates/app-a");
+        fs::create_dir_all(crate_a.join("src")).unwrap();
+        fs::write(
+            crate_a.join("Cargo.toml"),
+            "[package]\nname = \"app-a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(crate_a.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let crate_b = tmp.path().join("crates/lib-b");
+        fs::create_dir_all(crate_b.join("src")).unwrap();
+        fs::write(
+            crate_b.join("Cargo.toml"),
+            "[package]\nname = \"lib-b\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(crate_b.join("src/lib.rs"), "").unwrap();
+
+        let targets = cargo_binary_targets(tmp.path());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "app-a");
     }
 
     #[test]
