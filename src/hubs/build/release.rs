@@ -17,13 +17,13 @@ use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::RepoFilter;
 
-fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
+pub(crate) fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
         .map(Arc::new)
         .map_err(|e| format!("Failed to create auth provider: {}", e))
 }
 
-fn make_release_adapter(
+pub(crate) fn make_release_adapter(
     forge: &str,
     auth: Arc<YamlAuthProvider>,
     org: &str,

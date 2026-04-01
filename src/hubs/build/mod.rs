@@ -3,9 +3,11 @@
 //! These methods never write LocalForge or call forge APIs. They operate purely
 //! on the filesystem via workspace discovery.
 
+pub mod binstall;
 pub mod dirty;
 pub mod execution;
 pub mod gitignore;
+pub mod homebrew;
 pub mod large_files;
 pub mod loc;
 pub mod local_run;
@@ -375,6 +377,54 @@ impl BuildHub {
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         release::release(path, tag, targets, include, exclude, forge, title, body, draft, dry_run)
+    }
+
+    /// Inject cargo-binstall metadata into Cargo.toml files
+    #[plexus_macros::hub_method(
+        description = "Inject [package.metadata.binstall] into Cargo.toml files so cargo-binstall can discover pre-built binaries. Uses toml_edit to preserve formatting. Skips repos that already have binstall metadata.",
+        params(
+            path = "Path to workspace or repo directory",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            forge = "Which forge hosts releases: github (default), codeberg, gitlab",
+            dry_run = "Preview changes without writing files (optional, default: false)"
+        )
+    )]
+    pub async fn binstall_init(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        forge: Option<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        binstall::binstall_init(path, include, exclude, forge, dry_run)
+    }
+
+    /// Generate a Homebrew formula from release assets
+    #[plexus_macros::hub_method(
+        description = "Generate a Homebrew formula (.rb) from an existing release's assets. Downloads each platform archive, computes sha256, and maps target triples to Homebrew platform selectors (on_macos/on_linux, on_arm/on_intel). Write to a tap repo or emit the formula.",
+        params(
+            org = "Organization/owner name on the forge",
+            name = "Repository/package name",
+            tag = "Release tag to generate formula from (e.g. v4.1.0)",
+            forge = "Which forge hosts the release: github (default), codeberg",
+            tap_path = "Path to the homebrew-tap repo (optional, emits formula if not set)",
+            description = "Formula description (optional)",
+            dry_run = "Preview without downloading or writing files (optional, default: false)"
+        )
+    )]
+    pub async fn brew_formula(
+        &self,
+        org: String,
+        name: String,
+        tag: String,
+        forge: Option<String>,
+        tap_path: Option<String>,
+        description: Option<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        homebrew::brew_formula(org, name, tag, forge, tap_path, description, dry_run)
     }
 }
 
