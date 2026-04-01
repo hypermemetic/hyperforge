@@ -379,6 +379,38 @@ impl BuildHub {
         release::release(path, tag, targets, include, exclude, forge, title, body, draft, dry_run)
     }
 
+    /// Release all binary-producing packages in workspace in dependency order
+    #[plexus_macros::hub_method(
+        description = "Workspace-wide release: cross-compile, package, create releases, and upload assets for every binary-producing repo in dependency order. Repos are processed sequentially (dependencies first), with cross-compilation across targets running in parallel within each repo.",
+        params(
+            path = "Path to workspace directory",
+            tag = "Git tag for the release (e.g. v4.1.0)",
+            targets = "Comma-separated target triples (optional, defaults to native host)",
+            include = "Glob patterns — repo must match at least one (optional, repeatable)",
+            exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
+            forge = "Target forges, comma-separated (optional, defaults to all configured)",
+            title = "Release title (optional, defaults to tag)",
+            body = "Release description/notes (optional)",
+            draft = "Create as draft release (optional, default: false)",
+            dry_run = "Preview everything without side effects (optional, default: false)"
+        )
+    )]
+    pub async fn release_all(
+        &self,
+        path: String,
+        tag: String,
+        targets: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        forge: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+        draft: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        release::release_all(path, tag, targets, include, exclude, forge, title, body, draft, dry_run)
+    }
+
     /// Inject cargo-binstall metadata into Cargo.toml files
     #[plexus_macros::hub_method(
         description = "Inject [package.metadata.binstall] into Cargo.toml files so cargo-binstall can discover pre-built binaries. Uses toml_edit to preserve formatting. Skips repos that already have binstall metadata.",

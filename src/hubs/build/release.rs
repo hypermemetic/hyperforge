@@ -2,6 +2,7 @@
 
 use async_stream::stream;
 use futures::Stream;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use crate::auth::YamlAuthProvider;
 use crate::build_system::cross_compile::{compile_and_package, host_triple, TargetTriple};
 use crate::build_system::{self, BinaryTarget};
 use crate::commands::runner::discover_or_bail;
-use crate::commands::workspace::DiscoveredRepo;
+use crate::commands::workspace::{build_publish_dep_graph, DiscoveredRepo};
 use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::RepoFilter;
@@ -138,6 +139,348 @@ fn discover_single_repo(path: &std::path::Path) -> Result<DiscoveredRepo, String
     })
 }
 
+/// Accumulated counters from releasing a single repo.
+struct SingleRepoReleaseCounts {
+    /// Whether this repo had binary targets (counted as a release repo)
+    has_binaries: bool,
+    targets: usize,
+    forges: HashSet<String>,
+    assets_uploaded: usize,
+    failed: usize,
+}
+
+/// Release a single repo: detect binaries, compile for all targets, create git tag,
+/// create forge releases, upload assets. Returns events and summary counters.
+///
+/// Shared by both `release` (single/workspace) and `release_all` (workspace-only).
+async fn release_single_repo(
+    repo: &DiscoveredRepo,
+    tag: &str,
+    target_triples: &[TargetTriple],
+    forge_override: &Option<String>,
+    release_title: &str,
+    release_body: &str,
+    is_draft: bool,
+    is_dry_run: bool,
+) -> (Vec<HyperforgeEvent>, SingleRepoReleaseCounts) {
+    let mut events = Vec::new();
+    let mut counts = SingleRepoReleaseCounts {
+        has_binaries: false,
+        targets: 0,
+        forges: HashSet::new(),
+        assets_uploaded: 0,
+        failed: 0,
+    };
+
+    let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+
+    let (bin_targets, version) = match repo_binary_info(repo) {
+        Some(info) => info,
+        None => {
+            events.push(HyperforgeEvent::Info {
+                message: format!("Skipping {} (no binary targets or no version)", repo.dir_name),
+            });
+            return (events, counts);
+        }
+    };
+
+    counts.has_binaries = true;
+    let binary_names: Vec<String> = bin_targets.iter().map(|b| b.name.clone()).collect();
+    let bs_kind = &bin_targets[0].build_system;
+    let repo_name = repo.dir_name.clone();
+
+    events.push(HyperforgeEvent::Info {
+        message: format!(
+            "{}  {} v{} -- {} binary target(s): {}",
+            dry_prefix,
+            repo_name,
+            version,
+            binary_names.len(),
+            binary_names.join(", "),
+        ),
+    });
+
+    // Output dir for archives
+    let output_dir = repo.path.join("target").join("dist");
+
+    // Compile and package for each target triple
+    let mut archives: Vec<PathBuf> = Vec::new();
+
+    for triple in target_triples {
+        events.push(HyperforgeEvent::ReleaseBuildStep {
+            repo_name: repo_name.clone(),
+            target: triple.triple.clone(),
+            status: "compiling".to_string(),
+            detail: Some(format!("{} binary(ies)", binary_names.len())),
+        });
+
+        if is_dry_run {
+            let stem = format!(
+                "{}-{}-v{}{}",
+                repo_name,
+                triple.triple,
+                version,
+                triple.archive_format().extension()
+            );
+            events.push(HyperforgeEvent::ReleaseBuildStep {
+                repo_name: repo_name.clone(),
+                target: triple.triple.clone(),
+                status: "packaging".to_string(),
+                detail: Some(format!("would create {}", stem)),
+            });
+            counts.targets += 1;
+            continue;
+        }
+
+        let results = compile_and_package(
+            &repo.path,
+            bs_kind,
+            &[triple.clone()],
+            &binary_names,
+            &version,
+            &output_dir,
+        )
+        .await;
+
+        for result in results {
+            if result.success {
+                if let Some(ref archive_path) = result.archive_path {
+                    events.push(HyperforgeEvent::ReleaseBuildStep {
+                        repo_name: repo_name.clone(),
+                        target: triple.triple.clone(),
+                        status: "packaging".to_string(),
+                        detail: Some(format!(
+                            "created {}",
+                            archive_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                    });
+                    archives.push(archive_path.clone());
+                    counts.targets += 1;
+                }
+            } else {
+                let err = result.error.unwrap_or_else(|| "unknown error".to_string());
+                events.push(HyperforgeEvent::Error {
+                    message: format!(
+                        "{}: compile/package failed for {}: {}",
+                        repo_name, triple.triple, err
+                    ),
+                });
+                counts.failed += 1;
+            }
+        }
+    }
+
+    // Create git tag if needed
+    if !is_dry_run && !Git::tag_exists(&repo.path, tag) {
+        events.push(HyperforgeEvent::Info {
+            message: format!("  Creating git tag {} in {}", tag, repo_name),
+        });
+        let tag_output = tokio::process::Command::new("git")
+            .args(["tag", "-a", tag, "-m", &format!("Release {}", tag)])
+            .current_dir(&repo.path)
+            .output()
+            .await;
+        match tag_output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                events.push(HyperforgeEvent::Error {
+                    message: format!("  Failed to create tag {}: {}", tag, stderr),
+                });
+            }
+            Err(e) => {
+                events.push(HyperforgeEvent::Error {
+                    message: format!("  Failed to run git tag: {}", e),
+                });
+            }
+        }
+    } else if is_dry_run {
+        if Git::tag_exists(&repo.path, tag) {
+            events.push(HyperforgeEvent::Info {
+                message: format!("{}  Tag {} already exists in {}", dry_prefix, tag, repo_name),
+            });
+        } else {
+            events.push(HyperforgeEvent::Info {
+                message: format!("{}  Would create git tag {} in {}", dry_prefix, tag, repo_name),
+            });
+        }
+    }
+
+    // Upload to forges
+    let target_forges = resolve_forges(repo, forge_override);
+    if target_forges.is_empty() {
+        events.push(HyperforgeEvent::Info {
+            message: format!("  {} has no configured forges -- skipping release upload", repo_name),
+        });
+        return (events, counts);
+    }
+
+    let org = match resolve_org(repo) {
+        Some(o) => o,
+        None => {
+            events.push(HyperforgeEvent::Info {
+                message: format!("  {} has no org configured -- skipping release upload", repo_name),
+            });
+            return (events, counts);
+        }
+    };
+
+    if is_dry_run {
+        for forge_name in &target_forges {
+            events.push(HyperforgeEvent::Info {
+                message: format!(
+                    "{}  Would create release {} on {}/{} ({}), upload {} asset(s)",
+                    dry_prefix,
+                    tag,
+                    org,
+                    repo_name,
+                    forge_name,
+                    target_triples.len(),
+                ),
+            });
+            counts.forges.insert(forge_name.clone());
+        }
+        return (events, counts);
+    }
+
+    // Real upload path
+    let auth = match make_auth() {
+        Ok(a) => a,
+        Err(e) => {
+            events.push(HyperforgeEvent::Error { message: e });
+            counts.failed += 1;
+            return (events, counts);
+        }
+    };
+
+    for forge_name in &target_forges {
+        let adapter = match make_release_adapter(forge_name, auth.clone(), &org) {
+            Ok(a) => a,
+            Err(e) => {
+                events.push(HyperforgeEvent::ReleaseCreate {
+                    repo_name: repo_name.clone(),
+                    forge: forge_name.clone(),
+                    tag: tag.to_string(),
+                    success: false,
+                    error: Some(e),
+                });
+                counts.failed += 1;
+                continue;
+            }
+        };
+
+        // Create release
+        match adapter
+            .create_release(
+                &org,
+                &repo_name,
+                tag,
+                release_title,
+                release_body,
+                is_draft,
+                false,
+            )
+            .await
+        {
+            Ok(release_info) => {
+                events.push(HyperforgeEvent::ReleaseCreate {
+                    repo_name: repo_name.clone(),
+                    forge: forge_name.clone(),
+                    tag: tag.to_string(),
+                    success: true,
+                    error: None,
+                });
+                counts.forges.insert(forge_name.clone());
+
+                // Upload each archive
+                for archive_path in &archives {
+                    let filename = archive_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    events.push(HyperforgeEvent::ReleaseBuildStep {
+                        repo_name: repo_name.clone(),
+                        target: "all".to_string(),
+                        status: "uploading".to_string(),
+                        detail: Some(format!("{} to {}", filename, forge_name)),
+                    });
+
+                    let data = match tokio::fs::read(archive_path).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            events.push(HyperforgeEvent::ReleaseUpload {
+                                repo_name: repo_name.clone(),
+                                forge: forge_name.clone(),
+                                tag: tag.to_string(),
+                                asset_name: filename.clone(),
+                                size_bytes: 0,
+                                success: false,
+                                error: Some(format!("Failed to read archive: {}", e)),
+                            });
+                            counts.failed += 1;
+                            continue;
+                        }
+                    };
+
+                    let size_bytes = data.len() as u64;
+                    let content_type = guess_content_type(&filename);
+
+                    match adapter
+                        .upload_asset(
+                            &org,
+                            &repo_name,
+                            release_info.id,
+                            &filename,
+                            content_type,
+                            data,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            events.push(HyperforgeEvent::ReleaseUpload {
+                                repo_name: repo_name.clone(),
+                                forge: forge_name.clone(),
+                                tag: tag.to_string(),
+                                asset_name: filename,
+                                size_bytes,
+                                success: true,
+                                error: None,
+                            });
+                            counts.assets_uploaded += 1;
+                        }
+                        Err(e) => {
+                            events.push(HyperforgeEvent::ReleaseUpload {
+                                repo_name: repo_name.clone(),
+                                forge: forge_name.clone(),
+                                tag: tag.to_string(),
+                                asset_name: filename,
+                                size_bytes,
+                                success: false,
+                                error: Some(e.to_string()),
+                            });
+                            counts.failed += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                events.push(HyperforgeEvent::ReleaseCreate {
+                    repo_name: repo_name.clone(),
+                    forge: forge_name.clone(),
+                    tag: tag.to_string(),
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                counts.failed += 1;
+            }
+        }
+    }
+
+    (events, counts)
+}
+
 pub fn release(
     path: String,
     tag: String,
@@ -195,7 +538,7 @@ pub fn release(
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Release {} — {} repo(s), {} target(s)",
+                "{}Release {} -- {} repo(s), {} target(s)",
                 dry_prefix,
                 tag,
                 repos.len(),
@@ -205,314 +548,168 @@ pub fn release(
 
         let mut summary_repos = 0usize;
         let mut summary_targets = 0usize;
-        let mut summary_forges_set = std::collections::HashSet::new();
+        let mut summary_forges_set = HashSet::new();
         let mut summary_assets = 0usize;
         let mut summary_failed = 0usize;
 
         for repo in &repos {
-            let (bin_targets, version) = match repo_binary_info(repo) {
-                Some(info) => info,
-                None => {
-                    yield HyperforgeEvent::Info {
-                        message: format!("Skipping {} (no binary targets or no version)", repo.dir_name),
-                    };
-                    continue;
+            let (repo_events, repo_counts) = release_single_repo(
+                repo,
+                &tag,
+                &target_triples,
+                &forge,
+                &release_title,
+                &release_body,
+                is_draft,
+                is_dry_run,
+            ).await;
+
+            for event in repo_events {
+                yield event;
+            }
+
+            if repo_counts.has_binaries {
+                summary_repos += 1;
+            }
+            summary_targets += repo_counts.targets;
+            summary_forges_set.extend(repo_counts.forges);
+            summary_assets += repo_counts.assets_uploaded;
+            summary_failed += repo_counts.failed;
+        }
+
+        yield HyperforgeEvent::ReleaseSummary {
+            repos: summary_repos,
+            targets: summary_targets,
+            forges: summary_forges_set.len(),
+            assets_uploaded: summary_assets,
+            failed: summary_failed,
+        };
+    }
+}
+
+/// Workspace-wide release: release all binary-producing packages in dependency order.
+///
+/// Unlike `release`, this always treats the path as a workspace (never single-repo mode).
+/// Repos are processed sequentially in dependency order (from `topo_order`), with
+/// cross-compilation across targets running in parallel within each repo.
+pub fn release_all(
+    path: String,
+    tag: String,
+    targets: Option<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    forge: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    draft: Option<bool>,
+    dry_run: Option<bool>,
+) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+    let filter = RepoFilter::new(include, exclude);
+    let is_dry_run = dry_run.unwrap_or(false);
+    let is_draft = draft.unwrap_or(false);
+    let release_title = title.unwrap_or_else(|| tag.clone());
+    let release_body = body.unwrap_or_default();
+    let target_triples = parse_targets(&targets);
+
+    stream! {
+        let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
+        let workspace_path = PathBuf::from(&path);
+
+        // Always workspace mode
+        let ctx = match discover_or_bail(&workspace_path) {
+            Ok(ctx) => ctx,
+            Err(event) => {
+                yield event;
+                return;
+            }
+        };
+
+        let all_repos = ctx.repos;
+
+        // Build dependency graph for ordering
+        let dep_graph = build_publish_dep_graph(&all_repos);
+
+        // Compute topological order (dependencies first)
+        let ordered_indices = match dep_graph.topo_order() {
+            Ok(order) => order,
+            Err(e) => {
+                yield HyperforgeEvent::Error {
+                    message: format!("Dependency cycle detected: {}", e),
+                };
+                // Fall back to original order
+                (0..all_repos.len()).collect()
+            }
+        };
+
+        // Build ordered repo list, applying filter
+        let repos: Vec<&DiscoveredRepo> = ordered_indices
+            .iter()
+            .filter_map(|&idx| {
+                let repo = &all_repos[idx];
+                if filter.matches(&repo.dir_name) {
+                    Some(repo)
+                } else {
+                    None
                 }
+            })
+            .collect();
+
+        if repos.is_empty() {
+            yield HyperforgeEvent::Info {
+                message: "No repos matched filter.".to_string(),
             };
+            return;
+        }
 
-            summary_repos += 1;
-            let binary_names: Vec<String> = bin_targets.iter().map(|b| b.name.clone()).collect();
-            let bs_kind = &bin_targets[0].build_system;
-            let repo_name = repo.dir_name.clone();
+        yield HyperforgeEvent::Info {
+            message: format!(
+                "{}Release all {} -- {} repo(s) in dependency order, {} target(s)",
+                dry_prefix,
+                tag,
+                repos.len(),
+                target_triples.len(),
+            ),
+        };
 
+        let mut summary_repos = 0usize;
+        let mut summary_targets = 0usize;
+        let mut summary_forges_set = HashSet::new();
+        let mut summary_assets = 0usize;
+        let mut summary_failed = 0usize;
+
+        for (i, repo) in repos.iter().enumerate() {
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "{}  {} v{} — {} binary target(s): {}",
+                    "{}[{}/{}] Processing {}...",
                     dry_prefix,
-                    repo_name,
-                    version,
-                    binary_names.len(),
-                    binary_names.join(", "),
+                    i + 1,
+                    repos.len(),
+                    repo.dir_name,
                 ),
             };
 
-            // Output dir for archives
-            let output_dir = repo.path.join("target").join("dist");
+            let (repo_events, repo_counts) = release_single_repo(
+                repo,
+                &tag,
+                &target_triples,
+                &forge,
+                &release_title,
+                &release_body,
+                is_draft,
+                is_dry_run,
+            ).await;
 
-            // Compile and package for each target triple
-            let mut archives: Vec<PathBuf> = Vec::new();
-
-            for triple in &target_triples {
-                yield HyperforgeEvent::ReleaseBuildStep {
-                    repo_name: repo_name.clone(),
-                    target: triple.triple.clone(),
-                    status: "compiling".to_string(),
-                    detail: Some(format!("{} binary(ies)", binary_names.len())),
-                };
-
-                if is_dry_run {
-                    let stem = format!(
-                        "{}-{}-v{}{}",
-                        repo_name,
-                        triple.triple,
-                        version,
-                        triple.archive_format().extension()
-                    );
-                    yield HyperforgeEvent::ReleaseBuildStep {
-                        repo_name: repo_name.clone(),
-                        target: triple.triple.clone(),
-                        status: "packaging".to_string(),
-                        detail: Some(format!("would create {}", stem)),
-                    };
-                    summary_targets += 1;
-                    continue;
-                }
-
-                let results = compile_and_package(
-                    &repo.path,
-                    bs_kind,
-                    &[triple.clone()],
-                    &binary_names,
-                    &version,
-                    &output_dir,
-                )
-                .await;
-
-                for result in results {
-                    if result.success {
-                        if let Some(ref archive_path) = result.archive_path {
-                            yield HyperforgeEvent::ReleaseBuildStep {
-                                repo_name: repo_name.clone(),
-                                target: triple.triple.clone(),
-                                status: "packaging".to_string(),
-                                detail: Some(format!(
-                                    "created {}",
-                                    archive_path.file_name().unwrap_or_default().to_string_lossy()
-                                )),
-                            };
-                            archives.push(archive_path.clone());
-                            summary_targets += 1;
-                        }
-                    } else {
-                        let err = result.error.unwrap_or_else(|| "unknown error".to_string());
-                        yield HyperforgeEvent::Error {
-                            message: format!(
-                                "{}: compile/package failed for {}: {}",
-                                repo_name, triple.triple, err
-                            ),
-                        };
-                        summary_failed += 1;
-                    }
-                }
+            for event in repo_events {
+                yield event;
             }
 
-            // Create git tag if needed
-            if !is_dry_run && !Git::tag_exists(&repo.path, &tag) {
-                yield HyperforgeEvent::Info {
-                    message: format!("  Creating git tag {} in {}", tag, repo_name),
-                };
-                let tag_output = tokio::process::Command::new("git")
-                    .args(["tag", "-a", &tag, "-m", &format!("Release {}", tag)])
-                    .current_dir(&repo.path)
-                    .output()
-                    .await;
-                match tag_output {
-                    Ok(output) if output.status.success() => {}
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        yield HyperforgeEvent::Error {
-                            message: format!("  Failed to create tag {}: {}", tag, stderr),
-                        };
-                    }
-                    Err(e) => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("  Failed to run git tag: {}", e),
-                        };
-                    }
-                }
-            } else if is_dry_run {
-                if Git::tag_exists(&repo.path, &tag) {
-                    yield HyperforgeEvent::Info {
-                        message: format!("{}  Tag {} already exists in {}", dry_prefix, tag, repo_name),
-                    };
-                } else {
-                    yield HyperforgeEvent::Info {
-                        message: format!("{}  Would create git tag {} in {}", dry_prefix, tag, repo_name),
-                    };
-                }
+            if repo_counts.has_binaries {
+                summary_repos += 1;
             }
-
-            // Upload to forges
-            let target_forges = resolve_forges(repo, &forge);
-            if target_forges.is_empty() {
-                yield HyperforgeEvent::Info {
-                    message: format!("  {} has no configured forges — skipping release upload", repo_name),
-                };
-                continue;
-            }
-
-            let org = match resolve_org(repo) {
-                Some(o) => o,
-                None => {
-                    yield HyperforgeEvent::Info {
-                        message: format!("  {} has no org configured — skipping release upload", repo_name),
-                    };
-                    continue;
-                }
-            };
-
-            if is_dry_run {
-                for forge_name in &target_forges {
-                    yield HyperforgeEvent::Info {
-                        message: format!(
-                            "{}  Would create release {} on {}/{} ({}), upload {} asset(s)",
-                            dry_prefix,
-                            tag,
-                            org,
-                            repo_name,
-                            forge_name,
-                            target_triples.len(),
-                        ),
-                    };
-                    summary_forges_set.insert(forge_name.clone());
-                }
-                continue;
-            }
-
-            // Real upload path
-            let auth = match make_auth() {
-                Ok(a) => a,
-                Err(e) => {
-                    yield HyperforgeEvent::Error { message: e };
-                    summary_failed += 1;
-                    continue;
-                }
-            };
-
-            for forge_name in &target_forges {
-                let adapter = match make_release_adapter(forge_name, auth.clone(), &org) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        yield HyperforgeEvent::ReleaseCreate {
-                            repo_name: repo_name.clone(),
-                            forge: forge_name.clone(),
-                            tag: tag.clone(),
-                            success: false,
-                            error: Some(e),
-                        };
-                        summary_failed += 1;
-                        continue;
-                    }
-                };
-
-                // Create release
-                match adapter
-                    .create_release(
-                        &org,
-                        &repo_name,
-                        &tag,
-                        &release_title,
-                        &release_body,
-                        is_draft,
-                        false,
-                    )
-                    .await
-                {
-                    Ok(release_info) => {
-                        yield HyperforgeEvent::ReleaseCreate {
-                            repo_name: repo_name.clone(),
-                            forge: forge_name.clone(),
-                            tag: tag.clone(),
-                            success: true,
-                            error: None,
-                        };
-                        summary_forges_set.insert(forge_name.clone());
-
-                        // Upload each archive
-                        for archive_path in &archives {
-                            let filename = archive_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-
-                            yield HyperforgeEvent::ReleaseBuildStep {
-                                repo_name: repo_name.clone(),
-                                target: "all".to_string(),
-                                status: "uploading".to_string(),
-                                detail: Some(format!("{} to {}", filename, forge_name)),
-                            };
-
-                            let data = match tokio::fs::read(archive_path).await {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    yield HyperforgeEvent::ReleaseUpload {
-                                        repo_name: repo_name.clone(),
-                                        forge: forge_name.clone(),
-                                        tag: tag.clone(),
-                                        asset_name: filename.clone(),
-                                        size_bytes: 0,
-                                        success: false,
-                                        error: Some(format!("Failed to read archive: {}", e)),
-                                    };
-                                    summary_failed += 1;
-                                    continue;
-                                }
-                            };
-
-                            let size_bytes = data.len() as u64;
-                            let content_type = guess_content_type(&filename);
-
-                            match adapter
-                                .upload_asset(
-                                    &org,
-                                    &repo_name,
-                                    release_info.id,
-                                    &filename,
-                                    content_type,
-                                    data,
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    yield HyperforgeEvent::ReleaseUpload {
-                                        repo_name: repo_name.clone(),
-                                        forge: forge_name.clone(),
-                                        tag: tag.clone(),
-                                        asset_name: filename,
-                                        size_bytes,
-                                        success: true,
-                                        error: None,
-                                    };
-                                    summary_assets += 1;
-                                }
-                                Err(e) => {
-                                    yield HyperforgeEvent::ReleaseUpload {
-                                        repo_name: repo_name.clone(),
-                                        forge: forge_name.clone(),
-                                        tag: tag.clone(),
-                                        asset_name: filename,
-                                        size_bytes,
-                                        success: false,
-                                        error: Some(e.to_string()),
-                                    };
-                                    summary_failed += 1;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield HyperforgeEvent::ReleaseCreate {
-                            repo_name: repo_name.clone(),
-                            forge: forge_name.clone(),
-                            tag: tag.clone(),
-                            success: false,
-                            error: Some(e.to_string()),
-                        };
-                        summary_failed += 1;
-                    }
-                }
-            }
+            summary_targets += repo_counts.targets;
+            summary_forges_set.extend(repo_counts.forges);
+            summary_assets += repo_counts.assets_uploaded;
+            summary_failed += repo_counts.failed;
         }
 
         yield HyperforgeEvent::ReleaseSummary {
