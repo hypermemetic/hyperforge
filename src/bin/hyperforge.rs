@@ -46,6 +46,19 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Initialize tracing with filtering
+    // Logging targets (filterable via RUST_LOG):
+    //   hyperforge                       — top-level startup/shutdown
+    //   hyperforge::docker::connect      — Docker socket discovery
+    //   hyperforge::docker::build        — image builds (trace = stream output)
+    //   hyperforge::docker::push         — registry push (trace = layer progress)
+    //   hyperforge::hubs::workspace      — sync/diff pipeline phases
+    //   hyperforge::hubs::images         — container image operations
+    //   hyperforge::adapters::registry   — registry API calls
+    //
+    // Examples:
+    //   RUST_LOG="hyperforge=info"                              — normal ops
+    //   RUST_LOG="hyperforge::docker=debug,hyperforge=info"     — debug Docker only
+    //   RUST_LOG="hyperforge::docker::build=trace"              — stream build output
     let filter = if args.stdio {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             tracing_subscriber::EnvFilter::new("hyperforge=warn,jsonrpsee=warn")
@@ -55,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(debug_assertions)]
             let default_filter = "warn,hyperforge=trace";
             #[cfg(not(debug_assertions))]
-            let default_filter = "warn,hyperforge=debug";
+            let default_filter = "warn,hyperforge=info";
             tracing_subscriber::EnvFilter::new(default_filter)
         })
     };

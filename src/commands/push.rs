@@ -15,8 +15,8 @@ use thiserror::Error;
 use crate::config::HyperforgeConfig;
 use crate::git::{Git, GitError};
 
-/// Default large file threshold (100KB)
-const LARGE_FILE_THRESHOLD: u64 = 100 * 1024;
+/// Default large file threshold (500KB)
+const LARGE_FILE_THRESHOLD: u64 = 500 * 1024;
 
 /// Errors that can occur during push
 #[derive(Debug, Error)]
@@ -66,6 +66,9 @@ pub struct PushOptions {
 
     /// Only push to specific forges (empty = all)
     pub only_forges: Vec<String>,
+
+    /// Override branch to push (None = current branch)
+    pub branch: Option<String>,
 }
 
 impl PushOptions {
@@ -90,6 +93,11 @@ impl PushOptions {
 
     pub fn only(mut self, forges: Vec<String>) -> Self {
         self.only_forges = forges;
+        self
+    }
+
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
         self
     }
 }
@@ -200,11 +208,16 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
     // Load config
     let config = HyperforgeConfig::load(path)?;
 
-    // Get current branch
-    let branch = Git::current_branch(path)?;
-    if branch.is_empty() {
-        return Err(PushError::NoBranch);
-    }
+    // Get branch — use override if specified, otherwise current branch
+    let branch = if let Some(ref b) = options.branch {
+        b.clone()
+    } else {
+        let b = Git::current_branch(path)?;
+        if b.is_empty() {
+            return Err(PushError::NoBranch);
+        }
+        b
+    };
 
     // Check for large tracked files before pushing
     // Use per-repo threshold from config, falling back to default (100KB).

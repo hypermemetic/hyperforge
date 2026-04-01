@@ -2,8 +2,14 @@
 //!
 //! Handles Colima, Docker Desktop, and standard Linux sockets by reading
 //! Docker's config files directly — no subprocess calls.
+//!
+//! Logging targets:
+//!   - `hyperforge::docker::connect` — socket discovery
+//!   - `hyperforge::docker::build` — image builds
+//!   - `hyperforge::docker::push` — registry push
 
 use bollard::Docker;
+use tracing::{debug, info, warn, trace};
 
 /// Docker daemon availability state
 #[derive(Debug, Clone)]
@@ -19,6 +25,7 @@ fn discover_docker_host() -> Option<String> {
     // 1. DOCKER_HOST env takes priority
     if let Ok(host) = std::env::var("DOCKER_HOST") {
         if !host.is_empty() {
+            debug!(target: "hyperforge::docker::connect", host = %host, "Using DOCKER_HOST from environment");
             return Some(host);
         }
     }
@@ -35,7 +42,8 @@ fn discover_docker_host() -> Option<String> {
         .nth(1)?;
 
     if ctx_name == "default" {
-        return None; // use bollard default
+        debug!(target: "hyperforge::docker::connect", "Docker context is 'default', using bollard defaults");
+        return None;
     }
 
     // 3. Scan context metadata dirs for matching name
@@ -51,6 +59,7 @@ fn discover_docker_host() -> Option<String> {
                     .nth(1)
                     .and_then(|s| s.split('"').next())
                 {
+                    info!(target: "hyperforge::docker::connect", context = %ctx_name, host = %host, "Discovered Docker socket from context");
                     return Some(host.to_string());
                 }
             }
@@ -101,7 +110,9 @@ pub async fn build_image(
     use futures::StreamExt;
 
     // Create a tar archive of the build context
+    info!(target: "hyperforge::docker::build", tag = %image_tag, dockerfile = %dockerfile, context = %build_context.display(), "Starting Docker build");
     let tar_data = create_build_tar(build_context, dockerfile)?;
+    debug!(target: "hyperforge::docker::build", size_bytes = tar_data.len(), "Build context tar created");
 
     let options = BuildImageOptions {
         t: image_tag,
@@ -119,7 +130,11 @@ pub async fn build_image(
                 if let Some(ref id) = info.id {
                     last_id = id.clone();
                 }
+                if let Some(ref stream_line) = info.stream {
+                    trace!(target: "hyperforge::docker::build", "{}", stream_line.trim());
+                }
                 if let Some(error) = info.error {
+                    warn!(target: "hyperforge::docker::build", error = %error, "Build error");
                     return Err(format!("Build error: {}", error));
                 }
             }
@@ -154,6 +169,7 @@ pub async fn push_image(
     use bollard::image::PushImageOptions;
     use futures::StreamExt;
 
+    info!(target: "hyperforge::docker::push", image = %image, tag = %tag, "Pushing image to registry");
     let options = PushImageOptions { tag };
 
     let mut stream = docker.push_image(image, Some(options), Some(credentials));
@@ -161,7 +177,11 @@ pub async fn push_image(
     while let Some(result) = stream.next().await {
         match result {
             Ok(info) => {
+                if let Some(ref status) = info.status {
+                    trace!(target: "hyperforge::docker::push", status = %status, "Push progress");
+                }
                 if let Some(error) = info.error {
+                    warn!(target: "hyperforge::docker::push", error = %error, "Push error");
                     return Err(format!("Push error: {}", error));
                 }
             }

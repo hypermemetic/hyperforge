@@ -516,7 +516,7 @@ impl WorkspaceHub {
         set_upstream: Option<bool>,
         validate: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
-        let _ = branch; // push() uses current branch; param is informational
+        let push_branch = branch; // passed through to PushOptions
         let filter = RepoFilter::new(include, exclude);
         stream! {
             let workspace_path = PathBuf::from(&path);
@@ -566,6 +566,7 @@ impl WorkspaceHub {
                     let mut options = PushOptions::new();
                     if is_dry_run { options = options.dry_run(); }
                     if is_set_upstream { options = options.set_upstream(); }
+                    if let Some(ref b) = push_branch { options = options.with_branch(b.clone()); }
                     (r.dir_name.clone(), r.path.clone(), options)
                 })
                 .collect();
@@ -711,7 +712,8 @@ impl WorkspaceHub {
             no_init = "Skip initializing unconfigured repos (optional, default: true)",
             validate = "Run containerized validation before pushing (optional, default: false)",
             reflect = "Enable reflect mode: retire remote-only repos (optional, default: false)",
-            purge = "Delete repos previously staged for deletion. Implies --reflect (optional, default: false)"
+            purge = "Delete repos previously staged for deletion. Implies --reflect (optional, default: false)",
+            branch = "Branch to push (optional, default: current checked-out branch per repo)"
         )
     )]
     pub async fn sync(
@@ -727,6 +729,7 @@ impl WorkspaceHub {
         validate: Option<bool>,
         reflect: Option<bool>,
         purge: Option<bool>,
+        branch: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let sync_service = self.state.sync_service.clone();
@@ -1142,6 +1145,7 @@ impl WorkspaceHub {
                         let path = repo.path.clone();
                         let mut options = PushOptions::new();
                         if is_dry_run { options = options.dry_run(); }
+                        if let Some(ref b) = branch { options = options.with_branch(b.clone()); }
                         (dir_name, path, options)
                     })
                     .collect();
