@@ -16,9 +16,19 @@ use chrono::Utc;
 use std::collections::HashMap;
 
 use crate::adapters::{ForgePort, ForgeSyncState};
+use crate::auth::credentials::{
+    credentials_for_channels, credentials_for_forge, CredentialKind, CredentialSpec,
+    ResolvedCredential, ValidationMethod,
+};
+use crate::auth::AuthProvider;
+use crate::auth::YamlAuthProvider;
+use crate::auth_hub::storage::YamlStorage;
+use crate::auth_hub::types::SecretPath;
+use crate::commands::runner::discover_or_bail;
 use crate::config::{HyperforgeConfig, OrgConfig};
-use crate::hubs::utils::make_adapter;
+use crate::hubs::utils::{make_adapter, RepoFilter};
 use crate::hubs::{BuildHub, HyperforgeState, RepoHub, WorkspaceHub};
+use crate::types::config::DistChannel;
 use crate::types::repo::RepoRecord;
 use crate::types::Forge;
 
@@ -328,6 +338,14 @@ pub enum HyperforgeEvent {
         download_url: String,
         created_at: String,
     },
+    /// Auth credential check result
+    AuthCheckResult {
+        credential: String,
+        key_path: String,
+        status: String, // "valid", "missing", "invalid", "insufficient_scopes"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// Progress step during build release orchestration
     ReleaseBuildStep {
         repo_name: String,
@@ -344,6 +362,115 @@ pub enum HyperforgeEvent {
         assets_uploaded: usize,
         failed: usize,
     },
+}
+
+/// Validate a single credential token against its spec's validation method.
+/// Returns (status, detail).
+async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Option<String>) {
+    match &spec.validation {
+        ValidationMethod::ExistsOnly => ("valid".to_string(), None),
+        ValidationMethod::HttpGet {
+            url_pattern,
+            auth_scheme,
+        } => {
+            let client = reqwest::Client::new();
+            let res = client
+                .get(*url_pattern)
+                .header("Authorization", format!("{} {}", auth_scheme, token))
+                .header("User-Agent", "hyperforge")
+                .send()
+                .await;
+            match res {
+                Ok(resp) if resp.status().is_success() => ("valid".to_string(), None),
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    (
+                        "invalid".to_string(),
+                        Some(format!("HTTP {} from {}", code, url_pattern)),
+                    )
+                }
+                Err(e) => (
+                    "invalid".to_string(),
+                    Some(format!("Request failed: {}", e)),
+                ),
+            }
+        }
+        ValidationMethod::GitHubScopes { required } => {
+            let client = reqwest::Client::new();
+            let res = client
+                .get("https://api.github.com/user")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("User-Agent", "hyperforge")
+                .send()
+                .await;
+            match res {
+                Ok(resp) if resp.status().is_success() => {
+                    let scopes_header = resp
+                        .headers()
+                        .get("x-oauth-scopes")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let have: Vec<&str> = scopes_header
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let missing: Vec<&&str> = required
+                        .iter()
+                        .filter(|r| !have.iter().any(|h| *h == **r))
+                        .collect();
+                    if missing.is_empty() {
+                        (
+                            "valid".to_string(),
+                            Some(format!("scopes: {}", have.join(", "))),
+                        )
+                    } else {
+                        (
+                            "insufficient_scopes".to_string(),
+                            Some(format!(
+                                "missing: {}; have: {}",
+                                missing.iter().map(|s| **s).collect::<Vec<_>>().join(", "),
+                                have.join(", ")
+                            )),
+                        )
+                    }
+                }
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    (
+                        "invalid".to_string(),
+                        Some(format!("HTTP {} from GitHub /user", code)),
+                    )
+                }
+                Err(e) => (
+                    "invalid".to_string(),
+                    Some(format!("Request failed: {}", e)),
+                ),
+            }
+        }
+    }
+}
+
+/// Parse a comma-separated channel string into DistChannel values.
+fn parse_channels(channel: &str) -> Result<Vec<DistChannel>, String> {
+    let mut out = Vec::new();
+    for part in channel.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let dc = match part {
+            "forge-release" => DistChannel::ForgeRelease,
+            "crates-io" => DistChannel::CratesIo,
+            "hackage" => DistChannel::Hackage,
+            "brew" => DistChannel::Brew,
+            "ghcr" => DistChannel::Ghcr,
+            "binstall" => DistChannel::Binstall,
+            _ => return Err(format!("Unknown channel: {}", part)),
+        };
+        out.push(dc);
+    }
+    Ok(out)
 }
 
 /// Root hub for hyperforge operations
@@ -945,6 +1072,627 @@ impl HyperforgeHub {
 
             yield HyperforgeEvent::Info {
                 message: format!("{}Organization '{}' deleted.", dry_prefix, org),
+            };
+        }
+    }
+
+    /// Derive needed credentials from workspace dist configs and check which are present
+    #[plexus_macros::hub_method(
+        description = "Derive needed credentials from workspace dist configs and check which are present",
+        params(
+            path = "Workspace path (required)",
+            include = "Repo name filter (optional, repeatable)",
+            exclude = "Repo name filter (optional, repeatable)"
+        )
+    )]
+    pub async fn auth_requirements(
+        &self,
+        path: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let workspace_path = std::path::PathBuf::from(&path);
+            let ctx = match discover_or_bail(&workspace_path) {
+                Ok(ctx) => ctx,
+                Err(event) => {
+                    yield event;
+                    return;
+                }
+            };
+
+            yield HyperforgeEvent::Info {
+                message: format!("Scanning workspace at {}...", ctx.root.display()),
+            };
+
+            let filter = RepoFilter::new(include, exclude);
+
+            // Collect credentials needed across all matching repos
+            // Key: key_path -> (ResolvedCredential, Vec<repo_names_needing_it>)
+            let mut cred_map: std::collections::HashMap<String, (crate::auth::credentials::ResolvedCredential, Vec<String>)> =
+                std::collections::HashMap::new();
+
+            let mut matched_repos = 0usize;
+            let mut orgs_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut forges_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut channels_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+            for repo in &ctx.repos {
+                if !filter.matches(&repo.dir_name) {
+                    continue;
+                }
+
+                let config = match &repo.config {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                matched_repos += 1;
+
+                let org = match &config.org {
+                    Some(o) => o.clone(),
+                    None => continue,
+                };
+
+                orgs_seen.insert(org.clone());
+
+                // Collect forge credentials
+                for forge_str in &config.forges {
+                    forges_seen.insert(forge_str.clone());
+                    if let Some(forge_enum) = HyperforgeConfig::parse_forge(forge_str) {
+                        let forge_creds = credentials_for_forge(&forge_enum, &org);
+                        for cred in forge_creds {
+                            let entry = cred_map
+                                .entry(cred.key_path.clone())
+                                .or_insert_with(|| (cred.clone(), Vec::new()));
+                            if !entry.1.contains(&repo.dir_name) {
+                                entry.1.push(repo.dir_name.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Collect dist channel credentials
+                if let Some(ref dist) = config.dist {
+                    for channel in &dist.channels {
+                        channels_seen.insert(channel.to_string());
+                    }
+
+                    if !dist.channels.is_empty() {
+                        let channel_creds = credentials_for_channels(&dist.channels, &org);
+                        for cred in channel_creds {
+                            let entry = cred_map
+                                .entry(cred.key_path.clone())
+                                .or_insert_with(|| (cred.clone(), Vec::new()));
+                            if !entry.1.contains(&repo.dir_name) {
+                                entry.1.push(repo.dir_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if cred_map.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "No credentials needed for {} repo(s). No forges or dist channels configured.",
+                        matched_repos,
+                    ),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Credentials needed for {} repos across {} org(s), {} forge(s), {} channel(s):",
+                    matched_repos,
+                    orgs_seen.len(),
+                    forges_seen.len(),
+                    channels_seen.len(),
+                ),
+            };
+            yield HyperforgeEvent::Info { message: String::new() };
+
+            // Check each credential against the secrets store
+            let auth = match YamlAuthProvider::new() {
+                Ok(a) => a,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to create auth provider: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            // Sort credentials for deterministic output
+            let mut cred_entries: Vec<_> = cred_map.into_iter().collect();
+            cred_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let total = cred_entries.len();
+            let mut present_count = 0usize;
+
+            for (key_path, (cred, repo_names)) in &cred_entries {
+                let exists = match auth.get_secret(key_path).await {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => false,
+                };
+
+                if exists {
+                    present_count += 1;
+                }
+
+                let status_icon = if exists { "\u{2713}" } else { "\u{2717}" };
+                let status_label = if exists { "present" } else { "MISSING" };
+
+                // Build the "needed by" description
+                let needed_by = if repo_names.len() <= 3 {
+                    repo_names.join(", ")
+                } else {
+                    format!(
+                        "{} repos with {}",
+                        repo_names.len(),
+                        cred.spec.required_by.join("/"),
+                    )
+                };
+
+                yield HyperforgeEvent::Info {
+                    message: format!(
+                        "  {} {} \u{2014} {} (needed by: {})",
+                        status_icon, key_path, status_label, needed_by,
+                    ),
+                };
+            }
+
+            let missing_count = total - present_count;
+            yield HyperforgeEvent::Info { message: String::new() };
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{} of {} credentials configured.{}",
+                    present_count,
+                    total,
+                    if missing_count > 0 {
+                        let org_hint = orgs_seen.iter().next().map(|o| o.as_str()).unwrap_or("ORG");
+                        format!(" Run `auth setup --org {}` to set up missing ones.", org_hint)
+                    } else {
+                        " All credentials present.".to_string()
+                    },
+                ),
+            };
+        }
+    }
+
+    /// Guided credential setup — shows what tokens are needed, where to create them, and how to store them
+    #[plexus_macros::hub_method(
+        description = "Guided credential setup — shows what tokens are needed, where to create them, and how to store them",
+        params(
+            org = "Organization name (required)",
+            forge = "Set up credentials for a specific forge (optional, sets up all configured forges if omitted)",
+            channel = "Set up credentials for specific dist channels (optional, comma-separated)"
+        )
+    )]
+    pub async fn auth_setup(
+        &self,
+        org: String,
+        forge: Option<String>,
+        channel: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        let state = self.state.clone();
+
+        stream! {
+            const SECRETS_PORT: u16 = 44105;
+
+            // 1. Determine which forges to set up
+            let target_forges: Vec<Forge> = if let Some(ref forge_str) = forge {
+                // Single forge specified
+                match HyperforgeConfig::parse_forge(forge_str) {
+                    Some(f) => vec![f],
+                    None => {
+                        yield HyperforgeEvent::Error {
+                            message: format!(
+                                "Invalid forge: {}. Must be github, codeberg, or gitlab",
+                                forge_str
+                            ),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                // Discover forges from OrgConfig SSH keys
+                let org_config = OrgConfig::load(&config_dir, &org);
+                let mut forges: Vec<Forge> = org_config
+                    .ssh
+                    .keys()
+                    .filter_map(|k| HyperforgeConfig::parse_forge(k))
+                    .collect();
+
+                // If no SSH keys configured, also check LocalForge records for present_on
+                if forges.is_empty() {
+                    let local = state.get_local_forge(&org).await;
+                    if let Ok(records) = local.all_records() {
+                        let mut seen = std::collections::HashSet::new();
+                        for rec in &records {
+                            for f in &rec.present_on {
+                                if seen.insert(f.clone()) {
+                                    forges.push(f.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if forges.is_empty() {
+                    yield HyperforgeEvent::Error {
+                        message: format!(
+                            "No forges configured for org '{}'. Run `begin` first or specify --forge.",
+                            org
+                        ),
+                    };
+                    return;
+                }
+
+                forges
+            };
+
+            // 2. Parse channel parameter if provided
+            let target_channels: Vec<DistChannel> = if let Some(ref ch_str) = channel {
+                ch_str
+                    .split(',')
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .filter_map(|c| match c {
+                        "forge-release" => Some(DistChannel::ForgeRelease),
+                        "crates-io" => Some(DistChannel::CratesIo),
+                        "hackage" => Some(DistChannel::Hackage),
+                        "brew" => Some(DistChannel::Brew),
+                        "ghcr" => Some(DistChannel::Ghcr),
+                        "binstall" => Some(DistChannel::Binstall),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // 3. Gather credentials — forge tokens + channel tokens
+            let mut all_creds: Vec<ResolvedCredential> = Vec::new();
+
+            for forge_enum in &target_forges {
+                let forge_creds = credentials_for_forge(forge_enum, &org);
+                for cred in forge_creds {
+                    if !all_creds.iter().any(|c| c.key_path == cred.key_path) {
+                        all_creds.push(cred);
+                    }
+                }
+            }
+
+            if !target_channels.is_empty() {
+                let channel_creds = credentials_for_channels(&target_channels, &org);
+                for cred in channel_creds {
+                    if !all_creds.iter().any(|c| c.key_path == cred.key_path) {
+                        all_creds.push(cred);
+                    }
+                }
+            }
+
+            if all_creds.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No credentials needed for the specified configuration.".to_string(),
+                };
+                return;
+            }
+
+            // 4. Load secrets store to check existence
+            let storage = match YamlStorage::default_location() {
+                Ok(s) => s,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to open secrets store: {}", e),
+                    };
+                    return;
+                }
+            };
+            if let Err(e) = storage.load().await {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to load secrets store: {}", e),
+                };
+                return;
+            }
+
+            let forge_names: Vec<String> = target_forges
+                .iter()
+                .map(|f| match f {
+                    Forge::GitHub => "github".to_string(),
+                    Forge::Codeberg => "codeberg".to_string(),
+                    Forge::GitLab => "gitlab".to_string(),
+                })
+                .collect();
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "Setting up credentials for {} on {}...",
+                    org,
+                    forge_names.join(", "),
+                ),
+            };
+            yield HyperforgeEvent::Info { message: String::new() };
+
+            // 5. Check each credential and emit guidance
+            let mut configured_count = 0usize;
+            let mut missing_count = 0usize;
+
+            for cred in &all_creds {
+                let secret_path = SecretPath::new(&cred.key_path);
+                let is_present = storage.exists(&secret_path).unwrap_or(false);
+
+                if is_present {
+                    configured_count += 1;
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "\u{2713} {} \u{2014} valid",
+                            cred.spec.display_name,
+                        ),
+                    };
+                } else {
+                    missing_count += 1;
+
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "\u{2717} {} \u{2014} MISSING",
+                            cred.spec.display_name,
+                        ),
+                    };
+
+                    // What it's needed for
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "  Needed for: {}",
+                            cred.spec.required_by.join(", "),
+                        ),
+                    };
+
+                    // Special notes for credential kind
+                    match &cred.spec.kind {
+                        CredentialKind::ClassicPat { required_scopes } => {
+                            yield HyperforgeEvent::Info {
+                                message: "  Type: Classic Personal Access Token (NOT fine-grained)".to_string(),
+                            };
+                            yield HyperforgeEvent::Info {
+                                message: format!(
+                                    "  Required scopes: {}",
+                                    required_scopes.join(", "),
+                                ),
+                            };
+                        }
+                        CredentialKind::BearerToken => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  Type: {}", cred.spec.instructions),
+                            };
+                        }
+                        CredentialKind::ApiKey => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  Type: {}", cred.spec.instructions),
+                            };
+                        }
+                        CredentialKind::UsernamePassword => {
+                            yield HyperforgeEvent::Info {
+                                message: format!("  Type: {}", cred.spec.instructions),
+                            };
+                        }
+                    }
+
+                    // Setup URL
+                    yield HyperforgeEvent::Info {
+                        message: format!("  Create at: {}", cred.spec.setup_url),
+                    };
+
+                    // Synapse command to store it
+                    yield HyperforgeEvent::Info {
+                        message: "  Then run:".to_string(),
+                    };
+                    yield HyperforgeEvent::Info {
+                        message: format!(
+                            "    synapse -P {} secrets auth set_secret --secret_key \"{}\" --value \"$(pbpaste)\"",
+                            SECRETS_PORT,
+                            cred.key_path,
+                        ),
+                    };
+                    yield HyperforgeEvent::Info { message: String::new() };
+                }
+            }
+
+            // Summary
+            yield HyperforgeEvent::Info { message: String::new() };
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{} configured, {} need setup",
+                    configured_count, missing_count,
+                ),
+            };
+        }
+    }
+
+    /// Validate all configured tokens — check existence, validity, and scopes
+    #[plexus_macros::hub_method(
+        description = "Validate all configured tokens — check existence, validity, and scopes",
+        params(
+            org = "Check credentials for a specific org (optional, checks all if omitted)",
+            forge = "Check a specific forge only (optional)",
+            channel = "Check credentials for specific dist channels (optional, comma-separated)"
+        )
+    )]
+    pub async fn auth_check(
+        &self,
+        org: Option<String>,
+        forge: Option<String>,
+        channel: Option<String>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            // Initialize storage and load secrets from disk
+            let storage = match YamlStorage::default_location() {
+                Ok(s) => s,
+                Err(e) => {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Failed to initialize secrets storage: {}", e),
+                    };
+                    return;
+                }
+            };
+            if let Err(e) = storage.load().await {
+                yield HyperforgeEvent::Error {
+                    message: format!("Failed to load secrets: {}", e),
+                };
+                return;
+            }
+
+            // Enumerate orgs
+            let orgs: Vec<String> = if let Some(ref o) = org {
+                vec![o.clone()]
+            } else {
+                let orgs_dir = config_dir.join("orgs");
+                let mut found = Vec::new();
+                if orgs_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&orgs_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().map_or(false, |e| e == "toml") {
+                                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                    found.push(stem.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                found.sort();
+                found
+            };
+
+            if orgs.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No organizations configured. Run 'begin' first.".to_string(),
+                };
+                return;
+            }
+
+            // Parse optional forge filter
+            let forge_filter: Option<Forge> = if let Some(ref f) = forge {
+                match HyperforgeConfig::parse_forge(f) {
+                    Some(parsed) => Some(parsed),
+                    None => {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", f),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Parse optional channel filter
+            let channel_filter: Option<Vec<DistChannel>> = if let Some(ref c) = channel {
+                match parse_channels(c) {
+                    Ok(channels) => Some(channels),
+                    Err(e) => {
+                        yield HyperforgeEvent::Error { message: e };
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Collect all resolved credentials, dedup by key_path
+            let mut all_creds: Vec<ResolvedCredential> = Vec::new();
+            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for org_name in &orgs {
+                let org_config = OrgConfig::load(&config_dir, org_name);
+
+                // Determine which forges to check for this org
+                let forges_to_check: Vec<Forge> = if let Some(ref ff) = forge_filter {
+                    vec![ff.clone()]
+                } else {
+                    org_config
+                        .ssh
+                        .keys()
+                        .filter_map(|k| HyperforgeConfig::parse_forge(k))
+                        .collect()
+                };
+
+                // Get forge credentials
+                for f in &forges_to_check {
+                    for cred in credentials_for_forge(f, org_name) {
+                        if seen_keys.insert(cred.key_path.clone()) {
+                            all_creds.push(cred);
+                        }
+                    }
+                }
+
+                // Get channel credentials
+                if let Some(ref channels) = channel_filter {
+                    for cred in credentials_for_channels(channels, org_name) {
+                        if seen_keys.insert(cred.key_path.clone()) {
+                            all_creds.push(cred);
+                        }
+                    }
+                }
+            }
+
+            if all_creds.is_empty() {
+                yield HyperforgeEvent::Info {
+                    message: "No credentials to check. Configure forges with SSH keys or specify channels.".to_string(),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!("Checking {} credential(s)...", all_creds.len()),
+            };
+
+            let mut valid = 0usize;
+            let mut missing = 0usize;
+            let mut invalid = 0usize;
+            let total = all_creds.len();
+
+            for cred in &all_creds {
+                let secret_path = SecretPath::new(&cred.key_path);
+                let token = match storage.get(&secret_path) {
+                    Ok(secret) if !secret.value.is_empty() => secret.value,
+                    _ => {
+                        missing += 1;
+                        yield HyperforgeEvent::AuthCheckResult {
+                            credential: cred.spec.display_name.to_string(),
+                            key_path: cred.key_path.clone(),
+                            status: "missing".to_string(),
+                            detail: Some(format!("Set up at: {}", cred.spec.setup_url)),
+                        };
+                        continue;
+                    }
+                };
+
+                let (status, detail) = validate_credential(cred.spec, &token).await;
+
+                match status.as_str() {
+                    "valid" => valid += 1,
+                    _ => invalid += 1,
+                }
+
+                yield HyperforgeEvent::AuthCheckResult {
+                    credential: cred.spec.display_name.to_string(),
+                    key_path: cred.key_path.clone(),
+                    status,
+                    detail,
+                };
+            }
+
+            yield HyperforgeEvent::Info {
+                message: format!(
+                    "{} valid, {} missing, {} invalid out of {} credentials checked",
+                    valid, missing, invalid, total,
+                ),
             };
         }
     }

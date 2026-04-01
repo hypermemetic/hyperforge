@@ -2,6 +2,7 @@
 //!
 //! Provides secure access to forge tokens via macOS Keychain or YAML storage.
 
+pub mod credentials;
 pub mod keychain;
 pub mod yaml_provider;
 
