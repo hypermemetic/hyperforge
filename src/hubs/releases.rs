@@ -19,6 +19,7 @@ use crate::adapters::releases::ReleasePort;
 use crate::auth::YamlAuthProvider;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
+use crate::types::Forge;
 
 /// Sub-hub for release operations
 #[derive(Clone)]
@@ -95,14 +96,14 @@ impl ReleasesHub {
         params(
             org = "Organization name",
             name = "Repository name",
-            forge = "Forge to query (optional, defaults to all configured forges)"
+            forge = "Forge to query: github, codeberg, or gitlab (optional, defaults to all configured forges)"
         )
     )]
     pub async fn list(
         &self,
         org: String,
         name: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
 
@@ -171,7 +172,7 @@ impl ReleasesHub {
             body = "Release description/notes (optional)",
             draft = "Create as draft release (optional, default: false)",
             prerelease = "Mark as pre-release (optional, default: false)",
-            forge = "Target forge (optional, defaults to all configured forges)"
+            forge = "Target forge: github, codeberg, or gitlab (optional, defaults to all configured forges)"
         )
     )]
     pub async fn create(
@@ -183,7 +184,7 @@ impl ReleasesHub {
         body: Option<String>,
         draft: Option<bool>,
         prerelease: Option<bool>,
-        forge: Option<String>,
+        forge: Option<Forge>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         let release_title = title.unwrap_or_else(|| tag.clone());
@@ -252,7 +253,7 @@ impl ReleasesHub {
             name = "Repository name",
             tag = "Release tag (e.g. v1.0.0)",
             file = "Path to file to upload",
-            forge = "Target forge (optional, defaults to all configured forges)"
+            forge = "Target forge: github, codeberg, or gitlab (optional, defaults to all configured forges)"
         )
     )]
     pub async fn upload(
@@ -261,7 +262,7 @@ impl ReleasesHub {
         name: String,
         tag: String,
         file: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
 
@@ -388,7 +389,7 @@ impl ReleasesHub {
             org = "Organization name",
             name = "Repository name",
             tag = "Release tag to delete (e.g. v1.0.0)",
-            forge = "Target forge (optional, defaults to all configured forges)",
+            forge = "Target forge: github, codeberg, or gitlab (optional, defaults to all configured forges)",
             confirm = "Actually delete (default: false — dry-run unless confirmed)"
         )
     )]
@@ -397,7 +398,7 @@ impl ReleasesHub {
         org: String,
         name: String,
         tag: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
         confirm: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
@@ -495,7 +496,7 @@ impl ReleasesHub {
             org = "Organization name",
             name = "Repository name",
             tag = "Release tag (e.g. v1.0.0)",
-            forge = "Forge to query (optional, defaults to all configured forges)"
+            forge = "Forge to query: github, codeberg, or gitlab (optional, defaults to all configured forges)"
         )
     )]
     pub async fn assets(
@@ -503,7 +504,7 @@ impl ReleasesHub {
         org: String,
         name: String,
         tag: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
 
@@ -576,10 +577,10 @@ async fn resolve_target_forges(
     state: &HyperforgeState,
     org: &str,
     name: &str,
-    forge: Option<String>,
+    forge: Option<Forge>,
 ) -> Vec<String> {
     if let Some(f) = forge {
-        vec![f]
+        vec![f.as_str().to_string()]
     } else {
         let local = state.get_local_forge(org).await;
         match local.get_repo(org, name).await {

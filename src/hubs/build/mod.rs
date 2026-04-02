@@ -23,6 +23,8 @@ use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 
 use crate::hub::HyperforgeEvent;
+use crate::types::config::DistChannel;
+use crate::types::Forge;
 
 /// Sub-hub for development tools: manifest generation, publishing, cross-repo execution.
 #[derive(Clone)]
@@ -357,7 +359,7 @@ impl BuildHub {
             targets = "Comma-separated target triples (optional, defaults to native host)",
             include = "Glob patterns — repo must match at least one (optional, repeatable)",
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
-            forge = "Target forges, comma-separated (optional, defaults to all configured)",
+            forge = "Target forge: github, codeberg, or gitlab (optional, defaults to all configured)",
             title = "Release title (optional, defaults to tag)",
             body = "Release description/notes (optional)",
             draft = "Create as draft release (optional, default: false)",
@@ -372,7 +374,7 @@ impl BuildHub {
         targets: Option<String>,
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
-        forge: Option<String>,
+        forge: Option<Forge>,
         title: Option<String>,
         body: Option<String>,
         draft: Option<bool>,
@@ -391,7 +393,7 @@ impl BuildHub {
             targets = "Comma-separated target triples (optional, defaults to native host)",
             include = "Glob patterns — repo must match at least one (optional, repeatable)",
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
-            forge = "Target forges, comma-separated (optional, defaults to all configured)",
+            forge = "Target forge: github, codeberg, or gitlab (optional, defaults to all configured)",
             title = "Release title (optional, defaults to tag)",
             body = "Release description/notes (optional)",
             draft = "Create as draft release (optional, default: false)",
@@ -406,7 +408,7 @@ impl BuildHub {
         targets: Option<String>,
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
-        forge: Option<String>,
+        forge: Option<Forge>,
         title: Option<String>,
         body: Option<String>,
         draft: Option<bool>,
@@ -423,7 +425,7 @@ impl BuildHub {
             path = "Path to workspace or repo directory",
             include = "Glob patterns — repo must match at least one (optional, repeatable)",
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
-            forge = "Which forge hosts releases: github (default), codeberg, gitlab",
+            forge = "Which forge hosts releases: github, codeberg, or gitlab (optional, default: github)",
             dry_run = "Preview changes without writing files (optional, default: false)"
         )
     )]
@@ -432,7 +434,7 @@ impl BuildHub {
         path: String,
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
-        forge: Option<String>,
+        forge: Option<Forge>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         binstall::binstall_init(path, include, exclude, forge, dry_run)
@@ -445,7 +447,7 @@ impl BuildHub {
             org = "Organization/owner name on the forge",
             name = "Repository/package name",
             tag = "Release tag to generate formula from (e.g. v4.1.0)",
-            forge = "Which forge hosts the release: github (default), codeberg",
+            forge = "Which forge hosts the release: github, codeberg, or gitlab (optional, default: github)",
             tap_path = "Path to the homebrew-tap repo (optional, emits formula if not set)",
             description = "Formula description (optional)",
             dry_run = "Preview without downloading or writing files (optional, default: false)"
@@ -456,7 +458,7 @@ impl BuildHub {
         org: String,
         name: String,
         tag: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
         tap_path: Option<String>,
         description: Option<String>,
         dry_run: Option<bool>,
@@ -489,7 +491,7 @@ impl BuildHub {
             path = "Path to workspace directory",
             include = "Glob patterns — repo must match at least one (optional, repeatable)",
             exclude = "Glob patterns — repo matching any is excluded; exclude wins over include (optional, repeatable)",
-            channels = "Comma-separated distribution channels (optional, overrides auto-detect)",
+            channels = "Distribution channels to configure (optional, repeatable; overrides auto-detect)",
             targets = "Comma-separated target triples (optional, overrides auto-detect)",
             brew_tap = "Homebrew tap repo (e.g. hypermemetic/homebrew-tap) (optional)",
             force = "Overwrite existing [dist] config (optional, default: false)",
@@ -501,7 +503,7 @@ impl BuildHub {
         path: String,
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
-        channels: Option<String>,
+        channels: Option<Vec<DistChannel>>,
         targets: Option<String>,
         brew_tap: Option<String>,
         force: Option<bool>,

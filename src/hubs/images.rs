@@ -18,6 +18,7 @@ use crate::adapters::registry::RegistryPort;
 use crate::auth::YamlAuthProvider;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::HyperforgeState;
+use crate::types::Forge;
 
 /// Sub-hub for container image operations
 #[derive(Clone)]
@@ -65,7 +66,7 @@ impl ImagesHub {
         params(
             org = "Organization name",
             name = "Repository name",
-            forge = "Forge to query (optional, defaults to all configured forges)",
+            forge = "Forge to query: github, codeberg, or gitlab (optional, defaults to all configured forges)",
             filter = "Regex pattern to filter tags (optional)"
         )
     )]
@@ -73,7 +74,7 @@ impl ImagesHub {
         &self,
         org: String,
         name: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
         filter: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
@@ -102,7 +103,7 @@ impl ImagesHub {
 
             // Determine which forges to query
             let target_forges: Vec<String> = if let Some(f) = forge {
-                vec![f]
+                vec![f.as_str().to_string()]
             } else {
                 let local = state.get_local_forge(&org).await;
                 match local.get_repo(&org, &name).await {
@@ -177,14 +178,14 @@ impl ImagesHub {
         description = "List all container packages for an organization across forges",
         params(
             org = "Organization name",
-            forge = "Forge to query (optional, queries all known forges)",
+            forge = "Forge to query: github, codeberg, or gitlab (optional, queries all known forges)",
             filter = "Regex pattern to filter package names (optional)"
         )
     )]
     pub async fn list_all(
         &self,
         org: String,
-        forge: Option<String>,
+        forge: Option<Forge>,
         filter: Option<String>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
@@ -213,7 +214,7 @@ impl ImagesHub {
 
             // Determine forges to query
             let target_forges: Vec<String> = if let Some(f) = forge {
-                vec![f]
+                vec![f.as_str().to_string()]
             } else {
                 // Get forges from org config (SSH keys configured = forge is known)
                 let org_config = crate::config::OrgConfig::load(&state.config_dir, &org);
@@ -286,7 +287,7 @@ impl ImagesHub {
             path = "Path to build context (directory containing Dockerfile)",
             tag = "Image tag (default: latest)",
             dockerfile = "Dockerfile path relative to build context (optional, auto-detected)",
-            forge = "Target forge (optional, pushes to all configured forges)",
+            forge = "Target forge: github, codeberg, or gitlab (optional, pushes to all configured forges)",
             dry_run = "Preview without building or pushing (optional, default: false)"
         )
     )]
@@ -297,7 +298,7 @@ impl ImagesHub {
         path: String,
         tag: Option<String>,
         dockerfile: Option<String>,
-        forge: Option<String>,
+        forge: Option<Forge>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
@@ -351,11 +352,10 @@ impl ImagesHub {
 
             // Resolve target registries from forge names
             let target_registries: Vec<ContainerRegistry> = if let Some(f) = forge {
-                vec![match f.as_str() {
-                    "github" => ContainerRegistry::Ghcr,
-                    "codeberg" => ContainerRegistry::Codeberg,
-                    "gitlab" => ContainerRegistry::GitLab,
-                    other => ContainerRegistry::Custom(other.to_string()),
+                vec![match f {
+                    Forge::GitHub => ContainerRegistry::Ghcr,
+                    Forge::Codeberg => ContainerRegistry::Codeberg,
+                    Forge::GitLab => ContainerRegistry::GitLab,
                 }]
             } else {
                 let org_config = crate::config::OrgConfig::load(&state.config_dir, &org);
@@ -519,7 +519,7 @@ impl ImagesHub {
         params(
             org = "Organization name",
             name = "Repository name",
-            forge = "Forge (e.g. github)",
+            forge = "Forge: github, codeberg, or gitlab",
             tag = "Image tag to delete",
             confirm = "Actually delete (default: false — dry-run unless confirmed)"
         )
@@ -528,11 +528,12 @@ impl ImagesHub {
         &self,
         org: String,
         name: String,
-        forge: String,
+        forge: Forge,
         tag: String,
         confirm: Option<bool>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let is_dry_run = !confirm.unwrap_or(false);
+        let forge_str = forge.as_str().to_string();
 
         stream! {
             let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -545,7 +546,7 @@ impl ImagesHub {
                 }
             };
 
-            let adapter = match make_registry_adapter(&forge, auth, &org) {
+            let adapter = match make_registry_adapter(&forge_str, auth, &org) {
                 Ok(a) => a,
                 Err(e) => {
                     yield HyperforgeEvent::Error { message: e };
@@ -556,7 +557,7 @@ impl ImagesHub {
             if is_dry_run {
                 yield HyperforgeEvent::Info {
                     message: format!("{}Would delete {}:{} from {}/{} on {}",
-                        dry_prefix, name, tag, org, name, forge),
+                        dry_prefix, name, tag, org, name, forge_str),
                 };
                 return;
             }
@@ -565,7 +566,7 @@ impl ImagesHub {
                 Ok(()) => {
                     yield HyperforgeEvent::ImageDelete {
                         repo_name: name,
-                        forge,
+                        forge: forge_str.clone(),
                         tag,
                         success: true,
                         error: None,
@@ -574,7 +575,7 @@ impl ImagesHub {
                 Err(e) => {
                     yield HyperforgeEvent::ImageDelete {
                         repo_name: name,
-                        forge,
+                        forge: forge_str.clone(),
                         tag,
                         success: false,
                         error: Some(e.to_string()),

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::auth::AuthProvider;
 use crate::hub::HyperforgeEvent;
+use crate::types::Forge;
 
 use super::release::{make_auth, make_release_adapter};
 
@@ -222,13 +223,13 @@ pub fn brew_formula(
     org: String,
     name: String,
     tag: String,
-    forge: Option<String>,
+    forge: Option<Forge>,
     tap_path: Option<String>,
     description: Option<String>,
     dry_run: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let is_dry_run = dry_run.unwrap_or(false);
-    let forge_name = forge.unwrap_or_else(|| "github".to_string());
+    let forge_name = forge.map(|f| f.as_str().to_string()).unwrap_or_else(|| "github".to_string());
     let desc = description.unwrap_or_else(|| format!("{} — installed via Homebrew", name));
 
     stream! {

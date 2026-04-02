@@ -17,12 +17,23 @@ pub use config::{CiConfig, DistChannel, DistConfig, ForgeConfig};
 pub use registry::{ContainerRegistry, ImageRef, RegistryAuth};
 
 /// Supported git forges
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Forge {
     GitHub,
     Codeberg,
     GitLab,
+}
+
+impl Forge {
+    /// Return the lowercase string representation used in config files and adapters.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Forge::GitHub => "github",
+            Forge::Codeberg => "codeberg",
+            Forge::GitLab => "gitlab",
+        }
+    }
 }
 
 /// Repository visibility

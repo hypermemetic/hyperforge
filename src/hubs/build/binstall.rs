@@ -8,6 +8,7 @@ use crate::commands::runner::discover_or_bail;
 use crate::config::HyperforgeConfig;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::{dry_prefix, RepoFilter};
+use crate::types::Forge;
 
 // ---------------------------------------------------------------------------
 // Forge URL base
@@ -113,11 +114,11 @@ pub fn binstall_init(
     path: String,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
-    forge: Option<String>,
+    forge: Option<Forge>,
     dry_run: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let is_dry_run = dry_run.unwrap_or(false);
-    let forge_hint = forge;
+    let forge_hint: Option<String> = forge.map(|f| f.as_str().to_string());
     let filter = RepoFilter::new(include, exclude);
 
     stream! {

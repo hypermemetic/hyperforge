@@ -451,28 +451,6 @@ async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Opt
     }
 }
 
-/// Parse a comma-separated channel string into DistChannel values.
-fn parse_channels(channel: &str) -> Result<Vec<DistChannel>, String> {
-    let mut out = Vec::new();
-    for part in channel.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let dc = match part {
-            "forge-release" => DistChannel::ForgeRelease,
-            "crates-io" => DistChannel::CratesIo,
-            "hackage" => DistChannel::Hackage,
-            "brew" => DistChannel::Brew,
-            "ghcr" => DistChannel::Ghcr,
-            "binstall" => DistChannel::Binstall,
-            _ => return Err(format!("Unknown channel: {}", part)),
-        };
-        out.push(dc);
-    }
-    Ok(out)
-}
-
 /// Root hub for hyperforge operations
 #[derive(Clone)]
 pub struct HyperforgeHub {
@@ -1267,15 +1245,15 @@ impl HyperforgeHub {
         description = "Guided credential setup — shows what tokens are needed, where to create them, and how to store them",
         params(
             org = "Organization name (required)",
-            forge = "Set up credentials for a specific forge (optional, sets up all configured forges if omitted)",
-            channel = "Set up credentials for specific dist channels (optional, comma-separated)"
+            forge = "Set up credentials for a specific forge: github, codeberg, or gitlab (optional, sets up all configured forges if omitted)",
+            channel = "Set up credentials for specific dist channels (optional, repeatable)"
         )
     )]
     pub async fn auth_setup(
         &self,
         org: String,
-        forge: Option<String>,
-        channel: Option<String>,
+        forge: Option<Forge>,
+        channel: Option<Vec<DistChannel>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let config_dir = self.state.config_dir.clone();
         let state = self.state.clone();
@@ -1284,20 +1262,8 @@ impl HyperforgeHub {
             const SECRETS_PORT: u16 = 44105;
 
             // 1. Determine which forges to set up
-            let target_forges: Vec<Forge> = if let Some(ref forge_str) = forge {
-                // Single forge specified
-                match HyperforgeConfig::parse_forge(forge_str) {
-                    Some(f) => vec![f],
-                    None => {
-                        yield HyperforgeEvent::Error {
-                            message: format!(
-                                "Invalid forge: {}. Must be github, codeberg, or gitlab",
-                                forge_str
-                            ),
-                        };
-                        return;
-                    }
-                }
+            let target_forges: Vec<Forge> = if let Some(ref f) = forge {
+                vec![f.clone()]
             } else {
                 // Discover forges from OrgConfig SSH keys
                 let org_config = OrgConfig::load(&config_dir, &org);
@@ -1335,25 +1301,8 @@ impl HyperforgeHub {
                 forges
             };
 
-            // 2. Parse channel parameter if provided
-            let target_channels: Vec<DistChannel> = if let Some(ref ch_str) = channel {
-                ch_str
-                    .split(',')
-                    .map(|c| c.trim())
-                    .filter(|c| !c.is_empty())
-                    .filter_map(|c| match c {
-                        "forge-release" => Some(DistChannel::ForgeRelease),
-                        "crates-io" => Some(DistChannel::CratesIo),
-                        "hackage" => Some(DistChannel::Hackage),
-                        "brew" => Some(DistChannel::Brew),
-                        "ghcr" => Some(DistChannel::Ghcr),
-                        "binstall" => Some(DistChannel::Binstall),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            // 2. Channel parameter is already typed
+            let target_channels: Vec<DistChannel> = channel.unwrap_or_default();
 
             // 3. Gather credentials — forge tokens + channel tokens
             let mut all_creds: Vec<ResolvedCredential> = Vec::new();
@@ -1518,15 +1467,15 @@ impl HyperforgeHub {
         description = "Validate all configured tokens — check existence, validity, and scopes",
         params(
             org = "Check credentials for a specific org (optional, checks all if omitted)",
-            forge = "Check a specific forge only (optional)",
-            channel = "Check credentials for specific dist channels (optional, comma-separated)"
+            forge = "Check a specific forge only: github, codeberg, or gitlab (optional)",
+            channel = "Check credentials for specific dist channels (optional, repeatable)"
         )
     )]
     pub async fn auth_check(
         &self,
         org: Option<String>,
-        forge: Option<String>,
-        channel: Option<String>,
+        forge: Option<Forge>,
+        channel: Option<Vec<DistChannel>>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let config_dir = self.state.config_dir.clone();
         stream! {
@@ -1576,33 +1525,9 @@ impl HyperforgeHub {
                 return;
             }
 
-            // Parse optional forge filter
-            let forge_filter: Option<Forge> = if let Some(ref f) = forge {
-                match HyperforgeConfig::parse_forge(f) {
-                    Some(parsed) => Some(parsed),
-                    None => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", f),
-                        };
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Parse optional channel filter
-            let channel_filter: Option<Vec<DistChannel>> = if let Some(ref c) = channel {
-                match parse_channels(c) {
-                    Ok(channels) => Some(channels),
-                    Err(e) => {
-                        yield HyperforgeEvent::Error { message: e };
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            // Forge and channel are already typed
+            let forge_filter: Option<Forge> = forge;
+            let channel_filter: Option<Vec<DistChannel>> = channel;
 
             // Collect all resolved credentials, dedup by key_path
             let mut all_creds: Vec<ResolvedCredential> = Vec::new();

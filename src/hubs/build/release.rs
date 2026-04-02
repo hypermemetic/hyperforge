@@ -20,6 +20,7 @@ use crate::git::Git;
 use crate::hub::HyperforgeEvent;
 use crate::hubs::utils::RepoFilter;
 use crate::types::config::DistChannel;
+use crate::types::Forge;
 
 pub(crate) fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
@@ -212,9 +213,11 @@ fn resolve_forges_with_dist(
 /// Accepts an iterator of repo references to work with both owned and borrowed slices.
 async fn run_release_preflight(
     repos: &[&DiscoveredRepo],
-    forge_override: &Option<String>,
+    forge_override: &Option<Forge>,
 ) -> Vec<HyperforgeEvent> {
     use std::collections::HashSet;
+
+    let forge_override_str: Option<String> = forge_override.as_ref().map(|f| f.as_str().to_string());
 
     let mut org_forges: std::collections::HashMap<String, HashSet<String>> =
         std::collections::HashMap::new();
@@ -228,11 +231,8 @@ async fn run_release_preflight(
         };
 
         // Collect forges
-        let forges: Vec<String> = if let Some(ref f) = forge_override {
-            f.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+        let forges: Vec<String> = if let Some(ref f) = forge_override_str {
+            vec![f.clone()]
         } else {
             repo.forges().iter().map(|s| s.to_string()).collect()
         };
@@ -612,7 +612,7 @@ pub fn release(
     targets: Option<String>,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
-    forge: Option<String>,
+    forge: Option<Forge>,
     title: Option<String>,
     body: Option<String>,
     draft: Option<bool>,
@@ -625,6 +625,7 @@ pub fn release(
     let is_skip_auth = skip_auth_check.unwrap_or(false);
     let release_title = title.unwrap_or_else(|| tag.clone());
     let release_body = body.unwrap_or_default();
+    let forge_str: Option<String> = forge.as_ref().map(|f| f.as_str().to_string());
 
     stream! {
         let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -692,10 +693,10 @@ pub fn release(
         for repo in &repos {
             // Resolve targets and forges per-repo, consulting dist config
             let repo_targets = resolve_targets_with_dist(&targets, repo);
-            let repo_forges = resolve_forges_with_dist(&forge, repo);
+            let repo_forges = resolve_forges_with_dist(&forge_str, repo);
 
             // If dist config says no forge-release, skip
-            if repo_forges.is_empty() && forge.is_none() {
+            if repo_forges.is_empty() && forge_str.is_none() {
                 yield HyperforgeEvent::Info {
                     message: format!(
                         "Skipping {} (no forge-release channel in dist config)",
@@ -705,8 +706,8 @@ pub fn release(
                 continue;
             }
 
-            let forge_override_for_repo = if forge.is_some() {
-                forge.clone()
+            let forge_override_for_repo: Option<String> = if forge_str.is_some() {
+                forge_str.clone()
             } else if !repo_forges.is_empty() {
                 Some(repo_forges.join(","))
             } else {
@@ -758,7 +759,7 @@ pub fn release_all(
     targets: Option<String>,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
-    forge: Option<String>,
+    forge: Option<Forge>,
     title: Option<String>,
     body: Option<String>,
     draft: Option<bool>,
@@ -771,6 +772,7 @@ pub fn release_all(
     let is_skip_auth = skip_auth_check.unwrap_or(false);
     let release_title = title.unwrap_or_else(|| tag.clone());
     let release_body = body.unwrap_or_default();
+    let forge_str: Option<String> = forge.as_ref().map(|f| f.as_str().to_string());
 
     stream! {
         let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -855,10 +857,10 @@ pub fn release_all(
         for (i, repo) in repos.iter().enumerate() {
             // Resolve targets and forges per-repo, consulting dist config
             let repo_targets = resolve_targets_with_dist(&targets, repo);
-            let repo_forges = resolve_forges_with_dist(&forge, repo);
+            let repo_forges = resolve_forges_with_dist(&forge_str, repo);
 
             // If dist config says no forge-release, skip
-            if repo_forges.is_empty() && forge.is_none() {
+            if repo_forges.is_empty() && forge_str.is_none() {
                 yield HyperforgeEvent::Info {
                     message: format!(
                         "{}[{}/{}] Skipping {} (no forge-release channel in dist config)",
@@ -881,8 +883,8 @@ pub fn release_all(
                 ),
             };
 
-            let forge_override_for_repo = if forge.is_some() {
-                forge.clone()
+            let forge_override_for_repo: Option<String> = if forge_str.is_some() {
+                forge_str.clone()
             } else if !repo_forges.is_empty() {
                 Some(repo_forges.join(","))
             } else {

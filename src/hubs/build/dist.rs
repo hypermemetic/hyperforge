@@ -37,23 +37,6 @@ fn default_haskell_channels() -> Vec<DistChannel> {
     ]
 }
 
-/// Parse comma-separated channel names into DistChannel variants.
-fn parse_channels(s: &str) -> Vec<DistChannel> {
-    s.split(',')
-        .map(|c| c.trim())
-        .filter(|c| !c.is_empty())
-        .filter_map(|c| match c {
-            "forge-release" => Some(DistChannel::ForgeRelease),
-            "crates-io" => Some(DistChannel::CratesIo),
-            "hackage" => Some(DistChannel::Hackage),
-            "brew" => Some(DistChannel::Brew),
-            "ghcr" => Some(DistChannel::Ghcr),
-            "binstall" => Some(DistChannel::Binstall),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Parse comma-separated target triples.
 fn parse_target_list(s: &str) -> Vec<String> {
     s.split(',')
@@ -138,7 +121,7 @@ pub fn dist_init(
     path: String,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
-    channels: Option<String>,
+    channels: Option<Vec<DistChannel>>,
     targets: Option<String>,
     brew_tap: Option<String>,
     force: Option<bool>,
@@ -194,7 +177,7 @@ pub fn dist_init(
 
             // Apply overrides from CLI
             let final_channels = match &channels {
-                Some(s) => parse_channels(s),
+                Some(ch) => ch.clone(),
                 None => default_channels,
             };
             let final_targets = match &targets {
