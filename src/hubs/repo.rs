@@ -1217,6 +1217,7 @@ impl RepoHub {
                 hooks: !no_hooks.unwrap_or(false),
                 ssh_wrapper: !no_ssh_wrapper.unwrap_or(false),
                 dry_run: is_dry_run,
+                auto_commit: true,
             };
 
             match materialize(&org, &record, &repo_path, opts) {
@@ -1255,6 +1256,12 @@ impl RepoHub {
                     if report.ssh_configured {
                         yield HyperforgeEvent::Info {
                             message: "Configured SSH wrapper".to_string(),
+                        };
+                    }
+
+                    if report.auto_committed {
+                        yield HyperforgeEvent::Info {
+                            message: "Auto-committed .hyperforge/ config".to_string(),
                         };
                     }
 

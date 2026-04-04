@@ -21,6 +21,8 @@ pub struct MaterializeOpts {
     pub ssh_wrapper: bool,
     /// Report without writing (default false)
     pub dry_run: bool,
+    /// Auto-commit .hyperforge/ after materialization (default true)
+    pub auto_commit: bool,
 }
 
 impl Default for MaterializeOpts {
@@ -31,6 +33,7 @@ impl Default for MaterializeOpts {
             hooks: false,
             ssh_wrapper: false,
             dry_run: false,
+            auto_commit: true,
         }
     }
 }
@@ -47,6 +50,8 @@ pub struct MaterializeReport {
     pub hooks_installed: bool,
     /// Whether SSH wrapper was configured
     pub ssh_configured: bool,
+    /// Whether .hyperforge/ was auto-committed
+    pub auto_committed: bool,
     /// Warnings emitted during materialization
     pub warnings: Vec<String>,
 }
@@ -68,6 +73,7 @@ pub fn materialize(
         remotes_updated: Vec::new(),
         hooks_installed: false,
         ssh_configured: false,
+        auto_committed: false,
         warnings: Vec::new(),
     };
 
@@ -201,6 +207,45 @@ pub fn materialize(
                      Set org defaults with: synapse lforge hyperforge config set_ssh_key"
                         .to_string(),
                 );
+            }
+        }
+    }
+
+    // ── Step 5: auto-commit .hyperforge/ ──────────────────────────────
+
+    if opts.auto_commit && !opts.dry_run && report.config_written && repo_path.join(".git").exists()
+    {
+        let hf_dir = repo_path.join(".hyperforge");
+        if hf_dir.exists() {
+            // Stage .hyperforge/ and commit only if it produces changes
+            let add = std::process::Command::new("git")
+                .args(["add", ".hyperforge/"])
+                .current_dir(repo_path)
+                .output();
+            if let Ok(add_out) = add {
+                if add_out.status.success() {
+                    // Check if there's anything staged for .hyperforge/
+                    let has_staged = std::process::Command::new("git")
+                        .args(["diff", "--cached", "--quiet", "--", ".hyperforge/"])
+                        .current_dir(repo_path)
+                        .status()
+                        .map(|s| !s.success()) // exit 1 = there are diffs
+                        .unwrap_or(false);
+
+                    if has_staged {
+                        let _ = std::process::Command::new("git")
+                            .args([
+                                "commit",
+                                "-m",
+                                "chore: add .hyperforge config",
+                                "--",
+                                ".hyperforge/",
+                            ])
+                            .current_dir(repo_path)
+                            .output();
+                        report.auto_committed = true;
+                    }
+                }
             }
         }
     }

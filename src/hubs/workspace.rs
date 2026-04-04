@@ -2022,6 +2022,7 @@ impl WorkspaceHub {
                     hooks: false,
                     ssh_wrapper: false,
                     dry_run: is_dry_run,
+                    auto_commit: true,
                 };
 
                 match crate::commands::materialize::materialize(&target_org, &record, &repo_path, materialize_opts) {
