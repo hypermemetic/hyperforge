@@ -8,7 +8,7 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
+use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -84,14 +84,14 @@ fn guess_content_type(filename: &str) -> &'static str {
     }
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "releases",
     description = "Release management: list, create, upload, delete, assets",
     crate_path = "plexus_core"
 )]
 impl ReleasesHub {
     /// List releases for a repo across configured forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "List releases for a repository across its configured forges",
         params(
             org = "Organization name",
@@ -162,7 +162,7 @@ impl ReleasesHub {
     }
 
     /// Create a tagged release on forge(s)
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Create a tagged release on one or more forges",
         params(
             org = "Organization name",
@@ -246,7 +246,7 @@ impl ReleasesHub {
     }
 
     /// Upload a file as a release asset
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Upload a file as an asset to an existing release. Reads file from disk and uploads to the forge.",
         params(
             org = "Organization name",
@@ -383,7 +383,7 @@ impl ReleasesHub {
     }
 
     /// Delete a release by tag
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Delete a release by tag. Dry-run by default; pass --confirm true to actually delete.",
         params(
             org = "Organization name",
@@ -490,7 +490,7 @@ impl ReleasesHub {
     }
 
     /// List assets attached to a specific release
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "List assets attached to a specific release by tag",
         params(
             org = "Organization name",
@@ -615,8 +615,8 @@ impl ChildRouter for ReleasesHub {
         "releases"
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth).await
     }
 
     async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {

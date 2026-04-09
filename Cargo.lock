@@ -563,7 +563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -981,7 +981,7 @@ dependencies = [
  "jsonrpsee",
  "oci-client",
  "plexus-core",
- "plexus-macros 0.4.0",
+ "plexus-macros",
  "plexus-transport",
  "regex",
  "reqwest",
@@ -1674,7 +1674,7 @@ dependencies = [
  "futures",
  "futures-util",
  "jsonrpsee",
- "plexus-macros 0.2.2",
+ "plexus-macros",
  "rmcp",
  "schemars 1.2.0",
  "serde",
@@ -1683,18 +1683,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "plexus-macros"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5cdcf0a30209ac2bafa92455cdcf8ed5ffadc2e36470db24e8c20607a3cea4f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
  "uuid",
 ]
 
@@ -1710,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "plexus-transport"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2068,7 +2056,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2541,7 +2529,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

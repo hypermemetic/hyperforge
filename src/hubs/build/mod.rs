@@ -19,7 +19,7 @@ pub mod repo_size;
 
 use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
+use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 
 use crate::hub::HyperforgeEvent;
@@ -42,14 +42,14 @@ impl Default for BuildHub {
     }
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "build",
     description = "Development tools: manifest generation, publishing, cross-repo execution",
     crate_path = "plexus_core"
 )]
 impl BuildHub {
     /// Generate/update native workspace manifests (Cargo.toml, cabal.project)
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Generate workspace config files (.cargo/config.toml with [patch.crates-io], cabal.project) from detected build systems. Each repo stays independent while sibling crates resolve locally.",
         params(
             path = "Path to workspace directory",
@@ -65,7 +65,7 @@ impl BuildHub {
     }
 
     /// Analyze workspace dependency graph and detect version mismatches
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Analyze workspace dependency graph: show build tiers, dependency relationships, and version mismatches between pinned and local versions.",
         params(
             path = "Path to workspace directory",
@@ -81,7 +81,7 @@ impl BuildHub {
     }
 
     /// Detect mismatches between directory names and package names
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Detect repos where the directory name differs from the package name in the build manifest. Also reports git repos without hyperforge config (run `hyperforge init` to configure them).",
         params(
             path = "Path to workspace root directory"
@@ -95,7 +95,7 @@ impl BuildHub {
     }
 
     /// Compare local package versions against their registries
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show local vs published versions for workspace packages",
         params(
             path = "Path to workspace root directory",
@@ -113,7 +113,7 @@ impl BuildHub {
     }
 
     /// Publish packages with transitive dependency resolution
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Publish workspace packages in dependency order, auto-publishing transitive deps first. Dry-run by default — pass --execute to actually publish.",
         params(
             path = "Path to workspace root directory",
@@ -139,7 +139,7 @@ impl BuildHub {
     }
 
     /// Bump versions for workspace packages
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Bump package versions across the workspace",
         params(
             path = "Path to workspace root directory",
@@ -163,7 +163,7 @@ impl BuildHub {
     }
 
     /// Run a command across all workspace repos
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Execute an arbitrary shell command in every workspace repo directory. Runs in parallel by default.",
         params(
             path = "Path to workspace directory",
@@ -187,7 +187,7 @@ impl BuildHub {
     }
 
     /// Validate workspace builds in Docker containers
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Run containerized builds and tests in dependency order. Uses Docker to validate the entire workspace compiles before pushing.",
         params(
             path = "Path to workspace directory",
@@ -207,7 +207,7 @@ impl BuildHub {
     }
 
     /// Run build/test commands using layered CI runners
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Run build and test commands in dependency order using [ci] runners. Level 0 = quick check, level 1 = full build, level 2 = containerized. Without --level, runs all local runners.",
         params(
             path = "Path to workspace directory",
@@ -233,7 +233,7 @@ impl BuildHub {
     }
 
     /// Initialize CI configs for repos that lack them
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Generate default [ci] runner configs for workspace repos that don't have one. Detects build system (Cargo/Cabal/Node) and writes layered runners to .hyperforge/config.toml. Idempotent — repos with existing CI config are untouched.",
         params(
             path = "Path to workspace directory",
@@ -253,7 +253,7 @@ impl BuildHub {
     }
 
     /// Ensure sane .gitignore patterns across all workspace repos
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Add missing .gitignore patterns across all workspace repos. Includes OS, editor, build artifact, and build-system-specific patterns. Idempotent — only adds what's missing.",
         params(
             path = "Path to workspace directory",
@@ -275,7 +275,7 @@ impl BuildHub {
     }
 
     /// Find large tracked files across workspace repos
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Find large tracked files across all workspace repos. Scans git-tracked files only.",
         params(
             path = "Path to workspace directory",
@@ -295,7 +295,7 @@ impl BuildHub {
     }
 
     /// Show total tracked-file size for each workspace repo
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show total size of git-tracked files per repo, sorted by size descending",
         params(
             path = "Path to workspace directory",
@@ -313,7 +313,7 @@ impl BuildHub {
     }
 
     /// Count lines of code per repo
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Count lines of code per repo, sorted by total lines descending. Breaks down by file extension.",
         params(
             path = "Path to workspace directory",
@@ -331,7 +331,7 @@ impl BuildHub {
     }
 
     /// Check which repos have uncommitted changes
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Find repos with staged, unstaged, or untracked changes. Only reports dirty repos by default.",
         params(
             path = "Path to workspace directory",
@@ -351,7 +351,7 @@ impl BuildHub {
     }
 
     /// Cross-compile, package, create forge releases, and upload assets
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "All-in-one release orchestrator: cross-compile binaries, package archives, create tagged releases on forges, and upload assets. Works for a single repo or entire workspace.",
         params(
             path = "Path to workspace or repo directory",
@@ -385,7 +385,7 @@ impl BuildHub {
     }
 
     /// Release all binary-producing packages in workspace in dependency order
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Workspace-wide release: cross-compile, package, create releases, and upload assets for every binary-producing repo in dependency order. Repos are processed sequentially (dependencies first), with cross-compilation across targets running in parallel within each repo.",
         params(
             path = "Path to workspace directory",
@@ -419,7 +419,7 @@ impl BuildHub {
     }
 
     /// Inject cargo-binstall metadata into Cargo.toml files
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Inject [package.metadata.binstall] into Cargo.toml files so cargo-binstall can discover pre-built binaries. Uses toml_edit to preserve formatting. Skips repos that already have binstall metadata.",
         params(
             path = "Path to workspace or repo directory",
@@ -441,7 +441,7 @@ impl BuildHub {
     }
 
     /// Generate a Homebrew formula from release assets
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Generate a Homebrew formula (.rb) from an existing release's assets. Downloads each platform archive, computes sha256, and maps target triples to Homebrew platform selectors (on_macos/on_linux, on_arm/on_intel). Write to a tap repo or emit the formula.",
         params(
             org = "Organization/owner name on the forge",
@@ -467,7 +467,7 @@ impl BuildHub {
     }
 
     /// Show distribution config for workspace repos
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show distribution configuration ([dist] section) for each repo in the workspace. Shows channels, targets, and brew tap settings.",
         params(
             path = "Path to workspace directory",
@@ -485,7 +485,7 @@ impl BuildHub {
     }
 
     /// Initialize distribution config for workspace repos
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Populate [dist] sections in .hyperforge/config.toml for workspace repos. Auto-detects sensible defaults based on build system (Rust: forge-release + crates-io + binstall; Haskell: forge-release + hackage + brew). CLI flags override auto-detected defaults.",
         params(
             path = "Path to workspace directory",
@@ -519,8 +519,8 @@ impl ChildRouter for BuildHub {
         "build"
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth).await
     }
 
     async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {

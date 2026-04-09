@@ -6,7 +6,7 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
+use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -41,14 +41,14 @@ impl WorkspaceHub {
     }
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "workspace",
     description = "Multi-repo workspace orchestration",
     crate_path = "plexus_core"
 )]
 impl WorkspaceHub {
     /// Discover repos in a workspace directory
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Scan a workspace directory and report discovered repos, orgs, and forges",
         params(
             path = "Path to workspace directory",
@@ -124,7 +124,7 @@ impl WorkspaceHub {
     }
 
     /// Initialize unconfigured repos in a workspace
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Initialize hyperforge config for unconfigured repos in a workspace directory. Discovers repos, infers org/forges from existing configs, and creates .hyperforge/config.toml for each unconfigured repo.",
         params(
             path = "Path to workspace directory",
@@ -387,7 +387,7 @@ impl WorkspaceHub {
     }
 
     /// Check all repos are on expected branch and clean
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Verify all workspace repos are on the expected branch and have a clean working tree",
         params(
             path = "Path to workspace directory",
@@ -496,7 +496,7 @@ impl WorkspaceHub {
     }
 
     /// Push all repos to their configured forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Push all workspace repos to their configured forges",
         params(
             path = "Path to workspace directory",
@@ -612,7 +612,7 @@ impl WorkspaceHub {
     }
 
     /// Compute sync diff between local and a remote forge
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Compute diff between local configuration and a remote forge. Use --path to discover from disk, or --org and --forge for direct registry access.",
         params(
             path = "Path to workspace directory (discovers orgs/forges from disk)",
@@ -715,7 +715,7 @@ impl WorkspaceHub {
     }
 
     /// Full safe sync pipeline: discover → init → register → import → diff → apply (no deletes) → push
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Sync workspace to remote forges. With --reflect, retire remote-only repos. With --purge, delete previously staged repos.",
         params(
             path = "Path to workspace directory (required)",
@@ -1229,7 +1229,7 @@ impl WorkspaceHub {
     }
 
     /// Set default branch on all repos in a workspace
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Set the default branch on all remote forges for every repo in a workspace, and optionally git checkout locally",
         params(
             path = "Path to workspace directory",
@@ -1354,7 +1354,7 @@ impl WorkspaceHub {
     }
 
     /// Check remote default branch settings
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Verify all workspace repos have the expected default branch set on remote forges. Queries each forge API directly.",
         params(
             path = "Path to workspace directory",
@@ -1477,7 +1477,7 @@ impl WorkspaceHub {
     }
 
     /// Verify workspace sync state
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Verify workspace configuration including orgs, SSH keys, and auth tokens. Use --path to discover from disk, or --org for registry access.",
         params(
             path = "Path to workspace directory (discovers orgs from disk)",
@@ -1649,7 +1649,7 @@ impl WorkspaceHub {
 
 
     /// Clone all repos for an org from LocalForge into a workspace directory
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Clone all repos for an org from LocalForge into a workspace directory. Skips repos already on disk.",
         params(
             org = "Organization name (must have repos in LocalForge)",
@@ -1806,7 +1806,7 @@ impl WorkspaceHub {
 
 
     /// Move repos from one workspace to another
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Move repos from one workspace to another, updating config, git remotes, and LocalForge registry",
         params(
             path = "Source workspace directory",
@@ -2807,8 +2807,8 @@ impl ChildRouter for WorkspaceHub {
         "workspace"
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth).await
     }
 
     async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {

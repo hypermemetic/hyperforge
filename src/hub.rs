@@ -7,7 +7,7 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, ChildRouter, ChildSummary, PlexusError, PlexusStream};
+use plexus_core::plexus::{Activation, AuthContext, ChildRouter, ChildSummary, PlexusError, PlexusStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -472,7 +472,7 @@ impl Default for HyperforgeHub {
     }
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "hyperforge",
     description = "Multi-forge repository management",
     crate_path = "plexus_core",
@@ -480,7 +480,7 @@ impl Default for HyperforgeHub {
 )]
 impl HyperforgeHub {
     /// Show hyperforge status
-    #[plexus_macros::hub_method(description = "Show hyperforge status and version")]
+    #[plexus_macros::method(description = "Show hyperforge status and version")]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             yield HyperforgeEvent::Status {
@@ -491,7 +491,7 @@ impl HyperforgeHub {
     }
 
     /// Reload cached state from disk (repos.yaml for all known orgs)
-    #[plexus_macros::hub_method(description = "Reload all cached LocalForge state from disk")]
+    #[plexus_macros::method(description = "Reload all cached LocalForge state from disk")]
     pub async fn reload(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
         stream! {
@@ -509,7 +509,7 @@ impl HyperforgeHub {
     }
 
     /// Bootstrap an org — import all repos from remote forges into LocalForge
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Bootstrap an org — import all repos from remote forges into LocalForge, creating the canonical state mirror. Can generate SSH keys and set a workspace path.",
         params(
             org = "Organization name",
@@ -754,7 +754,7 @@ impl HyperforgeHub {
     }
 
     /// Show org-level configuration (SSH keys, defaults)
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show org-level configuration including SSH key defaults",
         params(
             org = "Organization name"
@@ -797,7 +797,7 @@ impl HyperforgeHub {
     }
 
     /// Set an org-level default SSH key for a forge
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Set or update an org-level default SSH key for a forge",
         params(
             org = "Organization name",
@@ -860,7 +860,7 @@ impl HyperforgeHub {
     }
 
     /// Show the public SSH key for an org/forge (pipe to pbcopy)
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show the public SSH key for an org/forge — pipe output to pbcopy",
         params(
             org = "Organization name",
@@ -901,7 +901,7 @@ impl HyperforgeHub {
     }
 
     /// List all known organizations
-    #[plexus_macros::hub_method(description = "List all organizations configured in hyperforge")]
+    #[plexus_macros::method(description = "List all organizations configured in hyperforge")]
     pub async fn orgs_list(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let config_dir = self.state.config_dir.clone();
         stream! {
@@ -955,7 +955,7 @@ impl HyperforgeHub {
     }
 
     /// Delete an organization — removes config, keys, repos.yaml, and optionally workspace dir
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Delete an organization — removes org config, SSH keys, LocalForge data, and optionally the workspace directory. Dry-run by default; pass --confirm true to actually delete.",
         params(
             org = "Organization name to delete",
@@ -1055,7 +1055,7 @@ impl HyperforgeHub {
     }
 
     /// Derive needed credentials from workspace dist configs and check which are present
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Derive needed credentials from workspace dist configs and check which are present",
         params(
             path = "Workspace path (required)",
@@ -1241,7 +1241,7 @@ impl HyperforgeHub {
     }
 
     /// Guided credential setup — shows what tokens are needed, where to create them, and how to store them
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Guided credential setup — shows what tokens are needed, where to create them, and how to store them",
         params(
             org = "Organization name (required)",
@@ -1463,7 +1463,7 @@ impl HyperforgeHub {
     }
 
     /// Validate all configured tokens — check existence, validity, and scopes
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Validate all configured tokens — check existence, validity, and scopes",
         params(
             org = "Check credentials for a specific org (optional, checks all if omitted)",
@@ -1653,8 +1653,8 @@ impl ChildRouter for HyperforgeHub {
         "hyperforge"
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {

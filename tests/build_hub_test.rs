@@ -245,6 +245,7 @@ async fn route_build_analyze_on_test_workspace() {
         .route(
             "hyperforge.build.analyze",
             serde_json::json!({ "path": tmp.path().to_str().unwrap() }),
+            None,
         )
         .await
         .expect("route should succeed");
@@ -271,6 +272,7 @@ async fn route_build_detect_name_mismatches() {
         .route(
             "hyperforge.build.detect_name_mismatches",
             serde_json::json!({ "path": tmp.path().to_str().unwrap() }),
+            None,
         )
         .await
         .expect("route should succeed");
@@ -308,6 +310,7 @@ async fn route_build_exec_echo() {
                 "command": "echo hello",
                 "include": ["alpha"],
             }),
+            None,
         )
         .await
         .expect("route should succeed");
@@ -346,6 +349,7 @@ async fn route_build_exec_filter_excludes() {
                 "command": "echo hi",
                 "include": ["nonexistent*"],
             }),
+            None,
         )
         .await
         .expect("route should succeed");
@@ -379,6 +383,7 @@ async fn route_build_unify_dry_run() {
                 "path": tmp.path().to_str().unwrap(),
                 "dry_run": true,
             }),
+            None,
         )
         .await
         .expect("route should succeed");
@@ -423,6 +428,7 @@ async fn route_build_bump_dry_run() {
                 "dry_run": true,
                 "include": ["alpha"],
             }),
+            None,
         )
         .await
         .expect("route should succeed");
@@ -467,6 +473,7 @@ async fn route_workspace_discover_still_works() {
         .route(
             "hyperforge.workspace.discover",
             serde_json::json!({ "path": tmp.path().to_str().unwrap() }),
+            None,
         )
         .await
         .expect("route should succeed");

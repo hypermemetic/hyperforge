@@ -3,7 +3,7 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
+use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -101,7 +101,7 @@ impl RepoHub {
     }
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "repo",
     description = "Single-repo operations and registry CRUD",
     crate_path = "plexus_core",
@@ -109,7 +109,7 @@ impl RepoHub {
 )]
 impl RepoHub {
     /// List repositories for an organization (from LocalForge)
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "List all repositories in the local forge for an organization",
         params(
             org = "Organization name",
@@ -160,7 +160,7 @@ impl RepoHub {
     }
 
     /// Create a new repository in LocalForge
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Create a new repository configuration",
         params(
             org = "Organization name",
@@ -249,7 +249,7 @@ impl RepoHub {
     }
 
     /// Update an existing repository
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Update repository configuration",
         params(
             org = "Organization name",
@@ -337,7 +337,7 @@ impl RepoHub {
     }
 
     /// Soft-delete a repository: privatize on remote forges, then mark dismissed locally
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Soft-delete a repository: privatize on remotes, mark dismissed locally (record preserved in repos.yaml)",
         params(
             org = "Organization name",
@@ -462,7 +462,7 @@ impl RepoHub {
     ///
     /// Only works on dismissed (soft-deleted) repos that have been privatized.
     /// Protected repos cannot be purged — remove protection first.
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Hard-delete a dismissed repo from remote forges and remove from repos.yaml. Requires repo to be dismissed and not protected.",
         params(
             org = "Organization name",
@@ -585,7 +585,7 @@ impl RepoHub {
     }
 
     /// Rename a repository on remote forge(s) and in local config
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Rename a repository on remote forge(s) and update local configuration",
         params(
             org = "Organization name",
@@ -719,7 +719,7 @@ impl RepoHub {
     }
 
     /// Set or unset archive status on remote forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Archive or unarchive a repository on its remote forges",
         params(
             org = "Organization name",
@@ -802,7 +802,7 @@ impl RepoHub {
     }
 
     /// Set the default branch on remote forges and optionally checkout locally
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Set the default branch on remote forges for a repository, and optionally git checkout locally",
         params(
             org = "Organization name",
@@ -932,7 +932,7 @@ impl RepoHub {
     }
 
     /// Import repositories from a remote forge
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Import repository configurations from a remote forge (GitHub, Codeberg, GitLab)",
         params(
             org = "Organization name",
@@ -1052,7 +1052,7 @@ impl RepoHub {
     }
 
     /// Initialize hyperforge for a git repository
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Initialize hyperforge configuration for a repository",
         params(
             path = "Repository path (absolute)",
@@ -1285,7 +1285,7 @@ impl RepoHub {
     }
 
     /// Show git repository status
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show git repository sync status across all configured forges",
         params(
             path = "Repository path (absolute)"
@@ -1381,7 +1381,7 @@ impl RepoHub {
     }
 
     /// Push to configured forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Push current branch to all configured forges",
         params(
             path = "Repository path (absolute)",
@@ -1473,7 +1473,7 @@ impl RepoHub {
     }
 
     /// Clone a repository from LocalForge
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Clone a repository by name from LocalForge, auto-initialize with hyperforge config",
         params(
             org = "Organization name",
@@ -1618,7 +1618,7 @@ impl RepoHub {
     }
 
     /// Sync a repo from LocalForge to its remote forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Sync a repo from LocalForge to its remote forges (create if missing, update if drifted)",
         params(
             org = "Organization name",
@@ -1816,7 +1816,7 @@ impl RepoHub {
     }
 
     /// Find large tracked files in a repository
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Find large tracked files in a repository",
         params(
             org = "Organization name",
@@ -1908,7 +1908,7 @@ impl RepoHub {
     }
 
     /// Show total size of tracked files in a repository
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Show total size of git-tracked files in a repository",
         params(
             org = "Organization name",
@@ -2000,7 +2000,7 @@ impl RepoHub {
     }
 
     /// Count lines of code in a repository
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Count lines of code in a repository, broken down by file extension",
         params(
             org = "Organization name",
@@ -2103,7 +2103,7 @@ impl RepoHub {
     }
 
     /// Check if a repository has uncommitted changes
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Check if a repository has staged, unstaged, or untracked changes",
         params(
             org = "Organization name",
@@ -2194,8 +2194,8 @@ impl ChildRouter for RepoHub {
         "repo"
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {

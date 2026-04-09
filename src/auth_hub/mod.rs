@@ -69,7 +69,7 @@ impl AuthHub {
     }
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "auth",
     version = "1.0.0",
     description = "Simple secret management with YAML storage",
@@ -77,7 +77,7 @@ impl AuthHub {
 )]
 impl AuthHub {
     /// Get a secret by path
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Get a secret by path",
         params(
             secret_key = "Secret key (e.g., 'github/alice/token')"
@@ -111,7 +111,7 @@ impl AuthHub {
     }
 
     /// Set a secret
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Set a secret value",
         params(
             secret_key = "Secret key (e.g., 'github/alice/token')",
@@ -144,7 +144,7 @@ impl AuthHub {
     }
 
     /// List secrets matching a prefix
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "List secrets matching a prefix",
         params(
             prefix = "Prefix to filter by (empty string for all secrets)"
@@ -177,7 +177,7 @@ impl AuthHub {
     }
 
     /// Delete a secret
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Delete a secret",
         params(
             secret_key = "Secret key to delete"

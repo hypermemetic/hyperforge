@@ -7,7 +7,7 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, ChildRouter, PlexusError, PlexusStream};
+use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -54,14 +54,14 @@ fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
         .map_err(|e| format!("Failed to create auth provider: {}", e))
 }
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "images",
     description = "Container image management: list, delete, push",
     crate_path = "plexus_core"
 )]
 impl ImagesHub {
     /// List container image tags for a repo on its configured forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "List container image tags for a repository",
         params(
             org = "Organization name",
@@ -174,7 +174,7 @@ impl ImagesHub {
     }
 
     /// List all container packages for an org across its configured forges
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "List all container packages for an organization across forges",
         params(
             org = "Organization name",
@@ -279,7 +279,7 @@ impl ImagesHub {
     }
 
     /// Build and push a container image to forge registries
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Build a Docker image and push to configured forge registries. Uses native Docker API via bollard.",
         params(
             org = "Organization name",
@@ -514,7 +514,7 @@ impl ImagesHub {
     }
 
     /// Delete a container image tag
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         description = "Delete a container image tag from a forge registry. Requires --confirm true.",
         params(
             org = "Organization name",
@@ -592,8 +592,8 @@ impl ChildRouter for ImagesHub {
         "images"
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth).await
     }
 
     async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {

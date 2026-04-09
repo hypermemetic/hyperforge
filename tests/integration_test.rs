@@ -14,7 +14,7 @@ async fn test_hyperforge_as_plugin() {
     let hub = Arc::new(DynamicHub::new("testhub").register(hyperforge));
 
     // Call hyperforge.status via DynamicHub routing
-    let mut stream = hub.route("hyperforge.status", serde_json::json!({})).await.unwrap();
+    let mut stream = hub.route("hyperforge.status", serde_json::json!({}), None).await.unwrap();
 
     let mut found_status = false;
     while let Some(item) = stream.next().await {
