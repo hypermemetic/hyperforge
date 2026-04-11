@@ -23,9 +23,9 @@ path = "src/bin/hyperforge-ssh.rs"
 
 [dependencies]
 # Hub framework integration
-plexus-core = { path = "../plexus-core", version = "0.4" }
-plexus-macros = { path = "../plexus-macros", version = "0.4" }
-plexus-transport = { path = "../plexus-transport", version = "0.2" }
+plexus-core = "0.4"
+plexus-macros = "0.4"
+plexus-transport = "0.2"
 
 # Async
 tokio = { version = "1", features = ["full"] }
