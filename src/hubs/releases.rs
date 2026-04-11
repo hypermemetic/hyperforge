@@ -608,18 +608,3 @@ async fn resolve_target_forges(
         }
     }
 }
-
-#[async_trait]
-impl ChildRouter for ReleasesHub {
-    fn router_namespace(&self) -> &str {
-        "releases"
-    }
-
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params, auth).await
-    }
-
-    async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
-        None // Leaf plugin
-    }
-}

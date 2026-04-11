@@ -512,18 +512,3 @@ impl BuildHub {
         dist::dist_init(path, include, exclude, channels, targets, brew_tap, force, dry_run)
     }
 }
-
-#[async_trait]
-impl ChildRouter for BuildHub {
-    fn router_namespace(&self) -> &str {
-        "build"
-    }
-
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params, auth).await
-    }
-
-    async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
-        None // Leaf plugin
-    }
-}

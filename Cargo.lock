@@ -1673,6 +1673,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "http",
  "jsonrpsee",
  "plexus-macros",
  "rmcp",
@@ -1703,9 +1704,11 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "bytes",
  "form_urlencoded",
  "futures",
  "http",
+ "http-body",
  "jsonrpsee",
  "plexus-core",
  "rmcp",
@@ -1713,6 +1716,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "tracing",
 ]
 

@@ -2800,18 +2800,3 @@ async fn sync_retire_remote_only(
 
     (events, staged_count, purged_count, protected_skipped)
 }
-
-#[async_trait]
-impl ChildRouter for WorkspaceHub {
-    fn router_namespace(&self) -> &str {
-        "workspace"
-    }
-
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params, auth).await
-    }
-
-    async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
-        None // Leaf plugin
-    }
-}

@@ -4,6 +4,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
+use plexus_core::request::RawRequestContext;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2194,8 +2195,8 @@ impl ChildRouter for RepoHub {
         "repo"
     }
 
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params, auth).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>, raw_ctx: Option<&RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        Activation::call(self, method, params, auth, raw_ctx).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
