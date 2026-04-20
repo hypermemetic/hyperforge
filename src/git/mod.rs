@@ -862,13 +862,42 @@ pub fn force_push_with_retry(path: &Path, remote: &str, branch: &str) -> GitResu
     })
 }
 
-/// Build a git remote URL for a forge
+/// Git transport for remote URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Ssh,
+    Https,
+}
+
+impl Transport {
+    /// Default transport: reads `HYPERFORGE_TRANSPORT=https|ssh`, falls back to Ssh.
+    pub fn from_env() -> Self {
+        match std::env::var("HYPERFORGE_TRANSPORT").ok().as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("https") => Transport::Https,
+            _ => Transport::Ssh,
+        }
+    }
+}
+
+/// Build a git remote URL for a forge, picking transport from env (ssh by default).
 pub fn build_remote_url(forge: &str, org: &str, repo: &str) -> String {
-    match forge.to_lowercase().as_str() {
-        "github" => format!("git@github.com:{}/{}.git", org, repo),
-        "codeberg" => format!("git@codeberg.org:{}/{}.git", org, repo),
-        "gitlab" => format!("git@gitlab.com:{}/{}.git", org, repo),
-        _ => format!("git@{}:{}/{}.git", forge, org, repo),
+    build_remote_url_with(forge, org, repo, Transport::from_env())
+}
+
+/// Build a git remote URL for a forge with an explicit transport.
+pub fn build_remote_url_with(forge: &str, org: &str, repo: &str, transport: Transport) -> String {
+    let host = match forge.to_lowercase().as_str() {
+        "github" => "github.com",
+        "codeberg" => "codeberg.org",
+        "gitlab" => "gitlab.com",
+        other => return match transport {
+            Transport::Ssh => format!("git@{}:{}/{}.git", other, org, repo),
+            Transport::Https => format!("https://{}/{}/{}.git", other, org, repo),
+        },
+    };
+    match transport {
+        Transport::Ssh => format!("git@{}:{}/{}.git", host, org, repo),
+        Transport::Https => format!("https://{}/{}/{}.git", host, org, repo),
     }
 }
 
@@ -934,18 +963,34 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_build_remote_url() {
+    fn test_build_remote_url_ssh() {
         assert_eq!(
-            build_remote_url("github", "alice", "my-repo"),
+            build_remote_url_with("github", "alice", "my-repo", Transport::Ssh),
             "git@github.com:alice/my-repo.git"
         );
         assert_eq!(
-            build_remote_url("codeberg", "bob", "tool"),
+            build_remote_url_with("codeberg", "bob", "tool", Transport::Ssh),
             "git@codeberg.org:bob/tool.git"
         );
         assert_eq!(
-            build_remote_url("gitlab", "org", "project"),
+            build_remote_url_with("gitlab", "org", "project", Transport::Ssh),
             "git@gitlab.com:org/project.git"
+        );
+    }
+
+    #[test]
+    fn test_build_remote_url_https() {
+        assert_eq!(
+            build_remote_url_with("github", "alice", "my-repo", Transport::Https),
+            "https://github.com/alice/my-repo.git"
+        );
+        assert_eq!(
+            build_remote_url_with("codeberg", "bob", "tool", Transport::Https),
+            "https://codeberg.org/bob/tool.git"
+        );
+        assert_eq!(
+            build_remote_url_with("gitlab", "org", "project", Transport::Https),
+            "https://gitlab.com/org/project.git"
         );
     }
 
