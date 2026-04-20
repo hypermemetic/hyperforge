@@ -94,6 +94,36 @@ pub enum OrgAddFailureReason {
     IoError,
 }
 
+/// Machine-readable discriminator for why `orgs_update` refused a request.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgUpdateFailureReason {
+    /// No org config exists for the given name.
+    NotFound,
+    /// The caller supplied no mutation fields (neither ssh nor workspace_path).
+    NoFieldsToUpdate,
+    /// An I/O or serialization error occurred while writing the config.
+    IoError,
+}
+
+/// Machine-readable description of what `orgs_update` did (or would do, in
+/// dry-run mode). A single call can produce multiple operations — e.g. an
+/// ssh merge plus a workspace_path clear.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OrgUpdateOp {
+    /// Per-field merge: ssh fields the caller provided were upserted;
+    /// fields the caller omitted were left alone.
+    SshMerged,
+    /// Whole-record replacement: the persisted ssh state now equals
+    /// exactly what the caller provided.
+    SshReplaced,
+    /// `workspace_path` set to a specific value.
+    WorkspacePathSet,
+    /// `workspace_path` cleared (absent in the stored config afterwards).
+    WorkspacePathCleared,
+}
+
 /// Hyperforge event types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -366,6 +396,22 @@ pub enum HyperforgeEvent {
     OrgAddFailed {
         org: String,
         reason: OrgAddFailureReason,
+        message: String,
+    },
+    /// Result of `orgs_update` — an org config was mutated (or would have
+    /// been, in dry-run mode). `operations` enumerates every distinct
+    /// action performed, so callers can verify merge vs replace vs
+    /// workspace_path changes from the event stream alone.
+    OrgUpdated {
+        org: String,
+        dry_run: bool,
+        operations: Vec<OrgUpdateOp>,
+    },
+    /// `orgs_update` refused the request. `reason` is a machine-readable
+    /// discriminator.
+    OrgUpdateFailed {
+        org: String,
+        reason: OrgUpdateFailureReason,
         message: String,
     },
     /// Progress step during build release orchestration
@@ -1093,6 +1139,123 @@ impl HyperforgeHub {
             yield HyperforgeEvent::OrgAdded {
                 org: org.clone(),
                 dry_run: false,
+            };
+        }
+    }
+
+    /// Update an existing organization — mutate ssh keys and/or workspace_path
+    #[plexus_macros::method(
+        description = "Update an existing org's ssh map and/or workspace_path. For ssh, the default is per-field merge; pass --replace true for whole-record replacement. For workspace_path: omit to keep current, pass an empty string to clear, or a non-empty value to set.",
+        params(
+            org = "Organization name (must already exist)",
+            ssh = "SSH key paths per forge (optional). One field per known forge — Synapse emits per-forge flags like --ssh.github.",
+            workspace_path = "Workspace path — omit to keep current, empty string clears, non-empty sets (optional)",
+            replace = "For ssh: replace the whole record instead of per-field merge (optional, default: false)",
+            dry_run = "Preview without writing state (optional, default: false)"
+        )
+    )]
+    pub async fn orgs_update(
+        &self,
+        org: String,
+        ssh: Option<crate::config::OrgSshKeys>,
+        workspace_path: Option<String>,
+        replace: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+        let do_replace = replace.unwrap_or(false);
+
+        stream! {
+            // 1. Require the org to exist. `OrgConfig::load` returns a
+            //    default on missing, which would silently create-on-update —
+            //    so check the file directly.
+            let config_path = OrgConfig::config_path(&config_dir, &org);
+            if !config_path.exists() {
+                yield HyperforgeEvent::OrgUpdateFailed {
+                    org: org.clone(),
+                    reason: OrgUpdateFailureReason::NotFound,
+                    message: format!(
+                        "Organization '{}' not found at {}. Use orgs_add to create it.",
+                        org, config_path.display(),
+                    ),
+                };
+                return;
+            }
+
+            // 2. Nothing to do? Three-intent semantics for workspace_path
+            //    mean "Some(anything)" counts as an update (including
+            //    Some("") = clear). A missing ssh record with no
+            //    workspace_path is the only no-op case.
+            //
+            //    Note: --replace true with no ssh field is still
+            //    meaningful — it wipes the existing ssh map. But we only
+            //    honour --replace when the caller actually provided an
+            //    ssh parameter (even an empty one). That way, a caller
+            //    who omits ssh entirely cannot accidentally wipe the
+            //    stored keys just by setting replace=true.
+            if ssh.is_none() && workspace_path.is_none() {
+                yield HyperforgeEvent::OrgUpdateFailed {
+                    org: org.clone(),
+                    reason: OrgUpdateFailureReason::NoFieldsToUpdate,
+                    message: format!(
+                        "No mutation fields supplied for org '{}'. Provide ssh and/or workspace_path.",
+                        org,
+                    ),
+                };
+                return;
+            }
+
+            // 3. Load existing config, compute new state, record operations.
+            let mut current = OrgConfig::load(&config_dir, &org);
+            let mut operations: Vec<OrgUpdateOp> = Vec::new();
+
+            if let Some(keys) = ssh {
+                if do_replace {
+                    current.ssh = keys.into_map();
+                    operations.push(OrgUpdateOp::SshReplaced);
+                } else {
+                    for (forge, path) in keys.iter() {
+                        current.ssh.insert(forge.to_string(), path.to_string());
+                    }
+                    operations.push(OrgUpdateOp::SshMerged);
+                }
+            }
+
+            if let Some(wp) = workspace_path {
+                if wp.is_empty() {
+                    current.workspace_path = None;
+                    operations.push(OrgUpdateOp::WorkspacePathCleared);
+                } else {
+                    current.workspace_path = Some(wp);
+                    operations.push(OrgUpdateOp::WorkspacePathSet);
+                }
+            }
+
+            // 4. Dry-run: report what would happen, do not write.
+            if is_dry_run {
+                yield HyperforgeEvent::OrgUpdated {
+                    org: org.clone(),
+                    dry_run: true,
+                    operations,
+                };
+                return;
+            }
+
+            // 5. Persist.
+            if let Err(e) = current.save(&config_dir, &org) {
+                yield HyperforgeEvent::OrgUpdateFailed {
+                    org: org.clone(),
+                    reason: OrgUpdateFailureReason::IoError,
+                    message: format!("Failed to save org config: {}", e),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::OrgUpdated {
+                org: org.clone(),
+                dry_run: false,
+                operations,
             };
         }
     }

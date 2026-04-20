@@ -2,7 +2,9 @@
 
 use futures::StreamExt;
 use plexus_core::plexus::{DynamicHub, PlexusStreamItem};
-use hyperforge::{HyperforgeEvent, HyperforgeHub, OrgAddFailureReason};
+use hyperforge::{
+    HyperforgeEvent, HyperforgeHub, OrgAddFailureReason, OrgUpdateFailureReason, OrgUpdateOp,
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -298,4 +300,245 @@ async fn test_orgs_add_ssh_omitted_creates_empty_ssh_map() {
     assert!(events.iter().any(|e| matches!(e, HyperforgeEvent::OrgAdded { org, dry_run: false } if org == "noshh")));
 
     assert!(list_orgs(&hub).await.contains(&"noshh".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// orgs_update (ORGS-3)
+// ---------------------------------------------------------------------------
+
+/// Read the current OrgConfig for `org` from disk, under the hub's config dir.
+fn read_org_toml(tmp: &TempDir, org: &str) -> toml::Value {
+    let p = tmp.path().join("orgs").join(format!("{}.toml", org));
+    let raw = std::fs::read_to_string(&p).unwrap_or_default();
+    toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()))
+}
+
+/// Extract the `ssh.<forge>` value for an org, if present.
+fn ssh_value(tmp: &TempDir, org: &str, forge: &str) -> Option<String> {
+    read_org_toml(tmp, org)
+        .get("ssh")
+        .and_then(|v| v.get(forge))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract the top-level workspace_path of an org, if present.
+fn ws_path_value(tmp: &TempDir, org: &str) -> Option<String> {
+    read_org_toml(tmp, org)
+        .get("workspace_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Seed an org named `upd` with only github ssh (acceptance-criterion #1 setup).
+async fn seed_upd_org(hub: &DynamicHub) {
+    drain_hyperforge_events(hub, "hyperforge.orgs_add", serde_json::json!({
+        "org": "upd",
+        "ssh": { "github": "/tmp/gh_initial" },
+    })).await;
+}
+
+#[tokio::test]
+async fn test_orgs_update_not_found_is_distinguishable() {
+    let (hub, _tmp) = test_hub();
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "ghost",
+        "ssh": { "github": "/tmp/gh" },
+    })).await;
+
+    let failure = events.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdateFailed { org, reason, .. } => Some((org.clone(), reason.clone())),
+        _ => None,
+    }).expect("missing-org update should emit OrgUpdateFailed");
+
+    assert_eq!(failure.0, "ghost");
+    assert_eq!(failure.1, OrgUpdateFailureReason::NotFound);
+}
+
+#[tokio::test]
+async fn test_orgs_update_no_fields_is_distinguishable() {
+    let (hub, _tmp) = test_hub();
+    seed_upd_org(&hub).await;
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+    })).await;
+
+    let failure = events.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdateFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    }).expect("no-fields update should emit OrgUpdateFailed");
+    assert_eq!(failure, OrgUpdateFailureReason::NoFieldsToUpdate,
+        "no-fields must be distinguishable from not-found");
+}
+
+#[tokio::test]
+async fn test_orgs_update_not_found_distinct_from_no_fields() {
+    let (hub, _tmp) = test_hub();
+    seed_upd_org(&hub).await;
+
+    let not_found = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "ghost",
+        "ssh": { "github": "/tmp/gh" },
+    })).await;
+    let no_fields = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+    })).await;
+
+    let nf_reason = not_found.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdateFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    }).unwrap();
+    let nf2_reason = no_fields.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdateFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    }).unwrap();
+
+    assert_ne!(nf_reason, nf2_reason,
+        "callers must be able to distinguish not-found from no-fields-to-update");
+}
+
+#[tokio::test]
+async fn test_orgs_update_dry_run_does_not_persist() {
+    let (hub, tmp) = test_hub();
+    seed_upd_org(&hub).await;
+
+    let before = read_org_toml(&tmp, "upd");
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "ssh": { "codeberg": "/tmp/cb_new" },
+        "dry_run": true,
+    })).await;
+
+    let success = events.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdated { dry_run, operations, .. } => Some((*dry_run, operations.clone())),
+        _ => None,
+    }).expect("dry-run should emit OrgUpdated");
+    assert!(success.0, "dry_run flag must be true");
+    assert_eq!(success.1, vec![OrgUpdateOp::SshMerged]);
+
+    let after = read_org_toml(&tmp, "upd");
+    assert_eq!(before, after, "dry-run must not mutate the on-disk TOML");
+}
+
+#[tokio::test]
+async fn test_orgs_update_default_merge_preserves_other_fields() {
+    let (hub, tmp) = test_hub();
+    // Seed with github and codeberg
+    drain_hyperforge_events(&hub, "hyperforge.orgs_add", serde_json::json!({
+        "org": "upd",
+        "ssh": { "github": "/tmp/gh_old", "codeberg": "/tmp/cb_old" },
+    })).await;
+
+    // Update only github
+    let events = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "ssh": { "github": "/tmp/gh_NEW" },
+    })).await;
+    assert!(events.iter().any(|e| matches!(e, HyperforgeEvent::OrgUpdated {
+        operations, dry_run: false, ..
+    } if operations == &vec![OrgUpdateOp::SshMerged])));
+
+    // github updated, codeberg untouched
+    assert_eq!(ssh_value(&tmp, "upd", "github").as_deref(), Some("/tmp/gh_NEW"));
+    assert_eq!(ssh_value(&tmp, "upd", "codeberg").as_deref(), Some("/tmp/cb_old"));
+}
+
+#[tokio::test]
+async fn test_orgs_update_replace_wipes_untouched_fields() {
+    let (hub, tmp) = test_hub();
+    // Seed with both github and codeberg
+    drain_hyperforge_events(&hub, "hyperforge.orgs_add", serde_json::json!({
+        "org": "upd",
+        "ssh": { "github": "/tmp/gh", "codeberg": "/tmp/cb" },
+    })).await;
+
+    // Replace with empty ssh record (ssh passed, all fields None)
+    let events = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "ssh": {},
+        "replace": true,
+    })).await;
+
+    let ok = events.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdated { operations, dry_run: false, .. } => Some(operations.clone()),
+        _ => None,
+    }).expect("replace should succeed");
+    assert!(ok.contains(&OrgUpdateOp::SshReplaced),
+        "replace must surface SshReplaced, not SshMerged, got {:?}", ok);
+
+    assert_eq!(ssh_value(&tmp, "upd", "github"), None, "github must be wiped");
+    assert_eq!(ssh_value(&tmp, "upd", "codeberg"), None, "codeberg must be wiped");
+}
+
+#[tokio::test]
+async fn test_orgs_update_workspace_path_three_intents() {
+    let (hub, tmp) = test_hub();
+    seed_upd_org(&hub).await;
+
+    // Intent: SET
+    let set = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "workspace_path": "/tmp/x",
+    })).await;
+    let set_ops = set.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdated { operations, .. } => Some(operations.clone()),
+        _ => None,
+    }).unwrap();
+    assert!(set_ops.contains(&OrgUpdateOp::WorkspacePathSet));
+    assert_eq!(ws_path_value(&tmp, "upd").as_deref(), Some("/tmp/x"));
+
+    // Intent: KEEP — ssh mutation with workspace_path omitted.
+    let keep = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "ssh": { "github": "/tmp/keep" },
+    })).await;
+    // Must NOT contain a WorkspacePath* op.
+    let keep_ops = keep.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdated { operations, .. } => Some(operations.clone()),
+        _ => None,
+    }).unwrap();
+    assert!(!keep_ops.contains(&OrgUpdateOp::WorkspacePathSet));
+    assert!(!keep_ops.contains(&OrgUpdateOp::WorkspacePathCleared));
+    assert_eq!(ws_path_value(&tmp, "upd").as_deref(), Some("/tmp/x"),
+        "omitted workspace_path must preserve the prior value");
+
+    // Intent: CLEAR — empty string.
+    let clear = drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "workspace_path": "",
+    })).await;
+    let clear_ops = clear.iter().find_map(|e| match e {
+        HyperforgeEvent::OrgUpdated { operations, .. } => Some(operations.clone()),
+        _ => None,
+    }).unwrap();
+    assert!(clear_ops.contains(&OrgUpdateOp::WorkspacePathCleared));
+    assert_eq!(ws_path_value(&tmp, "upd"), None,
+        "clear intent must leave workspace_path absent from persisted TOML");
+}
+
+#[tokio::test]
+async fn test_orgs_update_round_trip_through_orgs_list() {
+    let (hub, _tmp) = test_hub();
+    seed_upd_org(&hub).await;
+
+    // Add codeberg (merge), set a workspace_path, all in one call
+    drain_hyperforge_events(&hub, "hyperforge.orgs_update", serde_json::json!({
+        "org": "upd",
+        "ssh": { "codeberg": "/tmp/cb_rt" },
+        "workspace_path": "/tmp/upd_ws",
+    })).await;
+
+    // orgs_list must surface both forges + the new workspace_path.
+    let list = drain_hyperforge_events(&hub, "hyperforge.orgs_list", serde_json::json!({})).await;
+    let line = list.iter().find_map(|e| match e {
+        HyperforgeEvent::Info { message } if message.contains("upd ") => Some(message.clone()),
+        _ => None,
+    }).expect("orgs_list must include upd");
+
+    assert!(line.contains("/tmp/upd_ws"), "workspace_path missing from list: {}", line);
+    assert!(line.contains("github"), "github forge missing from list: {}", line);
+    assert!(line.contains("codeberg"), "codeberg forge missing from list: {}", line);
 }

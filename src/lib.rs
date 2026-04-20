@@ -26,6 +26,8 @@ pub use plexus_core::serde_helpers;
 pub use adapters::{ForgePort, LocalForge};
 pub use auth_hub::{AuthEvent, AuthHub};
 pub use config::HyperforgeConfig;
-pub use hub::{HyperforgeEvent, HyperforgeHub, OrgAddFailureReason};
+pub use hub::{
+    HyperforgeEvent, HyperforgeHub, OrgAddFailureReason, OrgUpdateFailureReason, OrgUpdateOp,
+};
 pub use services::{SymmetricSyncService, SyncDiff, SyncOp};
 pub use types::*;
