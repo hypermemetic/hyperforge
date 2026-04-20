@@ -1,5 +1,12 @@
 # Auth Plugin Implementation
 
+> **Status: Historical / retrospective.** The AUTH epic has shipped. This document captures the design rationale and the in-progress state during the rollout. Details that are now stale:
+> - Default port is **44104** (not 4444). The auth sidecar port is 4445.
+> - Namespace for the auth hub is **`secrets`** (not `auth`).
+> - CLI method names are space-separated (`repo list`, `workspace diff`) — not the underscore form (`repos_list`, `workspace_diff`) used in this document.
+>
+> For current usage, see [`README.md`](README.md) and [`docs/workspace-sync-guide.md`](docs/workspace-sync-guide.md). Keep this file for the architecture/rationale narrative; don't use it as a command reference.
+
 ## Overview
 
 This document describes the auth plugin implementation for hyperforge, including architecture, usage, testing, and remaining work.
