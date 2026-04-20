@@ -56,6 +56,7 @@ synapse substrate hyperforge reload
 
 # Orgs
 synapse substrate hyperforge orgs_list
+synapse substrate hyperforge orgs_add    --org <org> --ssh.github ~/.ssh/gh --workspace_path /path/to/ws
 synapse substrate hyperforge orgs_delete --org <org>
 
 # Config

@@ -82,6 +82,18 @@ pub enum PublishActionKind {
     Failed,
 }
 
+/// Machine-readable discriminator for why `orgs_add` refused a request.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgAddFailureReason {
+    /// The `org` value was empty or contained a path separator / null byte.
+    InvalidName,
+    /// An org config already exists for this name.
+    AlreadyExists,
+    /// An I/O or serialization error occurred while writing the config.
+    IoError,
+}
+
 /// Hyperforge event types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -343,6 +355,19 @@ pub enum HyperforgeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// Result of `orgs_add` — an organization was created (or would have been, in dry-run mode).
+    OrgAdded {
+        org: String,
+        /// True when this was a preview (`dry_run: true`); no file was written.
+        dry_run: bool,
+    },
+    /// `orgs_add` refused the request. `reason` is a machine-readable
+    /// discriminator: callers can match on it without parsing `message`.
+    OrgAddFailed {
+        org: String,
+        reason: OrgAddFailureReason,
+        message: String,
+    },
     /// Progress step during build release orchestration
     ReleaseBuildStep {
         repo_name: String,
@@ -459,6 +484,15 @@ impl HyperforgeHub {
     pub fn new() -> Self {
         Self {
             state: HyperforgeState::new(),
+        }
+    }
+
+    /// Create a HyperforgeHub rooted at an arbitrary config directory.
+    ///
+    /// Tests use this to isolate disk I/O under a tempdir.
+    pub fn new_with_config_dir(config_dir: std::path::PathBuf) -> Self {
+        Self {
+            state: HyperforgeState::new_with_config_dir(config_dir),
         }
     }
 }
@@ -963,6 +997,102 @@ impl HyperforgeHub {
 
             yield HyperforgeEvent::Info {
                 message: format!("{} org(s) configured.", orgs.len()),
+            };
+        }
+    }
+
+    /// Add a new organization — creates its TOML config from RPC parameters
+    #[plexus_macros::method(
+        description = "Create a new org config from RPC parameters. Validates the org name, rejects if an org with this name already exists, and supports dry-run. Composes with `orgs_delete` + `orgs_add` for renames.",
+        params(
+            org = "Organization name (must not be empty or contain path separators)",
+            ssh = "SSH key paths per forge (optional). One field per known forge — Synapse emits per-forge flags like --ssh.github.",
+            workspace_path = "Workspace directory path for this org's repos (optional)",
+            dry_run = "Preview without writing state (optional, default: false)"
+        )
+    )]
+    pub async fn orgs_add(
+        &self,
+        org: String,
+        ssh: Option<crate::config::OrgSshKeys>,
+        workspace_path: Option<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        stream! {
+            // 1. Validate the org name.
+            //
+            // Reject empty, any path-separator char, any ".." component, any
+            // null byte, or any whitespace. The orgs TOML lives on disk at
+            // <config_dir>/orgs/<org>.toml — containment in that directory
+            // is a safety property.
+            let is_invalid = org.is_empty()
+                || org.contains('/')
+                || org.contains('\\')
+                || org.contains('\0')
+                || org.contains("..")
+                || org.chars().any(|c| c.is_whitespace());
+
+            if is_invalid {
+                yield HyperforgeEvent::OrgAddFailed {
+                    org: org.clone(),
+                    reason: OrgAddFailureReason::InvalidName,
+                    message: format!(
+                        "Invalid org name {:?}: must be non-empty and must not contain path separators, '..', whitespace, or null bytes.",
+                        org,
+                    ),
+                };
+                return;
+            }
+
+            // 2. Reject if the org config already exists.
+            let config_path = OrgConfig::config_path(&config_dir, &org);
+            if config_path.exists() {
+                yield HyperforgeEvent::OrgAddFailed {
+                    org: org.clone(),
+                    reason: OrgAddFailureReason::AlreadyExists,
+                    message: format!(
+                        "Organization '{}' already exists at {}. Use orgs_update to modify, or orgs_delete then orgs_add to replace.",
+                        org,
+                        config_path.display(),
+                    ),
+                };
+                return;
+            }
+
+            // 3. Build the new config from the typed record.
+            let mut new_config = OrgConfig::default();
+            if let Some(keys) = ssh {
+                new_config.ssh = keys.into_map();
+            }
+            if let Some(wp) = workspace_path {
+                new_config.workspace_path = Some(wp);
+            }
+
+            // 4. Dry-run: no write.
+            if is_dry_run {
+                yield HyperforgeEvent::OrgAdded {
+                    org: org.clone(),
+                    dry_run: true,
+                };
+                return;
+            }
+
+            // 5. Persist.
+            if let Err(e) = new_config.save(&config_dir, &org) {
+                yield HyperforgeEvent::OrgAddFailed {
+                    org: org.clone(),
+                    reason: OrgAddFailureReason::IoError,
+                    message: format!("Failed to save org config: {}", e),
+                };
+                return;
+            }
+
+            yield HyperforgeEvent::OrgAdded {
+                org: org.clone(),
+                dry_run: false,
             };
         }
     }

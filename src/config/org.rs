@@ -20,6 +20,65 @@ pub struct OrgConfig {
     pub workspace_path: Option<String>,
 }
 
+/// Typed record of SSH key paths by forge.
+///
+/// This is the RPC-parameter shape for `orgs_add` and `orgs_update`. Each
+/// field corresponds to a known forge. The closed set of forges is
+/// expressed by the struct's field set — unknown forges are rejected at
+/// the CLI parse layer (Synapse), before the call reaches the hub. To
+/// add support for a new forge, add a field here.
+///
+/// `JsonSchema` is required so Synapse can emit per-forge CLI flags
+/// (e.g. `--ssh.github <path>`) instead of a single JSON-blob flag.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct OrgSshKeys {
+    /// Path to the GitHub SSH private key for this org
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<String>,
+
+    /// Path to the Codeberg SSH private key for this org
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codeberg: Option<String>,
+
+    /// Path to the GitLab SSH private key for this org
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gitlab: Option<String>,
+}
+
+impl OrgSshKeys {
+    /// True if every field is None.
+    pub fn is_empty(&self) -> bool {
+        self.github.is_none() && self.codeberg.is_none() && self.gitlab.is_none()
+    }
+
+    /// Yield the set fields as (forge_name, key_path) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("github", self.github.as_deref()),
+            ("codeberg", self.codeberg.as_deref()),
+            ("gitlab", self.gitlab.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(forge, val)| val.map(|v| (forge, v)))
+    }
+
+    /// Convert into a `HashMap<String, String>` of the set fields.
+    pub fn into_map(self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        if let Some(v) = self.github {
+            out.insert("github".to_string(), v);
+        }
+        if let Some(v) = self.codeberg {
+            out.insert("codeberg".to_string(), v);
+        }
+        if let Some(v) = self.gitlab {
+            out.insert("gitlab".to_string(), v);
+        }
+        out
+    }
+}
+
 impl OrgConfig {
     /// Path to the org config file: ~/.config/hyperforge/orgs/{org}.toml
     pub fn config_path(config_dir: &Path, org: &str) -> PathBuf {

@@ -4,6 +4,7 @@
 > - Default port is **44104** (not 4444). The auth sidecar port is 4445.
 > - Namespace for the auth hub is **`secrets`** (not `auth`).
 > - CLI method names are space-separated (`repo list`, `workspace diff`) — not the underscore form (`repos_list`, `workspace_diff`) used in this document.
+> - Org CRUD via RPC: `orgs_add` (and `orgs_update`) now exist on the root hub — see `README.md` and ORGS epic in `plans/ORGS/`. Hand-editing `~/.config/hyperforge/orgs/<org>.toml` is no longer the only onboarding path.
 >
 > For current usage, see [`README.md`](README.md) and [`docs/workspace-sync-guide.md`](docs/workspace-sync-guide.md). Keep this file for the architecture/rationale narrative; don't use it as a command reference.
 

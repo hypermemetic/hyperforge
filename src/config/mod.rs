@@ -6,7 +6,7 @@
 
 pub mod org;
 
-pub use org::OrgConfig;
+pub use org::{OrgConfig, OrgSshKeys};
 
 use crate::types::{Forge, Visibility};
 use serde::{Deserialize, Serialize};

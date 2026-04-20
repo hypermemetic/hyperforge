@@ -37,6 +37,14 @@ impl HyperforgeState {
             .join(".config")
             .join("hyperforge");
 
+        Self::new_with_config_dir(config_dir)
+    }
+
+    /// Create a state rooted at an arbitrary config directory.
+    ///
+    /// Tests use this to isolate disk I/O under a tempdir instead of the
+    /// real `~/.config/hyperforge`.
+    pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
             sync_service: Arc::new(SymmetricSyncService::new()),
             local_forges: Arc::new(RwLock::new(HashMap::new())),
