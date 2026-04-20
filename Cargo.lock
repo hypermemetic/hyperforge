@@ -563,7 +563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1666,6 +1666,8 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "plexus-core"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a78d85244ccd3d69c023fc1ae0d012cfa1b7eeccd30dd5af13ecb5165dc0ec1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1690,6 +1692,8 @@ dependencies = [
 [[package]]
 name = "plexus-macros"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80f2fca57b169e0e82cbae88676b0be2e3b52f8919e533bdaa617c30d02787d0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1700,6 +1704,8 @@ dependencies = [
 [[package]]
 name = "plexus-transport"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e9bd5a41b6aaf6b7287c33106b214e72aefe193aa20fd2365d17e5aa1412e46"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2060,7 +2066,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2533,7 +2539,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
