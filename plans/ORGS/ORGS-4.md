@@ -1,7 +1,7 @@
 ---
 id: ORGS-4
 title: "Epic checkpoint — state of org CRUD against user stories"
-status: Pending
+status: Complete
 type: checkpoint
 blocked_by: [ORGS-2, ORGS-3]
 unlocks: []
