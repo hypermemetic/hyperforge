@@ -58,22 +58,22 @@ pub struct ForgeStatus {
 
 impl ForgeStatus {
     /// Check if this forge is up to date
-    pub fn is_up_to_date(&self) -> bool {
+    pub const fn is_up_to_date(&self) -> bool {
         self.remote_exists && self.ahead == 0 && self.behind == 0 && self.error.is_none()
     }
 
     /// Check if needs push (ahead of remote)
-    pub fn needs_push(&self) -> bool {
+    pub const fn needs_push(&self) -> bool {
         self.ahead > 0
     }
 
     /// Check if needs pull (behind remote)
-    pub fn needs_pull(&self) -> bool {
+    pub const fn needs_pull(&self) -> bool {
         self.behind > 0
     }
 
     /// Get a status symbol
-    pub fn symbol(&self) -> &'static str {
+    pub const fn symbol(&self) -> &'static str {
         if self.error.is_some() {
             "✗"
         } else if !self.remote_exists {
@@ -94,7 +94,7 @@ impl ForgeStatus {
     /// Get a human-readable status message
     pub fn message(&self) -> String {
         if let Some(ref err) = self.error {
-            return format!("error: {}", err);
+            return format!("error: {err}");
         }
 
         if !self.remote_exists {
@@ -148,21 +148,21 @@ pub struct RepoStatusReport {
 impl RepoStatusReport {
     /// Check if all forges are up to date
     pub fn all_up_to_date(&self) -> bool {
-        self.forges.iter().all(|f| f.is_up_to_date())
+        self.forges.iter().all(ForgeStatus::is_up_to_date)
     }
 
     /// Check if any forge needs push
     pub fn needs_push(&self) -> bool {
-        self.forges.iter().any(|f| f.needs_push())
+        self.forges.iter().any(ForgeStatus::needs_push)
     }
 
     /// Check if any forge needs pull
     pub fn needs_pull(&self) -> bool {
-        self.forges.iter().any(|f| f.needs_pull())
+        self.forges.iter().any(ForgeStatus::needs_pull)
     }
 
     /// Check if working tree is clean
-    pub fn is_clean(&self) -> bool {
+    pub const fn is_clean(&self) -> bool {
         !self.has_changes && !self.has_staged && !self.has_untracked
     }
 
@@ -215,7 +215,7 @@ impl RepoStatusReport {
 /// * `path` - Path to the repository
 ///
 /// # Returns
-/// RepoStatusReport with status information
+/// `RepoStatusReport` with status information
 pub fn status(path: &Path) -> StatusResult<RepoStatusReport> {
     // Check if hyperforge config exists
     if !HyperforgeConfig::exists(path) {
@@ -267,7 +267,7 @@ pub fn status(path: &Path) -> StatusResult<RepoStatusReport> {
                         forge_status.behind = behind;
                     }
                     Err(e) => {
-                        forge_status.error = Some(format!("Failed to get sync status: {}", e));
+                        forge_status.error = Some(format!("Failed to get sync status: {e}"));
                     }
                 }
             }
@@ -454,7 +454,7 @@ mod tests {
 
         let error = ForgeStatus {
             error: Some("network error".to_string()),
-            ..up_to_date.clone()
+            ..up_to_date
         };
         assert_eq!(error.symbol(), "✗");
     }
@@ -487,7 +487,7 @@ mod tests {
 
         let not_configured = ForgeStatus {
             remote_exists: false,
-            ..up_to_date.clone()
+            ..up_to_date
         };
         assert_eq!(not_configured.message(), "remote not configured");
     }

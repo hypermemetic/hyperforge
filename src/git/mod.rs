@@ -47,7 +47,7 @@ pub(crate) fn command_error_message(output: &std::process::Output) -> String {
     } else if stderr.is_empty() {
         stdout.to_string()
     } else {
-        format!("{}\n{}", stderr, stdout)
+        format!("{stderr}\n{stdout}")
     }
 }
 
@@ -101,7 +101,7 @@ fn is_transient_push_error(msg: &str) -> bool {
 }
 
 /// Run a git push command with retry logic for transient failures.
-/// Retries up to PUSH_MAX_RETRIES times with exponential backoff.
+/// Retries up to `PUSH_MAX_RETRIES` times with exponential backoff.
 fn push_with_retry<F>(mut attempt: F) -> GitResult<()>
 where
     F: FnMut() -> GitResult<()>,
@@ -185,7 +185,7 @@ impl Git {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Self::parse_remotes(&stdout)
+        Ok(Self::parse_remotes(&stdout))
     }
 
     /// Get a specific remote's info
@@ -277,9 +277,7 @@ impl Git {
 
         // Expand ~ in key path
         let expanded_path = if key_path.starts_with("~/") {
-            dirs::home_dir()
-                .map(|h| h.join(&key_path[2..]))
-                .unwrap_or_else(|| key_path.into())
+            dirs::home_dir().map_or_else(|| key_path.into(), |h| h.join(&key_path[2..]))
         } else {
             key_path.into()
         };
@@ -338,7 +336,7 @@ impl Git {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Self::parse_branch_status(&stdout)
+        Ok(Self::parse_branch_status(&stdout))
     }
 
     /// Get repository status (changes, staged, untracked)
@@ -399,7 +397,7 @@ impl Git {
 
         let path = path.to_path_buf();
         let remote = remote.to_string();
-        let branch = branch.map(|b| b.to_string());
+        let branch = branch.map(std::string::ToString::to_string);
 
         push_with_retry(move || {
             let mut args = vec!["push".to_string(), remote.clone()];
@@ -527,9 +525,9 @@ impl Git {
     pub fn ahead_behind(path: &Path, remote: &str, branch: &str) -> GitResult<(u32, u32)> {
         Self::ensure_repo(path)?;
 
-        let upstream = format!("{}/{}", remote, branch);
+        let upstream = format!("{remote}/{branch}");
         let output = Command::new("git")
-            .args(["rev-list", "--left-right", "--count", &format!("{}...HEAD", upstream)])
+            .args(["rev-list", "--left-right", "--count", &format!("{upstream}...HEAD")])
             .current_dir(path)
             .output()?;
 
@@ -545,7 +543,7 @@ impl Git {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
+        let parts: Vec<&str> = stdout.split_whitespace().collect();
         if parts.len() != 2 {
             return Ok((0, 0));
         }
@@ -630,7 +628,7 @@ impl Git {
     /// Check if a tag exists in the repo.
     pub fn tag_exists(path: &Path, tag: &str) -> bool {
         Command::new("git")
-            .args(["rev-parse", "--verify", &format!("refs/tags/{}", tag)])
+            .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
             .current_dir(path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -643,7 +641,7 @@ impl Git {
     /// Returns 0 if tag is at HEAD. Errors if tag doesn't exist.
     pub fn commits_since_tag(path: &Path, tag: &str) -> GitResult<usize> {
         let output = Command::new("git")
-            .args(["rev-list", &format!("{}..HEAD", tag), "--count"])
+            .args(["rev-list", &format!("{tag}..HEAD"), "--count"])
             .current_dir(path)
             .output()?;
 
@@ -657,7 +655,7 @@ impl Git {
             .trim()
             .parse::<usize>()
             .map_err(|e| GitError::ParseError {
-                message: format!("failed to parse commit count: {}", e),
+                message: format!("failed to parse commit count: {e}"),
             })
     }
 
@@ -693,7 +691,7 @@ impl Git {
             .trim()
             .parse::<usize>()
             .map_err(|e| GitError::ParseError {
-                message: format!("failed to parse commit count: {}", e),
+                message: format!("failed to parse commit count: {e}"),
             })
     }
 
@@ -733,7 +731,7 @@ impl Git {
         Ok(())
     }
 
-    fn parse_remotes(output: &str) -> GitResult<Vec<RemoteInfo>> {
+    fn parse_remotes(output: &str) -> Vec<RemoteInfo> {
         let mut remotes: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
 
         for line in output.lines() {
@@ -754,7 +752,7 @@ impl Git {
             }
         }
 
-        Ok(remotes
+        remotes
             .into_iter()
             .filter_map(|(name, (fetch, push))| {
                 let fetch_url = fetch?;
@@ -765,10 +763,10 @@ impl Git {
                     push_url,
                 })
             })
-            .collect())
+            .collect()
     }
 
-    fn parse_branch_status(output: &str) -> GitResult<Option<BranchStatus>> {
+    fn parse_branch_status(output: &str) -> Option<BranchStatus> {
         // Find the current branch (marked with *)
         for line in output.lines() {
             if !line.starts_with('*') {
@@ -816,15 +814,15 @@ impl Git {
                 }
             }
 
-            return Ok(Some(BranchStatus {
+            return Some(BranchStatus {
                 name: branch_name,
                 upstream,
                 ahead,
                 behind,
-            }));
+            });
         }
 
-        Ok(None)
+        None
     }
 
     fn extract_number(s: &str, prefix: &str) -> Option<u32> {
@@ -834,7 +832,7 @@ impl Git {
         let num_str: String = rest
             .trim_start()
             .chars()
-            .take_while(|c| c.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
             .collect();
         num_str.parse().ok()
     }
@@ -865,10 +863,10 @@ pub fn force_push_with_retry(path: &Path, remote: &str, branch: &str) -> GitResu
 /// Build a git remote URL for a forge
 pub fn build_remote_url(forge: &str, org: &str, repo: &str) -> String {
     match forge.to_lowercase().as_str() {
-        "github" => format!("git@github.com:{}/{}.git", org, repo),
-        "codeberg" => format!("git@codeberg.org:{}/{}.git", org, repo),
-        "gitlab" => format!("git@gitlab.com:{}/{}.git", org, repo),
-        _ => format!("git@{}:{}/{}.git", forge, org, repo),
+        "github" => format!("git@github.com:{org}/{repo}.git"),
+        "codeberg" => format!("git@codeberg.org:{org}/{repo}.git"),
+        "gitlab" => format!("git@gitlab.com:{org}/{repo}.git"),
+        _ => format!("git@{forge}:{org}/{repo}.git"),
     }
 }
 
@@ -980,7 +978,7 @@ mod tests {
                       upstream\tgit@github.com:bob/repo.git (fetch)\n\
                       upstream\tgit@github.com:bob/repo.git (push)";
 
-        let remotes = Git::parse_remotes(output).unwrap();
+        let remotes = Git::parse_remotes(output);
         assert_eq!(remotes.len(), 2);
 
         let origin = remotes.iter().find(|r| r.name == "origin").unwrap();
@@ -990,7 +988,7 @@ mod tests {
     #[test]
     fn test_parse_branch_status_with_tracking() {
         let output = "* main abc1234 [origin/main: ahead 2, behind 1] Latest commit";
-        let status = Git::parse_branch_status(output).unwrap().unwrap();
+        let status = Git::parse_branch_status(output).unwrap();
 
         assert_eq!(status.name, "main");
         assert_eq!(status.upstream, Some("origin/main".to_string()));
@@ -1001,7 +999,7 @@ mod tests {
     #[test]
     fn test_parse_branch_status_up_to_date() {
         let output = "* main abc1234 [origin/main] Latest commit";
-        let status = Git::parse_branch_status(output).unwrap().unwrap();
+        let status = Git::parse_branch_status(output).unwrap();
 
         assert_eq!(status.name, "main");
         assert_eq!(status.upstream, Some("origin/main".to_string()));
@@ -1012,7 +1010,7 @@ mod tests {
     #[test]
     fn test_parse_branch_status_no_tracking() {
         let output = "* feature abc1234 Work in progress";
-        let status = Git::parse_branch_status(output).unwrap().unwrap();
+        let status = Git::parse_branch_status(output).unwrap();
 
         assert_eq!(status.name, "feature");
         assert_eq!(status.upstream, None);

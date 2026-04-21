@@ -19,15 +19,12 @@ async fn test_hyperforge_as_plugin() {
     let mut found_status = false;
     while let Some(item) = stream.next().await {
         if let plexus_core::plexus::PlexusStreamItem::Data { content, .. } = item {
-            if let Ok(event) = serde_json::from_value::<HyperforgeEvent>(content) {
-                match event {
-                    HyperforgeEvent::Status { version, description } => {
-                        assert_eq!(version, env!("CARGO_PKG_VERSION"));
-                        assert!(description.contains("FORGE4"));
-                        found_status = true;
-                    }
-                    _ => {}
-                }
+            if let Ok(HyperforgeEvent::Status { version, description }) =
+                serde_json::from_value::<HyperforgeEvent>(content)
+            {
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
+                assert!(description.contains("FORGE4"));
+                found_status = true;
             }
         }
     }

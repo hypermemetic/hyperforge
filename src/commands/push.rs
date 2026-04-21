@@ -76,17 +76,17 @@ impl PushOptions {
         Self::default()
     }
 
-    pub fn set_upstream(mut self) -> Self {
+    pub const fn set_upstream(mut self) -> Self {
         self.set_upstream = true;
         self
     }
 
-    pub fn dry_run(mut self) -> Self {
+    pub const fn dry_run(mut self) -> Self {
         self.dry_run = true;
         self
     }
 
-    pub fn force(mut self) -> Self {
+    pub const fn force(mut self) -> Self {
         self.force = true;
         self
     }
@@ -186,7 +186,7 @@ impl PushReport {
 /// * `options` - Push options
 ///
 /// # Returns
-/// PushReport with results for each forge
+/// `PushReport` with results for each forge
 ///
 /// # Behavior
 /// Attempts all configured forges even if one fails. This ensures that a
@@ -224,8 +224,7 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
     // Set to 0 in config to disable the guard entirely.
     let threshold = config
         .large_file_threshold_kb
-        .map(|kb| kb * 1024)
-        .unwrap_or(LARGE_FILE_THRESHOLD);
+        .map_or(LARGE_FILE_THRESHOLD, |kb| kb * 1024);
     if !options.dry_run && threshold > 0 {
         if let Ok(entries) = crate::hubs::build::large_files::scan_repo(path, threshold)
         {
@@ -273,7 +272,7 @@ pub fn push(path: &Path, options: PushOptions) -> PushResult<PushReport> {
                 remote_name: remote_name.clone(),
                 branch: branch.clone(),
                 success: false,
-                error: Some(format!("Remote not found: {}", remote_name)),
+                error: Some(format!("Remote not found: {remote_name}")),
                 dry_run: options.dry_run,
             });
             continue;

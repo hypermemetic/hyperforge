@@ -48,11 +48,9 @@ struct GhAsset {
 
 impl GhRelease {
     fn into_release_info(self) -> ReleaseInfo {
-        let created_at = DateTime::parse_from_rfc3339(&self.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        let created_at = DateTime::parse_from_rfc3339(&self.created_at).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
-        let assets = self.assets.into_iter().map(|a| a.into_asset_info()).collect();
+        let assets = self.assets.into_iter().map(GhAsset::into_asset_info).collect();
 
         ReleaseInfo {
             id: self.id,
@@ -69,9 +67,7 @@ impl GhRelease {
 
 impl GhAsset {
     fn into_asset_info(self) -> AssetInfo {
-        let created_at = DateTime::parse_from_rfc3339(&self.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        let created_at = DateTime::parse_from_rfc3339(&self.created_at).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
         AssetInfo {
             id: self.id,
@@ -136,7 +132,7 @@ impl GitHubReleaseAdapter {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", token))
+            header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|e| ReleaseError::AuthFailed(e.to_string()))?,
         );
         headers.insert(
@@ -146,26 +142,23 @@ impl GitHubReleaseAdapter {
         Ok(headers)
     }
 
-    /// Check response for common auth/not-found errors and return appropriate ReleaseError
+    /// Check response for common auth/not-found errors and return appropriate `ReleaseError`
     fn check_error_status(status: reqwest::StatusCode, body: &str) -> Option<ReleaseError> {
         if status == reqwest::StatusCode::UNAUTHORIZED
             || status == reqwest::StatusCode::FORBIDDEN
         {
             return Some(ReleaseError::AuthFailed(format!(
-                "GitHub auth error: {} (token may need repo scope)",
-                body
+                "GitHub auth error: {body} (token may need repo scope)"
             )));
         }
         if status == reqwest::StatusCode::NOT_FOUND {
             return Some(ReleaseError::NotFound(format!(
-                "GitHub resource not found: {}",
-                body
+                "GitHub resource not found: {body}"
             )));
         }
         if !status.is_success() {
             return Some(ReleaseError::ApiError(format!(
-                "GitHub API error {}: {}",
-                status, body
+                "GitHub API error {status}: {body}"
             )));
         }
         None
@@ -209,13 +202,13 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let release: GhRelease = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(release.into_release_info())
     }
@@ -258,13 +251,13 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let asset: GhAsset = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(asset.into_asset_info())
     }
@@ -289,15 +282,15 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let releases: Vec<GhRelease> = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
-        Ok(releases.into_iter().map(|r| r.into_release_info()).collect())
+        Ok(releases.into_iter().map(GhRelease::into_release_info).collect())
     }
 
     async fn get_release_by_tag(
@@ -329,13 +322,13 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let release: GhRelease = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(Some(release.into_release_info()))
     }
@@ -360,7 +353,7 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         Ok(())
@@ -391,15 +384,15 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let assets: Vec<GhAsset> = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
-        Ok(assets.into_iter().map(|a| a.into_asset_info()).collect())
+        Ok(assets.into_iter().map(GhAsset::into_asset_info).collect())
     }
 
     async fn delete_asset(&self, org: &str, repo: &str, asset_id: u64) -> ReleaseResult<()> {
@@ -422,7 +415,7 @@ impl ReleasePort for GitHubReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         Ok(())
@@ -470,7 +463,7 @@ mod tests {
         let asset = &info.assets[0];
         assert_eq!(asset.id, 999);
         assert_eq!(asset.name, "binary-linux-amd64");
-        assert_eq!(asset.size_bytes, 10485760);
+        assert_eq!(asset.size_bytes, 10_485_760);
         assert_eq!(asset.content_type, "application/octet-stream");
     }
 
@@ -511,7 +504,7 @@ mod tests {
 
         assert_eq!(info.id, 42);
         assert_eq!(info.name, "app.tar.gz");
-        assert_eq!(info.size_bytes, 5242880);
+        assert_eq!(info.size_bytes, 5_242_880);
         assert_eq!(info.content_type, "application/gzip");
         assert!(info.download_url.contains("app.tar.gz"));
     }

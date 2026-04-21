@@ -24,7 +24,7 @@ pub struct KeychainAuthProvider {
 }
 
 impl KeychainAuthProvider {
-    /// Create a new KeychainAuthProvider for the given organization
+    /// Create a new `KeychainAuthProvider` for the given organization
     pub fn new(org: impl Into<String>) -> Self {
         Self {
             bridge: KeychainBridge::new(&org.into()),
@@ -34,19 +34,19 @@ impl KeychainAuthProvider {
     /// Set a token in the keychain
     pub async fn set_token(&self, forge: &str, token: &str) -> anyhow::Result<()> {
         self.bridge.set(forge, token).await
-            .map_err(|e| anyhow::anyhow!("Failed to set token in keychain: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to set token in keychain: {e}"))
     }
 
     /// Delete a token from the keychain
     pub async fn delete_token(&self, forge: &str) -> anyhow::Result<()> {
         self.bridge.delete(forge).await
-            .map_err(|e| anyhow::anyhow!("Failed to delete token from keychain: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to delete token from keychain: {e}"))
     }
 
     /// Check if a token exists in the keychain
     pub async fn has_token(&self, forge: &str) -> anyhow::Result<bool> {
         self.bridge.exists(forge).await
-            .map_err(|e| anyhow::anyhow!("Failed to check keychain: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to check keychain: {e}"))
     }
 }
 
@@ -54,7 +54,7 @@ impl KeychainAuthProvider {
 impl AuthProvider for KeychainAuthProvider {
     async fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
         self.bridge.get(key).await
-            .map_err(|e| anyhow::anyhow!("Failed to get secret from keychain: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to get secret from keychain: {e}"))
     }
 }
 
@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires macOS keychain access
+    #[ignore = "requires macOS keychain access"]
     async fn test_keychain_auth_provider_roundtrip() {
         let provider = KeychainAuthProvider::new("test-org");
 

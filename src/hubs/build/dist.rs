@@ -73,44 +73,40 @@ pub fn dist_show(
 
             let dist = repo.config.as_ref().and_then(|c| c.dist.as_ref());
 
-            match dist {
-                Some(dist) => {
-                    configured += 1;
-                    let channels: Vec<String> = dist.channels.iter().map(|c| c.to_string()).collect();
-                    let targets_str = if dist.targets.is_empty() {
-                        "none".to_string()
-                    } else {
-                        dist.targets.join(", ")
-                    };
+            if let Some(dist) = dist {
+                configured += 1;
+                let channels: Vec<String> = dist.channels.iter().map(std::string::ToString::to_string).collect();
+                let targets_str = if dist.targets.is_empty() {
+                    "none".to_string()
+                } else {
+                    dist.targets.join(", ")
+                };
 
-                    let mut parts = vec![
-                        format!("channels: [{}]", channels.join(", ")),
-                        format!("targets: [{}]", targets_str),
-                    ];
-                    if let Some(ref tap) = dist.brew_tap {
-                        parts.push(format!("brew_tap: {}", tap));
-                    }
-                    if let Some(ref tap_path) = dist.brew_tap_path {
-                        parts.push(format!("brew_tap_path: {}", tap_path));
-                    }
+                let mut parts = vec![
+                    format!("channels: [{}]", channels.join(", ")),
+                    format!("targets: [{}]", targets_str),
+                ];
+                if let Some(ref tap) = dist.brew_tap {
+                    parts.push(format!("brew_tap: {tap}"));
+                }
+                if let Some(ref tap_path) = dist.brew_tap_path {
+                    parts.push(format!("brew_tap_path: {tap_path}"));
+                }
 
-                    yield HyperforgeEvent::Info {
-                        message: format!("  {} — {}", name, parts.join(", ")),
-                    };
-                }
-                None => {
-                    unconfigured += 1;
-                    yield HyperforgeEvent::Info {
-                        message: format!("  {} — not configured", name),
-                    };
-                }
+                yield HyperforgeEvent::Info {
+                    message: format!("  {} — {}", name, parts.join(", ")),
+                };
+            } else {
+                unconfigured += 1;
+                yield HyperforgeEvent::Info {
+                    message: format!("  {name} — not configured"),
+                };
             }
         }
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "Distribution config: {} configured, {} not configured",
-                configured, unconfigured,
+                "Distribution config: {configured} configured, {unconfigured} not configured",
             ),
         };
     }
@@ -163,7 +159,7 @@ pub fn dist_init(
             let (default_channels, default_targets) = match bs {
                 BuildSystemKind::Cargo => (
                     default_rust_channels(),
-                    COMMON_RUST_TARGETS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    COMMON_RUST_TARGETS.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
                 ),
                 BuildSystemKind::Cabal => (
                     default_haskell_channels(),
@@ -192,7 +188,7 @@ pub fn dist_init(
                 brew_tap_path: None,
             };
 
-            let channels_str: Vec<String> = dist.channels.iter().map(|c| c.to_string()).collect();
+            let channels_str: Vec<String> = dist.channels.iter().map(std::string::ToString::to_string).collect();
             yield HyperforgeEvent::Info {
                 message: format!(
                     "{}{}: channels=[{}], targets=[{}]{}",
@@ -200,32 +196,31 @@ pub fn dist_init(
                     name,
                     channels_str.join(", "),
                     dist.targets.join(", "),
-                    dist.brew_tap.as_ref().map(|t| format!(", brew_tap={}", t)).unwrap_or_default(),
+                    dist.brew_tap.as_ref().map(|t| format!(", brew_tap={t}")).unwrap_or_default(),
                 ),
             };
 
-            if !is_dry_run {
+            if is_dry_run {
+                written += 1;
+            } else {
                 // Load existing config or create minimal one
                 let mut config = repo.config.clone().unwrap_or_else(HyperforgeConfig::default);
                 config.dist = Some(dist);
 
                 match config.save(&repo.path) {
-                    Ok(_) => { written += 1; }
+                    Ok(()) => { written += 1; }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to write config for {}: {}", name, e),
+                            message: format!("Failed to write config for {name}: {e}"),
                         };
                     }
                 }
-            } else {
-                written += 1;
             }
         }
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Dist init: {} written, {} already configured, {} no build system",
-                dry, written, skipped_existing, skipped_no_bs,
+                "{dry}Dist init: {written} written, {skipped_existing} already configured, {skipped_no_bs} no build system",
             ),
         };
     }

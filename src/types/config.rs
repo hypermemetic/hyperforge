@@ -1,4 +1,4 @@
-//! Shared configuration types used by both HyperforgeConfig (per-repo) and RepoRecord (registry)
+//! Shared configuration types used by both `HyperforgeConfig` (per-repo) and `RepoRecord` (registry)
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::build_system::BuildSystemKind;
 
 /// Runner execution mode
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerType {
     Local,
@@ -42,12 +42,13 @@ pub struct RunnerConfig {
     pub timeout_secs: u64,
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     300
 }
 
 /// CI/validation configuration for a repo
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CiConfig {
     /// Skip all CI for this repo
     #[serde(default)]
@@ -58,14 +59,6 @@ pub struct CiConfig {
     pub runners: Vec<RunnerConfig>,
 }
 
-impl Default for CiConfig {
-    fn default() -> Self {
-        Self {
-            skip_validate: false,
-            runners: Vec::new(),
-        }
-    }
-}
 
 /// Resolve CI config for a repo: use existing config if present, otherwise generate defaults.
 ///

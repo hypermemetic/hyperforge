@@ -1,4 +1,4 @@
-//! GitHub adapter implementing ForgePort trait
+//! GitHub adapter implementing `ForgePort` trait
 //!
 //! Uses the GitHub REST API v3 to manage repositories.
 
@@ -53,7 +53,7 @@ struct RenameRepoRequest {
     name: String,
 }
 
-/// GitHub adapter for ForgePort trait
+/// GitHub adapter for `ForgePort` trait
 pub struct GitHubAdapter {
     client: Client,
     auth: Arc<dyn AuthProvider>,
@@ -63,12 +63,12 @@ pub struct GitHubAdapter {
 }
 
 impl GitHubAdapter {
-    /// Create a new GitHubAdapter with the given auth provider
+    /// Create a new `GitHubAdapter` with the given auth provider
     pub fn new(auth: Arc<dyn AuthProvider>, org: impl Into<String>) -> ForgeResult<Self> {
         Self::with_api_url(auth, org, GITHUB_API_URL.to_string())
     }
 
-    /// Create a new GitHubAdapter with a custom API URL (for testing)
+    /// Create a new `GitHubAdapter` with a custom API URL (for testing)
     pub fn with_api_url(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String) -> ForgeResult<Self> {
         let client = Client::builder()
             .user_agent("hyperforge/2.0")
@@ -79,7 +79,7 @@ impl GitHubAdapter {
     }
 
     /// Set the owner type for this adapter (user vs org)
-    pub fn with_owner_type(mut self, ot: OwnerType) -> Self {
+    pub const fn with_owner_type(mut self, ot: OwnerType) -> Self {
         self.owner_type = Some(ot);
         self
     }
@@ -97,7 +97,7 @@ impl GitHubAdapter {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", token))
+            header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|e| ForgeError::AuthenticationFailed { message: e.to_string() })?,
         );
         headers.insert(
@@ -162,7 +162,7 @@ impl GitHubAdapter {
         let last_page = Self::parse_last_page(&first_response);
 
         let first_repos: Vec<GitHubRepo> = first_response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         let mut all_repos: Vec<Repo> = first_repos.into_iter().map(Self::to_repo).collect();
 
@@ -181,7 +181,7 @@ impl GitHubAdapter {
         for page in 2..=last_page {
             let client = self.client.clone();
             let hdrs = headers.clone();
-            let url = format!("{}{separator}page={page}", base_url);
+            let url = format!("{base_url}{separator}page={page}");
 
             join_set.spawn(async move {
                 let response = client.get(&url)
@@ -194,12 +194,12 @@ impl GitHubAdapter {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
                     return Err(ForgeError::ApiError(format!(
-                        "GitHub API error {}: {}", status, body
+                        "GitHub API error {status}: {body}"
                     )));
                 }
 
                 let repos: Vec<GitHubRepo> = response.json().await
-                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
                 Ok(repos)
             });
@@ -208,7 +208,7 @@ impl GitHubAdapter {
             if join_set.len() >= 10 {
                 if let Some(result) = join_set.join_next().await {
                     let repos = result
-                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {e}")))??;
                     all_repos.extend(repos.into_iter().map(Self::to_repo));
                 }
             }
@@ -217,7 +217,7 @@ impl GitHubAdapter {
         // Collect remaining results
         while let Some(result) = join_set.join_next().await {
             let repos = result
-                .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                .map_err(|e| ForgeError::ApiError(format!("Task join error: {e}")))??;
             all_repos.extend(repos.into_iter().map(Self::to_repo));
         }
 
@@ -251,7 +251,7 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -276,12 +276,12 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
         let gh_repo: GitHubRepo = response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(Self::to_repo(gh_repo))
     }
@@ -318,14 +318,14 @@ impl ForgePort for GitHubAdapter {
             if body.contains("name already exists") {
                 return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
             }
-            return Err(ForgeError::ApiError(format!("GitHub API error: {}", body)));
+            return Err(ForgeError::ApiError(format!("GitHub API error: {body}")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -357,7 +357,7 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -389,7 +389,7 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -415,7 +415,7 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -443,7 +443,7 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -473,7 +473,7 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -498,7 +498,7 @@ impl ForgePort for GitHubAdapter {
             headers.insert(
                 header::IF_NONE_MATCH,
                 header::HeaderValue::from_str(etag_value)
-                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {}", e)))?,
+                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {e}")))?,
             );
         }
 
@@ -514,7 +514,7 @@ impl ForgePort for GitHubAdapter {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(ListResult {
                 repos: None,
-                etag: etag,
+                etag,
                 modified: false,
             });
         }
@@ -533,14 +533,14 @@ impl ForgePort for GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
         let new_etag = response.headers()
             .get(header::ETAG)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let repos = self.fetch_all_pages(response, &url).await?;
 
@@ -570,7 +570,7 @@ impl GitHubAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -600,14 +600,14 @@ impl GitHubAdapter {
             if body.contains("name already exists") {
                 return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
             }
-            return Err(ForgeError::ApiError(format!("GitHub API error: {}", body)));
+            return Err(ForgeError::ApiError(format!("GitHub API error: {body}")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
@@ -619,11 +619,16 @@ impl GitHubAdapter {
 mod tests {
     use super::*;
 
-    /// Mock auth provider for testing
+    /// Mock auth provider for testing.
+    ///
+    /// Referenced only by the commented-out `test_auth_headers_*` tests below.
+    /// Kept for when those tests are restored (tracked by HF-TESTS — see commit body).
+    #[allow(dead_code)]
     struct MockAuthProvider {
         token: Option<String>,
     }
 
+    #[allow(dead_code)]
     impl MockAuthProvider {
         fn with_token(token: &str) -> Self {
             Self { token: Some(token.to_string()) }

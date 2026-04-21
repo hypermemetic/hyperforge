@@ -1,11 +1,7 @@
-//! RepoHub - Single-repo operations and registry CRUD
+//! `RepoHub` - Single-repo operations and registry CRUD
 
 use async_stream::stream;
-use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
-use plexus_core::request::RawRequestContext;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,13 +26,13 @@ fn make_repo_adapter(
     match forge {
         Forge::GitHub => GitHubAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ForgePort>)
-            .map_err(|e| format!("{:?}: {}", forge, e)),
+            .map_err(|e| format!("{forge:?}: {e}")),
         Forge::Codeberg => CodebergAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ForgePort>)
-            .map_err(|e| format!("{:?}: {}", forge, e)),
+            .map_err(|e| format!("{forge:?}: {e}")),
         Forge::GitLab => GitLabAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ForgePort>)
-            .map_err(|e| format!("{:?}: {}", forge, e)),
+            .map_err(|e| format!("{forge:?}: {e}")),
     }
 }
 
@@ -44,7 +40,7 @@ fn make_repo_adapter(
 fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
         .map(Arc::new)
-        .map_err(|e| format!("Failed to create auth provider: {}", e))
+        .map_err(|e| format!("Failed to create auth provider: {e}"))
 }
 
 /// Build a `HyperforgeEvent::Repo` from a `Repo` struct.
@@ -57,7 +53,7 @@ fn repo_event(repo: &crate::types::Repo) -> HyperforgeEvent {
         mirrors: repo
             .mirrors
             .iter()
-            .map(|f| format!("{:?}", f).to_lowercase())
+            .map(|f| format!("{f:?}").to_lowercase())
             .collect(),
         protected: repo.protected,
         staged_for_deletion: repo.staged_for_deletion,
@@ -74,12 +70,12 @@ fn materialize_events(report: &MaterializeReport) -> Vec<HyperforgeEvent> {
     }
     for remote in &report.remotes_added {
         events.push(HyperforgeEvent::Info {
-            message: format!("Added remote: {}", remote),
+            message: format!("Added remote: {remote}"),
         });
     }
     for remote in &report.remotes_updated {
         events.push(HyperforgeEvent::Info {
-            message: format!("Updated remote: {}", remote),
+            message: format!("Updated remote: {remote}"),
         });
     }
     if report.hooks_installed {
@@ -97,21 +93,30 @@ pub struct RepoHub {
 }
 
 impl RepoHub {
-    pub fn new(state: HyperforgeState) -> Self {
+    pub const fn new(state: HyperforgeState) -> Self {
         Self { state }
     }
 }
 
-// TODO(HF-IR): remove the deprecated `hub` argument; hub mode is inferred from #[child] gates in plexus-macros 0.6.
 #[plexus_macros::activation(
     namespace = "repo",
     description = "Single-repo operations and registry CRUD",
-    crate_path = "plexus_core",
-    hub
+    crate_path = "plexus_core"
 )]
-#[allow(deprecated)]
 impl RepoHub {
-    /// List repositories for an organization (from LocalForge)
+    /// Container image operations (list/pull/push/delete images in forge registries).
+    #[plexus_macros::child]
+    fn images(&self) -> ImagesHub {
+        ImagesHub::new(self.state.clone())
+    }
+
+    /// Release operations (list/create/upload/download release artifacts).
+    #[plexus_macros::child]
+    fn releases(&self) -> ReleasesHub {
+        ReleasesHub::new(self.state.clone())
+    }
+
+    /// List repositories for an organization (from `LocalForge`)
     #[plexus_macros::method(
         description = "List all repositories in the local forge for an organization",
         params(
@@ -132,7 +137,7 @@ impl RepoHub {
                     Ok(r) => Some(r),
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Invalid regex '{}': {}", pattern, e),
+                            message: format!("Invalid regex '{pattern}': {e}"),
                         };
                         return;
                     }
@@ -155,14 +160,14 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to list repos: {}", e),
+                        message: format!("Failed to list repos: {e}"),
                     };
                 }
             }
         }
     }
 
-    /// Create a new repository in LocalForge
+    /// Create a new repository in `LocalForge`
     #[plexus_macros::method(
         description = "Create a new repository configuration",
         params(
@@ -187,14 +192,11 @@ impl RepoHub {
 
         stream! {
             // Parse forge from string
-            let origin_forge = match HyperforgeConfig::parse_forge(&origin) {
-                Some(f) => f,
-                None => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Invalid origin forge: {}. Must be github, codeberg, or gitlab", origin),
-                    };
-                    return;
-                }
+            let origin_forge = if let Some(f) = HyperforgeConfig::parse_forge(&origin) { f } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Invalid origin forge: {origin}. Must be github, codeberg, or gitlab"),
+                };
+                return;
             };
 
             // Parse visibility
@@ -209,9 +211,9 @@ impl RepoHub {
             // Parse mirrors
             let mirror_forges: Vec<Forge> = if let Some(m) = mirrors {
                 m.split(',')
-                    .map(|s| s.trim())
+                    .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .filter_map(|s| HyperforgeConfig::parse_forge(s))
+                    .filter_map(HyperforgeConfig::parse_forge)
                     .collect()
             } else {
                 Vec::new()
@@ -228,11 +230,11 @@ impl RepoHub {
             let local = state.get_local_forge(&org).await;
 
             match local.create_repo(&org, &repo).await {
-                Ok(_) => {
+                Ok(()) => {
                     // Save to YAML
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to save repos.yaml: {}", e),
+                            message: format!("Failed to save repos.yaml: {e}"),
                         };
                         return;
                     }
@@ -244,7 +246,7 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to create repo: {}", e),
+                        message: format!("Failed to create repo: {e}"),
                     };
                 }
             }
@@ -278,7 +280,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to get repo: {}", e),
+                        message: format!("Failed to get repo: {e}"),
                     };
                     return;
                 }
@@ -300,10 +302,10 @@ impl RepoHub {
             }
 
             match local.update_repo(&org, &repo).await {
-                Ok(_) => {
+                Ok(()) => {
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to save repos.yaml: {}", e),
+                            message: format!("Failed to save repos.yaml: {e}"),
                         };
                         return;
                     }
@@ -323,7 +325,7 @@ impl RepoHub {
                                 }
                                 Err(e) => {
                                     yield HyperforgeEvent::Error {
-                                        message: format!("Failed to materialize config: {}", e),
+                                        message: format!("Failed to materialize config: {e}"),
                                     };
                                 }
                             }
@@ -332,7 +334,7 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to update repo: {}", e),
+                        message: format!("Failed to update repo: {e}"),
                     };
                 }
             }
@@ -362,7 +364,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repository not found: {}", e),
+                        message: format!("Repository not found: {e}"),
                     };
                     return;
                 }
@@ -371,7 +373,7 @@ impl RepoHub {
             // Protected repos cannot be deleted
             if record.protected {
                 yield HyperforgeEvent::Error {
-                    message: format!("Cannot delete '{}': repo is protected. Remove protection first with: repo update --org {} --name {} --protected false", name, org, name),
+                    message: format!("Cannot delete '{name}': repo is protected. Remove protection first with: repo update --org {org} --name {name} --protected false"),
                 };
                 return;
             }
@@ -400,27 +402,27 @@ impl RepoHub {
                 let private_repo = Repo::new(&name, forge.clone())
                     .with_visibility(Visibility::Private);
                 match adapter.update_repo(&org, &private_repo).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         privatized_forges.push(forge.clone());
                         yield HyperforgeEvent::Info {
-                            message: format!("Made private on {:?}", forge),
+                            message: format!("Made private on {forge:?}"),
                         };
                     }
                     Err(e) => {
-                        privatize_errors.push(format!("{:?}: {}", forge, e));
+                        privatize_errors.push(format!("{forge:?}: {e}"));
                     }
                 }
             }
 
             for error in &privatize_errors {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to privatize - {}", error),
+                    message: format!("Failed to privatize - {error}"),
                 };
             }
 
             // Soft-delete locally (always, even if remote privatization had errors)
             match local.delete_repo(&org, &name).await {
-                Ok(_) => {
+                Ok(()) => {
                     // Record which forges were successfully privatized + update visibility
                     if let Ok(mut rec) = local.get_record(&name) {
                         for f in &privatized_forges {
@@ -434,21 +436,20 @@ impl RepoHub {
 
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to save repos.yaml: {}", e),
+                            message: format!("Failed to save repos.yaml: {e}"),
                         };
                         return;
                     }
 
                     yield HyperforgeEvent::Info {
                         message: format!(
-                            "Soft-deleted repository: {} (privatized on remotes, record preserved in repos.yaml)",
-                            name
+                            "Soft-deleted repository: {name} (privatized on remotes, record preserved in repos.yaml)"
                         ),
                     };
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to delete repo: {}", e),
+                        message: format!("Failed to delete repo: {e}"),
                     };
                 }
             }
@@ -486,7 +487,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repository not found: {}", e),
+                        message: format!("Repository not found: {e}"),
                     };
                     return;
                 }
@@ -495,7 +496,7 @@ impl RepoHub {
             // Must be dismissed first
             if !record.dismissed {
                 yield HyperforgeEvent::Error {
-                    message: format!("Cannot purge '{}': repo is not dismissed. Run 'repo delete' first.", name),
+                    message: format!("Cannot purge '{name}': repo is not dismissed. Run 'repo delete' first."),
                 };
                 return;
             }
@@ -503,7 +504,7 @@ impl RepoHub {
             // Protected repos cannot be purged
             if record.protected {
                 yield HyperforgeEvent::Error {
-                    message: format!("Cannot purge '{}': repo is protected. Remove protection first with: repo update --org {} --name {} --protected false", name, org, name),
+                    message: format!("Cannot purge '{name}': repo is protected. Remove protection first with: repo update --org {org} --name {name} --protected false"),
                 };
                 return;
             }
@@ -530,14 +531,14 @@ impl RepoHub {
                 };
 
                 match adapter.delete_repo(&org, &name).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         deleted_forges.push(forge.clone());
                         yield HyperforgeEvent::Info {
-                            message: format!("Deleted from {:?}", forge),
+                            message: format!("Deleted from {forge:?}"),
                         };
                     }
                     Err(e) => {
-                        delete_errors.push(format!("{:?}: {}", forge, e));
+                        delete_errors.push(format!("{forge:?}: {e}"));
                     }
                 }
             }
@@ -558,7 +559,7 @@ impl RepoHub {
 
             for error in &delete_errors {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to delete - {}", error),
+                    message: format!("Failed to delete - {error}"),
                 };
             }
 
@@ -566,17 +567,17 @@ impl RepoHub {
             if delete_errors.is_empty() {
                 if let Err(e) = local.remove_repo(&name) {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to remove local record: {}", e),
+                        message: format!("Failed to remove local record: {e}"),
                     };
                 } else {
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to save repos.yaml: {}", e),
+                            message: format!("Failed to save repos.yaml: {e}"),
                         };
                         return;
                     }
                     yield HyperforgeEvent::Info {
-                        message: format!("Purged repository: {} (deleted from all remotes, removed from repos.yaml)", name),
+                        message: format!("Purged repository: {name} (deleted from all remotes, removed from repos.yaml)"),
                     };
                 }
             } else {
@@ -614,7 +615,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repository not found in local config: {}", e),
+                        message: format!("Repository not found in local config: {e}"),
                     };
                     return;
                 }
@@ -652,13 +653,13 @@ impl RepoHub {
                 };
 
                 match adapter.rename_repo(&org, &old_name, &new_name).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Renamed on {:?}: {} -> {}", forge, old_name, new_name),
+                            message: format!("Renamed on {forge:?}: {old_name} -> {new_name}"),
                         };
                     }
                     Err(e) => {
-                        errors.push(format!("{:?}: {}", forge, e));
+                        errors.push(format!("{forge:?}: {e}"));
                     }
                 }
             }
@@ -666,22 +667,22 @@ impl RepoHub {
             // Report any errors from remote renames
             for error in &errors {
                 yield HyperforgeEvent::Error {
-                    message: format!("Remote rename failed - {}", error),
+                    message: format!("Remote rename failed - {error}"),
                 };
             }
 
             // Update local config regardless of remote errors (user may want to fix manually)
             match local.rename_repo(&org, &old_name, &new_name).await {
-                Ok(_) => {
+                Ok(()) => {
                     if let Err(e) = local.save_to_yaml().await {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to save repos.yaml: {}", e),
+                            message: format!("Failed to save repos.yaml: {e}"),
                         };
                         return;
                     }
 
                     yield HyperforgeEvent::Info {
-                        message: format!("Local config updated: {} -> {}", old_name, new_name),
+                        message: format!("Local config updated: {old_name} -> {new_name}"),
                     };
 
                     // Materialize to disk if the renamed record has a local_path
@@ -695,7 +696,7 @@ impl RepoHub {
                                 }
                                 Err(e) => {
                                     yield HyperforgeEvent::Error {
-                                        message: format!("Failed to materialize config: {}", e),
+                                        message: format!("Failed to materialize config: {e}"),
                                     };
                                 }
                             }
@@ -704,14 +705,14 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to update local config: {}", e),
+                        message: format!("Failed to update local config: {e}"),
                     };
                 }
             }
 
             if errors.is_empty() {
                 yield HyperforgeEvent::Info {
-                    message: format!("Renamed repository: {} -> {}", old_name, new_name),
+                    message: format!("Renamed repository: {old_name} -> {new_name}"),
                 };
             } else {
                 yield HyperforgeEvent::Error {
@@ -745,7 +746,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repository not found in local config: {}", e),
+                        message: format!("Repository not found in local config: {e}"),
                     };
                     return;
                 }
@@ -778,27 +779,27 @@ impl RepoHub {
                 };
 
                 match adapter.set_archived(&org, &name, archived).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("{} '{}' on {:?}", action, name, forge),
+                            message: format!("{action} '{name}' on {forge:?}"),
                         };
                     }
                     Err(e) => {
-                        errors.push(format!("{:?}: {}", forge, e));
+                        errors.push(format!("{forge:?}: {e}"));
                     }
                 }
             }
 
             for error in &errors {
                 yield HyperforgeEvent::Error {
-                    message: format!("  Error: {}", error),
+                    message: format!("  Error: {error}"),
                 };
             }
 
             // Update local state
             if let Err(e) = local.set_archived(&org, &name, archived).await {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to update local state: {}", e),
+                    message: format!("Failed to update local state: {e}"),
                 };
             }
         }
@@ -833,7 +834,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repository not found in local config: {}", e),
+                        message: format!("Repository not found in local config: {e}"),
                     };
                     return;
                 }
@@ -868,13 +869,13 @@ impl RepoHub {
                 };
 
                 match adapter.set_default_branch(&org, &name, &branch).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Set default branch to '{}' on {:?}", branch, forge),
+                            message: format!("Set default branch to '{branch}' on {forge:?}"),
                         };
                     }
                     Err(e) => {
-                        errors.push(format!("{:?}: {}", forge, e));
+                        errors.push(format!("{forge:?}: {e}"));
                     }
                 }
             }
@@ -882,7 +883,7 @@ impl RepoHub {
             // Report errors
             for error in &errors {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to set default branch - {}", error),
+                    message: format!("Failed to set default branch - {error}"),
                 };
             }
 
@@ -890,11 +891,11 @@ impl RepoHub {
             if errors.is_empty() {
                 if let Err(e) = local.set_default_branch(&org, &name, &branch).await {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to update LocalForge default_branch: {}", e),
+                        message: format!("Failed to update LocalForge default_branch: {e}"),
                     };
                 } else if let Err(e) = local.save_to_yaml().await {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to save repos.yaml: {}", e),
+                        message: format!("Failed to save repos.yaml: {e}"),
                     };
                 }
             }
@@ -904,14 +905,14 @@ impl RepoHub {
                 if let Some(ref repo_path) = path {
                     let repo_path = std::path::Path::new(repo_path);
                     match crate::git::Git::checkout(repo_path, &branch) {
-                        Ok(_) => {
+                        Ok(()) => {
                             yield HyperforgeEvent::Info {
-                                message: format!("Checked out '{}' locally", branch),
+                                message: format!("Checked out '{branch}' locally"),
                             };
                         }
                         Err(e) => {
                             yield HyperforgeEvent::Error {
-                                message: format!("Git checkout failed: {}", e),
+                                message: format!("Git checkout failed: {e}"),
                             };
                         }
                     }
@@ -924,7 +925,7 @@ impl RepoHub {
 
             if errors.is_empty() {
                 yield HyperforgeEvent::Info {
-                    message: format!("Default branch set to '{}' on all forges", branch),
+                    message: format!("Default branch set to '{branch}' on all forges"),
                 };
             } else {
                 yield HyperforgeEvent::Error {
@@ -951,14 +952,11 @@ impl RepoHub {
 
         stream! {
             // Parse forge
-            let source_forge = match HyperforgeConfig::parse_forge(&forge) {
-                Some(f) => f,
-                None => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
-                    };
-                    return;
-                }
+            let source_forge = if let Some(f) = HyperforgeConfig::parse_forge(&forge) { f } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Invalid forge: {forge}. Must be github, codeberg, or gitlab"),
+                };
+                return;
             };
 
             // Get forge adapter
@@ -978,7 +976,7 @@ impl RepoHub {
             };
 
             yield HyperforgeEvent::Info {
-                message: format!("Fetching repositories from {} for {}...", forge, org),
+                message: format!("Fetching repositories from {forge} for {org}..."),
             };
 
             // List repos from remote forge
@@ -986,7 +984,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to list repos from {}: {}", forge, e),
+                        message: format!("Failed to list repos from {forge}: {e}"),
                     };
                     return;
                 }
@@ -1024,7 +1022,7 @@ impl RepoHub {
 
                 // Create in local forge
                 match local.create_repo(&org, &repo).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         imported += 1;
                         yield repo_event(&repo);
                     }
@@ -1040,15 +1038,14 @@ impl RepoHub {
             // Save to YAML
             if let Err(e) = local.save_to_yaml().await {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to save repos.yaml: {}", e),
+                    message: format!("Failed to save repos.yaml: {e}"),
                 };
                 return;
             }
 
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "Import complete: {} imported, {} skipped (already exist), {} errors",
-                    imported, skipped, errors
+                    "Import complete: {imported} imported, {skipped} skipped (already exist), {errors} errors"
                 ),
             };
         }
@@ -1196,20 +1193,20 @@ impl RepoHub {
             if !is_dry_run {
                 if let Err(e) = local.upsert_record(record.clone()) {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to register in LocalForge: {}", e),
+                        message: format!("Failed to register in LocalForge: {e}"),
                     };
                     return;
                 }
 
                 if let Err(e) = local.save_to_yaml().await {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to save repos.yaml: {}", e),
+                        message: format!("Failed to save repos.yaml: {e}"),
                     };
                     return;
                 }
 
                 yield HyperforgeEvent::Info {
-                    message: format!("Registered {} in LocalForge for org {}", name, org),
+                    message: format!("Registered {name} in LocalForge for org {org}"),
                 };
             }
 
@@ -1240,13 +1237,13 @@ impl RepoHub {
 
                     for remote in &report.remotes_added {
                         yield HyperforgeEvent::Info {
-                            message: format!("Added remote: {}", remote),
+                            message: format!("Added remote: {remote}"),
                         };
                     }
 
                     for remote in &report.remotes_updated {
                         yield HyperforgeEvent::Info {
-                            message: format!("Updated remote: {}", remote),
+                            message: format!("Updated remote: {remote}"),
                         };
                     }
 
@@ -1270,7 +1267,7 @@ impl RepoHub {
 
                     for warning in &report.warnings {
                         yield HyperforgeEvent::Info {
-                            message: format!("⚠ {}", warning),
+                            message: format!("⚠ {warning}"),
                         };
                     }
 
@@ -1280,7 +1277,7 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Materialize failed: {}", e),
+                        message: format!("Materialize failed: {e}"),
                     };
                 }
             }
@@ -1344,7 +1341,7 @@ impl RepoHub {
                         }
 
                         if let Some(err) = forge_status.error {
-                            msg.push_str(&format!(" - {}", err));
+                            msg.push_str(&format!(" - {err}"));
                         }
 
                         yield HyperforgeEvent::Info { message: msg };
@@ -1354,7 +1351,7 @@ impl RepoHub {
                     match (&report.ssh_command, &report.hyperforge_org) {
                         (Some(cmd), Some(org)) if cmd == "hyperforge-ssh" => {
                             yield HyperforgeEvent::Info {
-                                message: format!("SSH: hyperforge-ssh (org: {})", org),
+                                message: format!("SSH: hyperforge-ssh (org: {org})"),
                             };
                         }
                         (Some(cmd), None) if cmd == "hyperforge-ssh" => {
@@ -1364,7 +1361,7 @@ impl RepoHub {
                         }
                         (Some(cmd), _) => {
                             yield HyperforgeEvent::Info {
-                                message: format!("SSH: custom ({})", cmd),
+                                message: format!("SSH: custom ({cmd})"),
                             };
                         }
                         (None, _) => {
@@ -1376,7 +1373,7 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Status failed: {}", e),
+                        message: format!("Status failed: {e}"),
                     };
                 }
             }
@@ -1468,14 +1465,14 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Push failed: {}", e),
+                        message: format!("Push failed: {e}"),
                     };
                 }
             }
         }
     }
 
-    /// Clone a repository from LocalForge
+    /// Clone a repository from `LocalForge`
     #[plexus_macros::method(
         description = "Clone a repository by name from LocalForge, auto-initialize with hyperforge config",
         params(
@@ -1502,7 +1499,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repository not found in LocalForge: {}", e),
+                        message: format!("Repository not found in LocalForge: {e}"),
                     };
                     return;
                 }
@@ -1510,51 +1507,45 @@ impl RepoHub {
 
             // 2. Pick clone forge
             let clone_forge = if let Some(ref forge_str) = forge {
-                match HyperforgeConfig::parse_forge(forge_str) {
-                    Some(f) => {
-                        if !record.present_on.contains(&f) {
-                            yield HyperforgeEvent::Error {
-                                message: format!("Repository not present on forge: {}", forge_str),
-                            };
-                            return;
-                        }
-                        f
-                    }
-                    None => {
+                if let Some(f) = HyperforgeConfig::parse_forge(forge_str) {
+                    if !record.present_on.contains(&f) {
                         yield HyperforgeEvent::Error {
-                            message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge_str),
+                            message: format!("Repository not present on forge: {forge_str}"),
                         };
                         return;
                     }
+                    f
+                } else {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid forge: {forge_str}. Must be github, codeberg, or gitlab"),
+                    };
+                    return;
                 }
             } else {
                 // Use first forge from present_on
-                match record.present_on.iter().next() {
-                    Some(f) => f.clone(),
-                    None => {
-                        yield HyperforgeEvent::Error {
-                            message: "Repository has no forges in present_on".to_string(),
-                        };
-                        return;
-                    }
+                if let Some(f) = record.present_on.iter().next() { f.clone() } else {
+                    yield HyperforgeEvent::Error {
+                        message: "Repository has no forges in present_on".to_string(),
+                    };
+                    return;
                 }
             };
 
             // 3. Build clone URL
-            let forge_str = format!("{:?}", clone_forge).to_lowercase();
+            let forge_str = format!("{clone_forge:?}").to_lowercase();
             let clone_url = crate::git::build_remote_url(&forge_str, &org, &name);
 
             // 4. Determine target path
             let target_path = path.unwrap_or_else(|| name.clone());
 
             yield HyperforgeEvent::Info {
-                message: format!("Cloning {} from {} into {}", name, forge_str, target_path),
+                message: format!("Cloning {name} from {forge_str} into {target_path}"),
             };
 
             // 5. Clone
             if let Err(e) = crate::git::Git::clone(&clone_url, &target_path) {
                 yield HyperforgeEvent::Error {
-                    message: format!("Git clone failed: {}", e),
+                    message: format!("Git clone failed: {e}"),
                 };
                 return;
             }
@@ -1571,7 +1562,7 @@ impl RepoHub {
             updated_record.local_path = Some(clone_path.clone());
             if updated_record.forges.is_empty() {
                 updated_record.forges = updated_record.present_on.iter()
-                    .map(|f| format!("{:?}", f).to_lowercase())
+                    .map(|f| format!("{f:?}").to_lowercase())
                     .collect();
             }
 
@@ -1586,18 +1577,18 @@ impl RepoHub {
                     }
                     for remote in &report.remotes_added {
                         yield HyperforgeEvent::Info {
-                            message: format!("Added remote: {}", remote),
+                            message: format!("Added remote: {remote}"),
                         };
                     }
                     for remote in &report.remotes_updated {
                         yield HyperforgeEvent::Info {
-                            message: format!("Updated remote: {}", remote),
+                            message: format!("Updated remote: {remote}"),
                         };
                     }
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to materialize config: {}", e),
+                        message: format!("Failed to materialize config: {e}"),
                     };
                     // Continue anyway - clone succeeded
                 }
@@ -1606,21 +1597,21 @@ impl RepoHub {
             // 7. Update LocalForge with local_path
             if let Err(e) = local.update_record(&updated_record) {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to update LocalForge record: {}", e),
+                    message: format!("Failed to update LocalForge record: {e}"),
                 };
             } else if let Err(e) = local.save_to_yaml().await {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to save repos.yaml: {}", e),
+                    message: format!("Failed to save repos.yaml: {e}"),
                 };
             }
 
             yield HyperforgeEvent::Info {
-                message: format!("Repository {} cloned and configured", name),
+                message: format!("Repository {name} cloned and configured"),
             };
         }
     }
 
-    /// Sync a repo from LocalForge to its remote forges
+    /// Sync a repo from `LocalForge` to its remote forges
     #[plexus_macros::method(
         description = "Sync a repo from LocalForge to its remote forges (create if missing, update if drifted)",
         params(
@@ -1647,7 +1638,7 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                        message: format!("Repo '{name}' not found in LocalForge: {e}"),
                     };
                     return;
                 }
@@ -1657,7 +1648,7 @@ impl RepoHub {
 
             if record.forges.is_empty() {
                 yield HyperforgeEvent::Error {
-                    message: format!("Repo '{}' has no target forges configured", name),
+                    message: format!("Repo '{name}' has no target forges configured"),
                 };
                 return;
             }
@@ -1684,22 +1675,19 @@ impl RepoHub {
             let mut record = record;
 
             for forge_name in &record.forges.clone() {
-                let forge = match HyperforgeConfig::parse_forge(forge_name) {
-                    Some(f) => f,
-                    None => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("Invalid forge: {}", forge_name),
-                        };
-                        errors += 1;
-                        continue;
-                    }
+                let forge = if let Some(f) = HyperforgeConfig::parse_forge(forge_name) { f } else {
+                    yield HyperforgeEvent::Error {
+                        message: format!("Invalid forge: {forge_name}"),
+                    };
+                    errors += 1;
+                    continue;
                 };
 
                 let adapter = match make_repo_adapter(&forge, auth.clone(), &org) {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("{}: {}", forge_name, e),
+                            message: format!("{forge_name}: {e}"),
                         };
                         errors += 1;
                         continue;
@@ -1711,41 +1699,20 @@ impl RepoHub {
                     Ok(v) => v,
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("{}: failed to check existence: {}", forge_name, e),
+                            message: format!("{forge_name}: failed to check existence: {e}"),
                         };
                         errors += 1;
                         continue;
                     }
                 };
 
-                if !exists {
-                    // Create
-                    yield HyperforgeEvent::Info {
-                        message: format!("  {}Creating {} on {}", dry_prefix, name, forge_name),
-                    };
-                    if !is_dry_run {
-                        match adapter.create_repo(&org, &repo).await {
-                            Ok(_) => {
-                                created += 1;
-                                record.present_on.insert(forge.clone());
-                            }
-                            Err(e) => {
-                                yield HyperforgeEvent::Error {
-                                    message: format!("{}: create failed: {}", forge_name, e),
-                                };
-                                errors += 1;
-                            }
-                        }
-                    } else {
-                        created += 1;
-                    }
-                } else {
+                if exists {
                     // Check for drift
                     let remote = match adapter.get_repo(&org, &name).await {
                         Ok(r) => r,
                         Err(e) => {
                             yield HyperforgeEvent::Error {
-                                message: format!("{}: failed to fetch remote: {}", forge_name, e),
+                                message: format!("{forge_name}: failed to fetch remote: {e}"),
                             };
                             errors += 1;
                             continue;
@@ -1773,25 +1740,46 @@ impl RepoHub {
                             ),
                         };
 
-                        if !is_dry_run {
+                        if is_dry_run {
+                            updated += 1;
+                        } else {
                             match adapter.update_repo(&org, &repo).await {
-                                Ok(_) => {
+                                Ok(()) => {
                                     updated += 1;
                                     record.present_on.insert(forge.clone());
                                 }
                                 Err(e) => {
                                     yield HyperforgeEvent::Error {
-                                        message: format!("{}: update failed: {}", forge_name, e),
+                                        message: format!("{forge_name}: update failed: {e}"),
                                     };
                                     errors += 1;
                                 }
                             }
-                        } else {
-                            updated += 1;
                         }
                     } else {
                         record.present_on.insert(forge.clone());
                         in_sync += 1;
+                    }
+                } else {
+                    // Create
+                    yield HyperforgeEvent::Info {
+                        message: format!("  {dry_prefix}Creating {name} on {forge_name}"),
+                    };
+                    if is_dry_run {
+                        created += 1;
+                    } else {
+                        match adapter.create_repo(&org, &repo).await {
+                            Ok(()) => {
+                                created += 1;
+                                record.present_on.insert(forge.clone());
+                            }
+                            Err(e) => {
+                                yield HyperforgeEvent::Error {
+                                    message: format!("{forge_name}: create failed: {e}"),
+                                };
+                                errors += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1800,19 +1788,18 @@ impl RepoHub {
             if !is_dry_run && (created > 0 || updated > 0 || in_sync > 0) {
                 if let Err(e) = local.update_record(&record) {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to update LocalForge record: {}", e),
+                        message: format!("Failed to update LocalForge record: {e}"),
                     };
                 } else if let Err(e) = local.save_to_yaml().await {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to save repos.yaml: {}", e),
+                        message: format!("Failed to save repos.yaml: {e}"),
                     };
                 }
             }
 
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "{}Sync complete: {} created, {} updated, {} in sync, {} errors",
-                    dry_prefix, created, updated, in_sync, errors,
+                    "{dry_prefix}Sync complete: {created} created, {updated} updated, {in_sync} in sync, {errors} errors",
                 ),
             };
         }
@@ -1843,20 +1830,17 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                        message: format!("Repo '{name}' not found in LocalForge: {e}"),
                     };
                     return;
                 }
             };
 
-            let repo_path = match &record.local_path {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
-                    };
-                    return;
-                }
+            let repo_path = if let Some(p) = &record.local_path { PathBuf::from(p) } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo '{name}' has no local_path set in LocalForge"),
+                };
+                return;
             };
 
             if !repo_path.exists() {
@@ -1903,7 +1887,7 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Scan failed for '{}': {}", name, e),
+                        message: format!("Scan failed for '{name}': {e}"),
                     };
                 }
             }
@@ -1932,20 +1916,17 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                        message: format!("Repo '{name}' not found in LocalForge: {e}"),
                     };
                     return;
                 }
             };
 
-            let repo_path = match &record.local_path {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
-                    };
-                    return;
-                }
+            let repo_path = if let Some(p) = &record.local_path { PathBuf::from(p) } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo '{name}' has no local_path set in LocalForge"),
+                };
+                return;
             };
 
             if !repo_path.exists() {
@@ -1963,7 +1944,7 @@ impl RepoHub {
                 Ok(o) => o,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to run git ls-files: {}", e),
+                        message: format!("Failed to run git ls-files: {e}"),
                     };
                     return;
                 }
@@ -2024,20 +2005,17 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                        message: format!("Repo '{name}' not found in LocalForge: {e}"),
                     };
                     return;
                 }
             };
 
-            let repo_path = match &record.local_path {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
-                    };
-                    return;
-                }
+            let repo_path = if let Some(p) = &record.local_path { PathBuf::from(p) } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo '{name}' has no local_path set in LocalForge"),
+                };
+                return;
             };
 
             if !repo_path.exists() {
@@ -2055,7 +2033,7 @@ impl RepoHub {
                 Ok(o) => o,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to run git ls-files: {}", e),
+                        message: format!("Failed to run git ls-files: {e}"),
                     };
                     return;
                 }
@@ -2127,20 +2105,17 @@ impl RepoHub {
                 Ok(r) => r,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' not found in LocalForge: {}", name, e),
+                        message: format!("Repo '{name}' not found in LocalForge: {e}"),
                     };
                     return;
                 }
             };
 
-            let repo_path = match &record.local_path {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    yield HyperforgeEvent::Error {
-                        message: format!("Repo '{}' has no local_path set in LocalForge", name),
-                    };
-                    return;
-                }
+            let repo_path = if let Some(p) = &record.local_path { PathBuf::from(p) } else {
+                yield HyperforgeEvent::Error {
+                    message: format!("Repo '{name}' has no local_path set in LocalForge"),
+                };
+                return;
             };
 
             if !repo_path.exists() {
@@ -2162,50 +2137,10 @@ impl RepoHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to get status for '{}': {}", name, e),
+                        message: format!("Failed to get status for '{name}': {e}"),
                     };
                 }
             }
-        }
-    }
-    /// Get child plugin summaries for the hub schema
-    pub fn plugin_children(&self) -> Vec<plexus_core::plexus::ChildSummary> {
-        let images = ImagesHub::new(self.state.clone());
-        let images_schema = Activation::plugin_schema(&images);
-
-        let releases = ReleasesHub::new(self.state.clone());
-        let releases_schema = Activation::plugin_schema(&releases);
-
-        vec![
-            plexus_core::plexus::ChildSummary {
-                namespace: images_schema.namespace,
-                description: images_schema.description,
-                hash: images_schema.hash,
-            },
-            plexus_core::plexus::ChildSummary {
-                namespace: releases_schema.namespace,
-                description: releases_schema.description,
-                hash: releases_schema.hash,
-            },
-        ]
-    }
-}
-
-#[async_trait]
-impl ChildRouter for RepoHub {
-    fn router_namespace(&self) -> &str {
-        "repo"
-    }
-
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>, raw_ctx: Option<&RawRequestContext>) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params, auth, raw_ctx).await
-    }
-
-    async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
-        match name {
-            "images" => Some(Box::new(ImagesHub::new(self.state.clone()))),
-            "releases" => Some(Box::new(ReleasesHub::new(self.state.clone()))),
-            _ => None,
         }
     }
 }

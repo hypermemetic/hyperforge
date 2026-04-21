@@ -1,4 +1,4 @@
-//! GitLab adapter implementing ForgePort trait
+//! GitLab adapter implementing `ForgePort` trait
 //!
 //! Uses the GitLab REST API v4 to manage repositories.
 
@@ -61,7 +61,7 @@ struct GitLabGroup {
     id: i64,
 }
 
-/// GitLab adapter for ForgePort trait
+/// GitLab adapter for `ForgePort` trait
 pub struct GitLabAdapter {
     client: Client,
     auth: Arc<dyn AuthProvider>,
@@ -71,12 +71,12 @@ pub struct GitLabAdapter {
 }
 
 impl GitLabAdapter {
-    /// Create a new GitLabAdapter with the given auth provider
+    /// Create a new `GitLabAdapter` with the given auth provider
     pub fn new(auth: Arc<dyn AuthProvider>, org: impl Into<String>) -> ForgeResult<Self> {
         Self::with_api_url(auth, org, GITLAB_API_URL.to_string())
     }
 
-    /// Create a new GitLabAdapter with a custom API URL (for testing or self-hosted)
+    /// Create a new `GitLabAdapter` with a custom API URL (for testing or self-hosted)
     pub fn with_api_url(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String) -> ForgeResult<Self> {
         let client = Client::builder()
             .user_agent("hyperforge/2.0")
@@ -87,7 +87,7 @@ impl GitLabAdapter {
     }
 
     /// Set the owner type for this adapter (user vs org)
-    pub fn with_owner_type(mut self, ot: OwnerType) -> Self {
+    pub const fn with_owner_type(mut self, ot: OwnerType) -> Self {
         self.owner_type = Some(ot);
         self
     }
@@ -129,19 +129,19 @@ impl GitLabAdapter {
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ForgeError::ApiError(format!("Group '{}' not found", group_name)));
+            return Err(ForgeError::ApiError(format!("Group '{group_name}' not found")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
         let group: GitLabGroup = response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(group.id)
     }
@@ -192,7 +192,7 @@ impl GitLabAdapter {
         let total_pages = Self::parse_total_pages(&first_response);
 
         let first_projects: Vec<GitLabProject> = first_response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         let mut all_repos: Vec<Repo> = first_projects.into_iter().map(Self::to_repo).collect();
 
@@ -210,7 +210,7 @@ impl GitLabAdapter {
         for page in 2..=total_pages {
             let client = self.client.clone();
             let hdrs = headers.clone();
-            let url = format!("{}{separator}page={page}", base_url);
+            let url = format!("{base_url}{separator}page={page}");
 
             join_set.spawn(async move {
                 let response = client.get(&url)
@@ -223,12 +223,12 @@ impl GitLabAdapter {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
                     return Err(ForgeError::ApiError(format!(
-                        "GitLab API error {}: {}", status, body
+                        "GitLab API error {status}: {body}"
                     )));
                 }
 
                 let projects: Vec<GitLabProject> = response.json().await
-                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
                 Ok(projects)
             });
@@ -237,7 +237,7 @@ impl GitLabAdapter {
             if join_set.len() >= 10 {
                 if let Some(result) = join_set.join_next().await {
                     let projects = result
-                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {e}")))??;
                     all_repos.extend(projects.into_iter().map(Self::to_repo));
                 }
             }
@@ -246,7 +246,7 @@ impl GitLabAdapter {
         // Collect remaining results
         while let Some(result) = join_set.join_next().await {
             let projects = result
-                .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                .map_err(|e| ForgeError::ApiError(format!("Task join error: {e}")))??;
             all_repos.extend(projects.into_iter().map(Self::to_repo));
         }
 
@@ -281,7 +281,7 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -291,7 +291,7 @@ impl ForgePort for GitLabAdapter {
     async fn get_repo(&self, org: &str, name: &str) -> ForgeResult<Repo> {
         let headers = self.auth_headers().await?;
         // GitLab uses URL-encoded "namespace/project" as project ID
-        let project_path = format!("{}/{}", org, name);
+        let project_path = format!("{org}/{name}");
         let encoded_path = urlencoding::encode(&project_path);
         let url = format!("{}/projects/{}", self.api_url, encoded_path);
 
@@ -309,12 +309,12 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
         let gl_project: GitLabProject = response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(Self::to_repo(gl_project))
     }
@@ -326,10 +326,8 @@ impl ForgePort for GitLabAdapter {
         let namespace_id = if self.owner_type == Some(OwnerType::User) {
             None
         } else {
-            match self.get_group_id(org).await {
-                Ok(id) => Some(id),
-                Err(_) => None, // Will create under user if group not found
-            }
+            // Will create under user if group not found
+            self.get_group_id(org).await.ok()
         };
 
         let url = format!("{}/projects", self.api_url);
@@ -353,14 +351,14 @@ impl ForgePort for GitLabAdapter {
             if body.contains("has already been taken") || body.contains("already exists") {
                 return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
             }
-            return Err(ForgeError::ApiError(format!("GitLab API error: {}", body)));
+            return Err(ForgeError::ApiError(format!("GitLab API error: {body}")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -394,7 +392,7 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -403,7 +401,7 @@ impl ForgePort for GitLabAdapter {
 
     async fn set_archived(&self, org: &str, name: &str, archived: bool) -> ForgeResult<()> {
         let headers = self.auth_headers().await?;
-        let project_path = format!("{}/{}", org, name);
+        let project_path = format!("{org}/{name}");
         let encoded_path = urlencoding::encode(&project_path);
         let url = format!("{}/projects/{}", self.api_url, encoded_path);
 
@@ -428,7 +426,7 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -437,7 +435,7 @@ impl ForgePort for GitLabAdapter {
 
     async fn delete_repo(&self, org: &str, name: &str) -> ForgeResult<()> {
         let headers = self.auth_headers().await?;
-        let project_path = format!("{}/{}", org, name);
+        let project_path = format!("{org}/{name}");
         let encoded_path = urlencoding::encode(&project_path);
         let url = format!("{}/projects/{}", self.api_url, encoded_path);
 
@@ -460,13 +458,13 @@ impl ForgePort for GitLabAdapter {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         Err(ForgeError::ApiError(format!(
-            "GitLab API error {}: {}", status, body
+            "GitLab API error {status}: {body}"
         )))
     }
 
     async fn set_default_branch(&self, org: &str, name: &str, branch: &str) -> ForgeResult<()> {
         let headers = self.auth_headers().await?;
-        let project_path = format!("{}/{}", org, name);
+        let project_path = format!("{org}/{name}");
         let encoded_path = urlencoding::encode(&project_path);
         let url = format!("{}/projects/{}", self.api_url, encoded_path);
 
@@ -487,7 +485,7 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -496,7 +494,7 @@ impl ForgePort for GitLabAdapter {
 
     async fn rename_repo(&self, org: &str, old_name: &str, new_name: &str) -> ForgeResult<()> {
         let headers = self.auth_headers().await?;
-        let project_path = format!("{}/{}", org, old_name);
+        let project_path = format!("{org}/{old_name}");
         let encoded_path = urlencoding::encode(&project_path);
         let url = format!("{}/projects/{}", self.api_url, encoded_path);
 
@@ -521,7 +519,7 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -546,7 +544,7 @@ impl ForgePort for GitLabAdapter {
             headers.insert(
                 header::IF_NONE_MATCH,
                 header::HeaderValue::from_str(etag_value)
-                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {}", e)))?,
+                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {e}")))?,
             );
         }
 
@@ -563,7 +561,7 @@ impl ForgePort for GitLabAdapter {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(ListResult {
                 repos: None,
-                etag: etag,
+                etag,
                 modified: false,
             });
         }
@@ -582,14 +580,14 @@ impl ForgePort for GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
         let new_etag = response.headers()
             .get(header::ETAG)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let base_url = format!("{}/groups/{}/projects?per_page=100", self.api_url, org);
         let repos = self.fetch_all_pages(response, &base_url).await?;
@@ -618,7 +616,7 @@ impl GitLabAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "GitLab API error {}: {}", status, body
+                "GitLab API error {status}: {body}"
             )));
         }
 
@@ -630,11 +628,16 @@ impl GitLabAdapter {
 mod tests {
     use super::*;
 
-    /// Mock auth provider for testing
+    /// Mock auth provider for testing.
+    ///
+    /// Referenced only by the commented-out `test_auth_headers_*` tests below.
+    /// Kept for when those tests are restored (tracked by HF-TESTS — see commit body).
+    #[allow(dead_code)]
     struct MockAuthProvider {
         token: Option<String>,
     }
 
+    #[allow(dead_code)]
     impl MockAuthProvider {
         fn with_token(token: &str) -> Self {
             Self { token: Some(token.to_string()) }

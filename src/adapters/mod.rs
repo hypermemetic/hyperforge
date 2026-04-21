@@ -1,4 +1,4 @@
-//! Forge adapters implementing ForgePort trait
+//! Forge adapters implementing `ForgePort` trait
 
 pub mod codeberg;
 pub mod forge_port;

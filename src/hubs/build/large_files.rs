@@ -27,7 +27,7 @@ pub fn scan_repo(repo_path: &std::path::Path, threshold: u64) -> Result<Vec<Larg
         .args(["ls-files"])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| format!("git ls-files failed: {}", e))?;
+        .map_err(|e| format!("git ls-files failed: {e}"))?;
 
     if output.status.success() {
         let files_str = String::from_utf8_lossy(&output.stdout);
@@ -153,7 +153,7 @@ pub fn large_files(
                 Ok((repo_name, entries, error)) => {
                     if let Some(e) = error {
                         yield HyperforgeEvent::Error {
-                            message: format!("{}: {}", repo_name, e),
+                            message: format!("{repo_name}: {e}"),
                         };
                         continue;
                     }
@@ -175,7 +175,7 @@ pub fn large_files(
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Task error: {}", e),
+                        message: format!("Task error: {e}"),
                     };
                 }
             }

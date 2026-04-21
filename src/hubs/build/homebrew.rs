@@ -48,7 +48,7 @@ impl BrewPlatform {
     }
 }
 
-/// Parse a binstall-convention asset filename into (name, target_triple, version).
+/// Parse a binstall-convention asset filename into (name, `target_triple`, version).
 ///
 /// Expected format: `{name}-{target}-v{version}.{ext}`
 /// e.g. `synapse-aarch64-apple-darwin-v3.10.1.tar.gz`
@@ -86,7 +86,7 @@ fn parse_asset_filename(filename: &str) -> Option<(String, String, String)> {
     ];
 
     for target in &known_targets {
-        if let Some(prefix) = name_and_target.strip_suffix(&format!("-{}", target)) {
+        if let Some(prefix) = name_and_target.strip_suffix(&format!("-{target}")) {
             return Some((prefix.to_string(), target.to_string(), version));
         }
     }
@@ -94,9 +94,9 @@ fn parse_asset_filename(filename: &str) -> Option<(String, String, String)> {
     None
 }
 
-/// Convert a package name to a Ruby class name (PascalCase).
+/// Convert a package name to a Ruby class name (`PascalCase`).
 fn to_class_name(name: &str) -> String {
-    name.split(|c: char| c == '-' || c == '_')
+    name.split(['-', '_'])
         .map(|part| {
             let mut chars = part.chars();
             match chars.next() {
@@ -121,10 +121,10 @@ fn generate_formula(
 ) -> String {
     let mut lines = Vec::new();
 
-    lines.push(format!("class {} < Formula", class_name));
-    lines.push(format!("  desc \"{}\"", description));
-    lines.push(format!("  homepage \"{}\"", homepage));
-    lines.push(format!("  version \"{}\"", version));
+    lines.push(format!("class {class_name} < Formula"));
+    lines.push(format!("  desc \"{description}\""));
+    lines.push(format!("  homepage \"{homepage}\""));
+    lines.push(format!("  version \"{version}\""));
     lines.push(String::new());
 
     // macOS section
@@ -174,7 +174,7 @@ fn generate_formula(
 
     lines.push(String::new());
     lines.push("  def install".to_string());
-    lines.push(format!("    bin.install \"{}\"", binary_name));
+    lines.push(format!("    bin.install \"{binary_name}\""));
     lines.push("  end".to_string());
     lines.push("end".to_string());
 
@@ -192,15 +192,15 @@ async fn download_and_hash(
     let mut request = client.get(url);
 
     // Add auth header for private repos
-    let secret_path = format!("{}/{}/token", forge, org);
+    let secret_path = format!("{forge}/{org}/token");
     if let Ok(Some(token)) = auth.get_secret(&secret_path).await {
-        request = request.header("Authorization", format!("Bearer {}", token));
+        request = request.header("Authorization", format!("Bearer {token}"));
     }
 
     let response = request
         .send()
         .await
-        .map_err(|e| format!("Failed to download {}: {}", url, e))?;
+        .map_err(|e| format!("Failed to download {url}: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -213,10 +213,10 @@ async fn download_and_hash(
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| format!("Failed to read response body from {}: {}", url, e))?;
+        .map_err(|e| format!("Failed to read response body from {url}: {e}"))?;
 
     let hash = Sha256::digest(&bytes);
-    Ok(format!("{:x}", hash))
+    Ok(format!("{hash:x}"))
 }
 
 pub fn brew_formula(
@@ -229,8 +229,8 @@ pub fn brew_formula(
     dry_run: Option<bool>,
 ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
     let is_dry_run = dry_run.unwrap_or(false);
-    let forge_name = forge.map(|f| f.as_str().to_string()).unwrap_or_else(|| "github".to_string());
-    let desc = description.unwrap_or_else(|| format!("{} — installed via Homebrew", name));
+    let forge_name = forge.map_or_else(|| "github".to_string(), |f| f.as_str().to_string());
+    let desc = description.unwrap_or_else(|| format!("{name} — installed via Homebrew"));
 
     stream! {
         let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
@@ -248,14 +248,14 @@ pub fn brew_formula(
             Ok(a) => a,
             Err(e) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to create release adapter: {}", e),
+                    message: format!("Failed to create release adapter: {e}"),
                 };
                 return;
             }
         };
 
         yield HyperforgeEvent::Info {
-            message: format!("{}Fetching release {} for {}/{} on {}", dry_prefix, tag, org, name, forge_name),
+            message: format!("{dry_prefix}Fetching release {tag} for {org}/{name} on {forge_name}"),
         };
 
         // Fetch the release by tag
@@ -263,13 +263,13 @@ pub fn brew_formula(
             Ok(Some(r)) => r,
             Ok(None) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Release {} not found for {}/{}", tag, org, name),
+                    message: format!("Release {tag} not found for {org}/{name}"),
                 };
                 return;
             }
             Err(e) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to fetch release: {}", e),
+                    message: format!("Failed to fetch release: {e}"),
                 };
                 return;
             }
@@ -292,28 +292,22 @@ pub fn brew_formula(
         let auth_provider: Arc<dyn AuthProvider> = auth;
 
         for asset in &release.assets {
-            let parsed = match parse_asset_filename(&asset.name) {
-                Some(p) => p,
-                None => {
-                    yield HyperforgeEvent::Info {
-                        message: format!("  Skipping unrecognized asset: {}", asset.name),
-                    };
-                    continue;
-                }
+            let parsed = if let Some(p) = parse_asset_filename(&asset.name) { p } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("  Skipping unrecognized asset: {}", asset.name),
+                };
+                continue;
             };
 
             let (asset_name, triple, version) = parsed;
             binary_name = asset_name;
             resolved_version = version;
 
-            let platform = match BrewPlatform::from_triple(&triple) {
-                Some(p) => p,
-                None => {
-                    yield HyperforgeEvent::Info {
-                        message: format!("  Skipping unsupported platform: {} ({})", triple, asset.name),
-                    };
-                    continue;
-                }
+            let platform = if let Some(p) = BrewPlatform::from_triple(&triple) { p } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("  Skipping unsupported platform: {} ({})", triple, asset.name),
+                };
+                continue;
             };
 
             yield HyperforgeEvent::Info {
@@ -355,10 +349,10 @@ pub fn brew_formula(
 
         // Generate the homepage URL
         let homepage = match forge_name.as_str() {
-            "github" => format!("https://github.com/{}/{}", org, name),
-            "codeberg" => format!("https://codeberg.org/{}/{}", org, name),
-            "gitlab" => format!("https://gitlab.com/{}/{}", org, name),
-            _ => format!("https://github.com/{}/{}", org, name),
+            "github" => format!("https://github.com/{org}/{name}"),
+            "codeberg" => format!("https://codeberg.org/{org}/{name}"),
+            "gitlab" => format!("https://gitlab.com/{org}/{name}"),
+            _ => format!("https://github.com/{org}/{name}"),
         };
 
         let class_name = to_class_name(&name);
@@ -374,7 +368,7 @@ pub fn brew_formula(
         // Write or emit
         if let Some(ref tap) = tap_path {
             let formula_dir = PathBuf::from(tap).join("Formula");
-            let formula_file = formula_dir.join(format!("{}.rb", name));
+            let formula_file = formula_dir.join(format!("{name}.rb"));
 
             if is_dry_run {
                 yield HyperforgeEvent::Info {
@@ -384,7 +378,7 @@ pub fn brew_formula(
             } else {
                 if let Err(e) = std::fs::create_dir_all(&formula_dir) {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to create Formula directory: {}", e),
+                        message: format!("Failed to create Formula directory: {e}"),
                     };
                     return;
                 }
@@ -397,7 +391,7 @@ pub fn brew_formula(
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to write formula: {}", e),
+                            message: format!("Failed to write formula: {e}"),
                         };
                         return;
                     }

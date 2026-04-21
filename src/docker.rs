@@ -20,7 +20,7 @@ pub enum DockerState {
 }
 
 /// Discover the Docker host socket by reading Docker config files.
-/// Priority: DOCKER_HOST env → ~/.docker/config.json context → bollard default.
+/// Priority: `DOCKER_HOST` env → ~/.docker/config.json context → bollard default.
 fn discover_docker_host() -> Option<String> {
     // 1. DOCKER_HOST env takes priority
     if let Ok(host) = std::env::var("DOCKER_HOST") {
@@ -52,7 +52,7 @@ fn discover_docker_host() -> Option<String> {
     for entry in entries.flatten() {
         let meta_path = entry.path().join("meta.json");
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
-            let name_match = format!("\"Name\":\"{}\"", ctx_name);
+            let name_match = format!("\"Name\":\"{ctx_name}\"");
             if meta_str.contains(&name_match) {
                 if let Some(host) = meta_str
                     .split("\"Host\":\"")
@@ -73,10 +73,10 @@ pub fn connect() -> Result<Docker, String> {
     if let Some(host) = discover_docker_host() {
         let sock_path = host.strip_prefix("unix://").unwrap_or(&host);
         Docker::connect_with_unix(sock_path, 120, bollard::API_DEFAULT_VERSION)
-            .map_err(|e| format!("Failed to connect to Docker at {}: {}", sock_path, e))
+            .map_err(|e| format!("Failed to connect to Docker at {sock_path}: {e}"))
     } else {
         Docker::connect_with_local_defaults()
-            .map_err(|e| format!("Failed to connect to Docker: {}", e))
+            .map_err(|e| format!("Failed to connect to Docker: {e}"))
     }
 }
 
@@ -135,10 +135,10 @@ pub async fn build_image(
                 }
                 if let Some(error) = info.error {
                     warn!(target: "hyperforge::docker::build", error = %error, "Build error");
-                    return Err(format!("Build error: {}", error));
+                    return Err(format!("Build error: {error}"));
                 }
             }
-            Err(e) => return Err(format!("Build stream error: {}", e)),
+            Err(e) => return Err(format!("Build stream error: {e}")),
         }
     }
 
@@ -156,7 +156,7 @@ pub async fn tag_image(
 
     docker.tag_image(source, Some(TagImageOptions { repo, tag }))
         .await
-        .map_err(|e| format!("Failed to tag image: {}", e))
+        .map_err(|e| format!("Failed to tag image: {e}"))
 }
 
 /// Push an image to a registry.
@@ -182,17 +182,17 @@ pub async fn push_image(
                 }
                 if let Some(error) = info.error {
                     warn!(target: "hyperforge::docker::push", error = %error, "Push error");
-                    return Err(format!("Push error: {}", error));
+                    return Err(format!("Push error: {error}"));
                 }
             }
-            Err(e) => return Err(format!("Push stream error: {}", e)),
+            Err(e) => return Err(format!("Push stream error: {e}")),
         }
     }
 
     Ok(())
 }
 
-/// Convert our RegistryAuth to bollard DockerCredentials.
+/// Convert our `RegistryAuth` to bollard `DockerCredentials`.
 pub fn to_docker_credentials(
     auth: &crate::types::RegistryAuth,
     registry: &crate::types::ContainerRegistry,
@@ -221,8 +221,8 @@ fn create_build_tar(context_path: &std::path::Path, _dockerfile: &str) -> Result
     let mut archive = tar::Builder::new(buf);
 
     archive.append_dir_all(".", context_path)
-        .map_err(|e| format!("Failed to create build context tar: {}", e))?;
+        .map_err(|e| format!("Failed to create build context tar: {e}"))?;
 
     archive.into_inner()
-        .map_err(|e| format!("Failed to finalize tar: {}", e))
+        .map_err(|e| format!("Failed to finalize tar: {e}"))
 }

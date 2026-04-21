@@ -180,7 +180,10 @@ pub const CREDENTIALS: &[CredentialSpec] = &[
 // ---------------------------------------------------------------------------
 
 /// Resolve `{org}` placeholders in a key pattern.
+#[allow(clippy::literal_string_with_formatting_args)]
 pub fn resolve_key_path(pattern: &str, org: &str) -> String {
+    // Literal template: not a format!() macro; `{org}` is a placeholder this
+    // function substitutes.
     pattern.replace("{org}", org)
 }
 
@@ -189,7 +192,7 @@ pub fn credentials_for_channels(
     channels: &[DistChannel],
     org: &str,
 ) -> Vec<ResolvedCredential> {
-    let channel_tags: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
+    let channel_tags: Vec<String> = channels.iter().map(std::string::ToString::to_string).collect();
 
     let mut out = Vec::new();
     for spec in CREDENTIALS {
@@ -219,7 +222,10 @@ pub fn credentials_for_forge(forge: &Forge, org: &str) -> Vec<ResolvedCredential
         Forge::GitLab => "gitlab/",
     };
 
-    // The primary token pattern for each forge is `<forge>/{org}/token`
+    // The primary token pattern for each forge is `<forge>/{org}/token`.
+    // The `{{org}}` escape yields a literal `{org}` placeholder for the
+    // credentials catalogue to compare against — not a format arg.
+    #[allow(clippy::literal_string_with_formatting_args)]
     let primary_pattern = format!("{prefix}{{org}}/token");
 
     CREDENTIALS
@@ -269,13 +275,13 @@ pub async fn preflight_check(
         Ok(s) => s,
         Err(e) => {
             return vec![HyperforgeEvent::Error {
-                message: format!("Pre-flight: failed to initialize secrets storage: {}", e),
+                message: format!("Pre-flight: failed to initialize secrets storage: {e}"),
             }];
         }
     };
     if let Err(e) = storage.load().await {
         return vec![HyperforgeEvent::Error {
-            message: format!("Pre-flight: failed to load secrets: {}", e),
+            message: format!("Pre-flight: failed to load secrets: {e}"),
         }];
     }
 
@@ -351,8 +357,7 @@ pub async fn preflight_check(
         ));
     }
     detail_lines.push_str(&format!(
-        "\nAborting. Run `auth setup --org {}` to configure missing credentials.",
-        org,
+        "\nAborting. Run `auth setup --org {org}` to configure missing credentials.",
     ));
 
     events.push(HyperforgeEvent::Error {

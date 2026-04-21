@@ -6,7 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use super::{CiConfig, DistConfig, ForgeConfig, Forge, Visibility};
 
-pub(crate) fn is_false(b: &bool) -> bool {
+/// Serde helper: required signature is `fn(&T) -> bool` for
+/// `#[serde(skip_serializing_if = ...)]`, so passing `&bool` is mandatory
+/// even though clippy prefers by-value for `Copy` types.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) const fn is_false(b: &bool) -> bool {
     !*b
 }
 
@@ -64,7 +68,7 @@ impl Repo {
     }
 
     /// Set repository visibility
-    pub fn with_visibility(mut self, visibility: Visibility) -> Self {
+    pub const fn with_visibility(mut self, visibility: Visibility) -> Self {
         self.visibility = visibility;
         self
     }
@@ -86,13 +90,13 @@ impl Repo {
     }
 
     /// Mark as protected
-    pub fn with_protected(mut self, protected: bool) -> Self {
+    pub const fn with_protected(mut self, protected: bool) -> Self {
         self.protected = protected;
         self
     }
 
     /// Mark as staged for deletion
-    pub fn with_staged_for_deletion(mut self, staged: bool) -> Self {
+    pub const fn with_staged_for_deletion(mut self, staged: bool) -> Self {
         self.staged_for_deletion = staged;
         self
     }
@@ -105,9 +109,9 @@ impl Repo {
     }
 }
 
-/// Annotated state-mirror type for LocalForge internal storage.
+/// Annotated state-mirror type for `LocalForge` internal storage.
 ///
-/// Unlike `Repo` (which uses origin/mirrors model for ForgePort compatibility),
+/// Unlike `Repo` (which uses origin/mirrors model for `ForgePort` compatibility),
 /// `RepoRecord` tracks the full lifecycle state of a repository: which forges
 /// it's present on, whether it's managed, soft-deletion state, and rename history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +146,7 @@ pub struct RepoRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<PathBuf>,
 
-    /// Which forges this repo should sync to (e.g. ["github", "codeberg"])
+    /// Which forges this repo should sync to (e.g. `["github", "codeberg"]`)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forges: Vec<String>,
 
@@ -197,10 +201,10 @@ impl RepoRecord {
         }
     }
 
-    /// Absorb fields from a per-repo HyperforgeConfig into this record.
+    /// Absorb fields from a per-repo `HyperforgeConfig` into this record.
     ///
     /// Only fills in fields that are currently empty/None in the record,
-    /// preserving any existing values (LocalForge wins over per-repo config).
+    /// preserving any existing values (`LocalForge` wins over per-repo config).
     pub fn merge_from_config(&mut self, config: &crate::config::HyperforgeConfig) {
         if self.forges.is_empty() {
             self.forges = config.forges.clone();
@@ -227,9 +231,9 @@ impl RepoRecord {
         }
     }
 
-    /// Convert back to Repo for ForgePort compatibility
+    /// Convert back to Repo for `ForgePort` compatibility
     ///
-    /// Dismissed records are surfaced as private + staged_for_deletion so they
+    /// Dismissed records are surfaced as private + `staged_for_deletion` so they
     /// remain visible in listings but clearly marked as soft-deleted.
     pub fn to_repo(&self) -> Repo {
         let forges: Vec<Forge> = self.present_on.iter().cloned().collect();

@@ -1,4 +1,4 @@
-//! Shared helpers used by both WorkspaceHub and BuildHub.
+//! Shared helpers used by both `WorkspaceHub` and `BuildHub`.
 
 use std::sync::Arc;
 
@@ -15,14 +15,14 @@ pub(crate) fn make_adapter(
     owner_type: Option<OwnerType>,
 ) -> Result<Arc<dyn ForgePort>, String> {
     let auth = YamlAuthProvider::new()
-        .map_err(|e| format!("Failed to create auth provider: {}", e))?;
+        .map_err(|e| format!("Failed to create auth provider: {e}"))?;
     let auth = Arc::new(auth);
     let target_forge = HyperforgeConfig::parse_forge(forge)
-        .ok_or_else(|| format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge))?;
+        .ok_or_else(|| format!("Invalid forge: {forge}. Must be github, codeberg, or gitlab"))?;
     let adapter: Arc<dyn ForgePort> = match target_forge {
         Forge::GitHub => {
             let a = GitHubAdapter::new(auth, org)
-                .map_err(|e| format!("Failed to create GitHub adapter: {}", e))?;
+                .map_err(|e| format!("Failed to create GitHub adapter: {e}"))?;
             Arc::new(match owner_type {
                 Some(ot) => a.with_owner_type(ot),
                 None => a,
@@ -30,7 +30,7 @@ pub(crate) fn make_adapter(
         }
         Forge::Codeberg => {
             let a = CodebergAdapter::new(auth, org)
-                .map_err(|e| format!("Failed to create Codeberg adapter: {}", e))?;
+                .map_err(|e| format!("Failed to create Codeberg adapter: {e}"))?;
             Arc::new(match owner_type {
                 Some(ot) => a.with_owner_type(ot),
                 None => a,
@@ -38,7 +38,7 @@ pub(crate) fn make_adapter(
         }
         Forge::GitLab => {
             let a = GitLabAdapter::new(auth, org)
-                .map_err(|e| format!("Failed to create GitLab adapter: {}", e))?;
+                .map_err(|e| format!("Failed to create GitLab adapter: {e}"))?;
             Arc::new(match owner_type {
                 Some(ot) => a.with_owner_type(ot),
                 None => a,
@@ -98,13 +98,13 @@ impl RepoFilter {
         self.include.iter().any(|pat| glob_match(pat, name))
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
     }
 }
 
-/// Build a default WorkspaceSummary event with all optional fields set to None.
-pub(crate) fn workspace_summary(
+/// Build a default `WorkspaceSummary` event with all optional fields set to None.
+pub(crate) const fn workspace_summary(
     ctx: &crate::commands::workspace::WorkspaceContext,
 ) -> HyperforgeEvent {
     HyperforgeEvent::WorkspaceSummary {
@@ -121,7 +121,7 @@ pub(crate) fn workspace_summary(
 }
 
 /// Return a prefix string for dry-run messages.
-pub fn dry_prefix(is_dry_run: bool) -> &'static str {
+pub const fn dry_prefix(is_dry_run: bool) -> &'static str {
     if is_dry_run {
         "[DRY RUN] "
     } else {

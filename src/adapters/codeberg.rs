@@ -1,4 +1,4 @@
-//! Codeberg adapter implementing ForgePort trait
+//! Codeberg adapter implementing `ForgePort` trait
 //!
 //! Uses the Gitea/Forgejo API v1 (Codeberg runs Forgejo).
 
@@ -55,7 +55,7 @@ struct RenameRepoRequest {
     name: String,
 }
 
-/// Codeberg adapter for ForgePort trait
+/// Codeberg adapter for `ForgePort` trait
 pub struct CodebergAdapter {
     client: Client,
     auth: Arc<dyn AuthProvider>,
@@ -65,12 +65,12 @@ pub struct CodebergAdapter {
 }
 
 impl CodebergAdapter {
-    /// Create a new CodebergAdapter with the given auth provider
+    /// Create a new `CodebergAdapter` with the given auth provider
     pub fn new(auth: Arc<dyn AuthProvider>, org: impl Into<String>) -> ForgeResult<Self> {
         Self::with_api_url(auth, org, CODEBERG_API_URL.to_string())
     }
 
-    /// Create a new CodebergAdapter with a custom API URL (for testing)
+    /// Create a new `CodebergAdapter` with a custom API URL (for testing)
     pub fn with_api_url(auth: Arc<dyn AuthProvider>, org: impl Into<String>, api_url: String) -> ForgeResult<Self> {
         let client = Client::builder()
             .user_agent("hyperforge/2.0")
@@ -81,7 +81,7 @@ impl CodebergAdapter {
     }
 
     /// Set the owner type for this adapter (user vs org)
-    pub fn with_owner_type(mut self, ot: OwnerType) -> Self {
+    pub const fn with_owner_type(mut self, ot: OwnerType) -> Self {
         self.owner_type = Some(ot);
         self
     }
@@ -100,7 +100,7 @@ impl CodebergAdapter {
         // Gitea/Forgejo uses "token" instead of "Bearer"
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("token {}", token))
+            header::HeaderValue::from_str(&format!("token {token}"))
                 .map_err(|e| ForgeError::AuthenticationFailed { message: e.to_string() })?,
         );
         headers.insert(
@@ -130,14 +130,14 @@ impl CodebergAdapter {
     }
 
     /// Parse X-Total-Count header from Codeberg/Gitea response to compute total pages.
-    /// Returns the total number of pages (ceil(total_count / per_page)).
+    /// Returns the total number of pages (`ceil(total_count` / `per_page`)).
     fn parse_total_pages(response: &Response, per_page: u32) -> Option<u32> {
         let total_count_str = response.headers().get("x-total-count")?.to_str().ok()?;
         let total_count: u32 = total_count_str.parse().ok()?;
         if total_count == 0 {
             return Some(1);
         }
-        Some((total_count + per_page - 1) / per_page)
+        Some(total_count.div_ceil(per_page))
     }
 
     /// Fetch all pages of Codeberg repos from a paginated endpoint.
@@ -151,7 +151,7 @@ impl CodebergAdapter {
         let total_pages = Self::parse_total_pages(&first_response, 100);
 
         let first_repos: Vec<CodebergRepo> = first_response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         let mut all_repos: Vec<Repo> = first_repos.into_iter().map(Self::to_repo).collect();
 
@@ -169,7 +169,7 @@ impl CodebergAdapter {
         for page in 2..=total_pages {
             let client = self.client.clone();
             let hdrs = headers.clone();
-            let url = format!("{}{separator}page={page}", base_url);
+            let url = format!("{base_url}{separator}page={page}");
 
             join_set.spawn(async move {
                 let response = client.get(&url)
@@ -182,12 +182,12 @@ impl CodebergAdapter {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
                     return Err(ForgeError::ApiError(format!(
-                        "Codeberg API error {}: {}", status, body
+                        "Codeberg API error {status}: {body}"
                     )));
                 }
 
                 let repos: Vec<CodebergRepo> = response.json().await
-                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+                    .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
                 Ok(repos)
             });
@@ -196,7 +196,7 @@ impl CodebergAdapter {
             if join_set.len() >= 10 {
                 if let Some(result) = join_set.join_next().await {
                     let repos = result
-                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                        .map_err(|e| ForgeError::ApiError(format!("Task join error: {e}")))??;
                     all_repos.extend(repos.into_iter().map(Self::to_repo));
                 }
             }
@@ -205,7 +205,7 @@ impl CodebergAdapter {
         // Collect remaining results
         while let Some(result) = join_set.join_next().await {
             let repos = result
-                .map_err(|e| ForgeError::ApiError(format!("Task join error: {}", e)))??;
+                .map_err(|e| ForgeError::ApiError(format!("Task join error: {e}")))??;
             all_repos.extend(repos.into_iter().map(Self::to_repo));
         }
 
@@ -239,7 +239,7 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -264,12 +264,12 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
         let cb_repo: CodebergRepo = response.json().await
-            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ForgeError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(Self::to_repo(cb_repo))
     }
@@ -311,14 +311,14 @@ impl ForgePort for CodebergAdapter {
             if body.contains("already exists") || body.contains("conflict") {
                 return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
             }
-            return Err(ForgeError::ApiError(format!("Codeberg API error: {}", body)));
+            return Err(ForgeError::ApiError(format!("Codeberg API error: {body}")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -350,7 +350,7 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -382,7 +382,7 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -408,7 +408,7 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -436,7 +436,7 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -466,7 +466,7 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -491,7 +491,7 @@ impl ForgePort for CodebergAdapter {
             headers.insert(
                 header::IF_NONE_MATCH,
                 header::HeaderValue::from_str(etag_value)
-                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {}", e)))?,
+                    .map_err(|e| ForgeError::ApiError(format!("Invalid ETag value: {e}")))?,
             );
         }
 
@@ -507,7 +507,7 @@ impl ForgePort for CodebergAdapter {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(ListResult {
                 repos: None,
-                etag: etag,
+                etag,
                 modified: false,
             });
         }
@@ -526,14 +526,14 @@ impl ForgePort for CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
         let new_etag = response.headers()
             .get(header::ETAG)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let base_url = format!("{}/orgs/{}/repos?limit=100", self.api_url, org);
         let repos = self.fetch_all_pages(response, &base_url).await?;
@@ -562,7 +562,7 @@ impl CodebergAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -597,14 +597,14 @@ impl CodebergAdapter {
             if body.contains("already exists") || body.contains("conflict") {
                 return Err(ForgeError::RepoAlreadyExists { name: repo.name.clone() });
             }
-            return Err(ForgeError::ApiError(format!("Codeberg API error: {}", body)));
+            return Err(ForgeError::ApiError(format!("Codeberg API error: {body}")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(ForgeError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
@@ -616,11 +616,16 @@ impl CodebergAdapter {
 mod tests {
     use super::*;
 
-    /// Mock auth provider for testing
+    /// Mock auth provider for testing.
+    ///
+    /// Referenced only by the commented-out `test_auth_headers_*` tests below.
+    /// Kept for when those tests are restored (tracked by HF-TESTS — see commit body).
+    #[allow(dead_code)]
     struct MockAuthProvider {
         token: Option<String>,
     }
 
+    #[allow(dead_code)]
     impl MockAuthProvider {
         fn with_token(token: &str) -> Self {
             Self { token: Some(token.to_string()) }

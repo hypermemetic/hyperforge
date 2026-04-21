@@ -16,10 +16,10 @@ use crate::types::Forge;
 
 fn forge_url_base(forge: &str, org: &str, repo_name: &str) -> String {
     match forge {
-        "codeberg" => format!("https://codeberg.org/{}/{}", org, repo_name),
-        "gitlab" => format!("https://gitlab.com/{}/{}", org, repo_name),
+        "codeberg" => format!("https://codeberg.org/{org}/{repo_name}"),
+        "gitlab" => format!("https://gitlab.com/{org}/{repo_name}"),
         // Default to GitHub
-        _ => format!("https://github.com/{}/{}", org, repo_name),
+        _ => format!("https://github.com/{org}/{repo_name}"),
     }
 }
 
@@ -48,11 +48,11 @@ fn inject_binstall(
     }
 
     let content = std::fs::read_to_string(&cargo_path)
-        .map_err(|e| format!("failed to read Cargo.toml: {}", e))?;
+        .map_err(|e| format!("failed to read Cargo.toml: {e}"))?;
 
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("failed to parse Cargo.toml: {}", e))?;
+        .map_err(|e| format!("failed to parse Cargo.toml: {e}"))?;
 
     // Check if binstall metadata already exists
     if doc
@@ -100,7 +100,7 @@ fn inject_binstall(
         doc["package"]["metadata"]["binstall"]["pkg-fmt"] = toml_edit::value(pkg_fmt);
 
         std::fs::write(&cargo_path, doc.to_string())
-            .map_err(|e| format!("failed to write Cargo.toml: {}", e))?;
+            .map_err(|e| format!("failed to write Cargo.toml: {e}"))?;
     }
 
     Ok(BinstallResult::Injected { pkg_url })
@@ -177,7 +177,7 @@ pub fn binstall_init(
                 Ok(BinstallResult::Skipped) => {
                     skipped += 1;
                     yield HyperforgeEvent::Info {
-                        message: format!("  {}: already has binstall metadata, skipped", dir_name),
+                        message: format!("  {dir_name}: already has binstall metadata, skipped"),
                     };
                 }
                 Ok(BinstallResult::NotCargo) => {
@@ -186,13 +186,13 @@ pub fn binstall_init(
                 Ok(BinstallResult::Injected { pkg_url }) => {
                     injected += 1;
                     yield HyperforgeEvent::Info {
-                        message: format!("{}  {}: injected binstall metadata (pkg-url: {})", prefix, dir_name, pkg_url),
+                        message: format!("{prefix}  {dir_name}: injected binstall metadata (pkg-url: {pkg_url})"),
                     };
                 }
                 Err(e) => {
                     failed += 1;
                     yield HyperforgeEvent::Error {
-                        message: format!("  {}: {}", dir_name, e),
+                        message: format!("  {dir_name}: {e}"),
                     };
                 }
             }
@@ -200,8 +200,7 @@ pub fn binstall_init(
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Binstall init complete: {} injected, {} already configured, {} non-Cargo, {} failed",
-                prefix, injected, skipped, not_cargo, failed
+                "{prefix}Binstall init complete: {injected} injected, {skipped} already configured, {not_cargo} non-Cargo, {failed} failed"
             ),
         };
     }

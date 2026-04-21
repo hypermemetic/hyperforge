@@ -1,6 +1,6 @@
 //! Release adapters for creating, uploading, and managing forge releases.
 //!
-//! Separate from ForgePort — different domain (release artifacts), different API
+//! Separate from `ForgePort` — different domain (release artifacts), different API
 //! surfaces (upload endpoints, asset management).
 
 pub mod codeberg;

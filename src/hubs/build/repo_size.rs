@@ -14,7 +14,7 @@ fn measure_repo(repo_path: &std::path::Path) -> Result<(usize, u64), String> {
         .args(["ls-files"])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| format!("git ls-files failed: {}", e))?;
+        .map_err(|e| format!("git ls-files failed: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -89,7 +89,7 @@ pub fn repo_sizes(
                 Ok((repo_name, tracked_files, total_bytes, error)) => {
                     if let Some(e) = error {
                         yield HyperforgeEvent::Error {
-                            message: format!("{}: {}", repo_name, e),
+                            message: format!("{repo_name}: {e}"),
                         };
                     } else {
                         entries.push((repo_name, tracked_files, total_bytes));
@@ -97,7 +97,7 @@ pub fn repo_sizes(
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Task error: {}", e),
+                        message: format!("Task error: {e}"),
                     };
                 }
             }

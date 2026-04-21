@@ -62,7 +62,7 @@ fn default_patterns() -> Vec<(&'static str, &'static [&'static str])> {
 // Build-system-aware patterns
 // ---------------------------------------------------------------------------
 
-fn patterns_for_build_system(kind: &BuildSystemKind) -> Option<(&'static str, &'static [&'static str])> {
+const fn patterns_for_build_system(kind: &BuildSystemKind) -> Option<(&'static str, &'static [&'static str])> {
     match kind {
         BuildSystemKind::Cargo => Some(("Cargo", &["target/"])),
         BuildSystemKind::Cabal => Some(("Cabal", &[
@@ -101,7 +101,7 @@ fn ensure_patterns(
 
     let existing_content = if gitignore_path.exists() {
         std::fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("failed to read .gitignore: {}", e))?
+            .map_err(|e| format!("failed to read .gitignore: {e}"))?
     } else {
         String::new()
     };
@@ -124,7 +124,7 @@ fn ensure_patterns(
     // Add build-system-specific patterns
     let mut seen_bs: HashSet<String> = HashSet::new();
     for bs in build_systems {
-        let key = format!("{:?}", bs);
+        let key = format!("{bs:?}");
         if seen_bs.contains(&key) {
             continue;
         }
@@ -147,7 +147,7 @@ fn ensure_patterns(
         let missing: Vec<String> = pats
             .iter()
             .filter(|p| !existing.contains(**p))
-            .map(|p| p.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         if !missing.is_empty() {
             additions.push((label.to_string(), missing));
@@ -179,7 +179,7 @@ fn ensure_patterns(
     appendix.push_str("\n# --- Added by hyperforge ---\n");
 
     for (label, pats) in &additions {
-        appendix.push_str(&format!("\n# {}\n", label));
+        appendix.push_str(&format!("\n# {label}\n"));
         for p in pats {
             appendix.push_str(p);
             appendix.push('\n');
@@ -190,7 +190,7 @@ fn ensure_patterns(
         let mut full = existing_content;
         full.push_str(&appendix);
         std::fs::write(&gitignore_path, full)
-            .map_err(|e| format!("failed to write .gitignore: {}", e))?;
+            .map_err(|e| format!("failed to write .gitignore: {e}"))?;
     }
 
     if existed {
@@ -280,7 +280,8 @@ pub fn gitignore_sync(
         };
 
         // Run ensure_patterns in parallel
-        let work: Vec<(String, PathBuf, Vec<BuildSystemKind>, Vec<String>, bool)> = items
+        type GitignoreWorkItem = (String, PathBuf, Vec<BuildSystemKind>, Vec<String>, bool);
+        let work: Vec<GitignoreWorkItem> = items
             .into_iter()
             .map(|item| {
                 (
@@ -309,31 +310,31 @@ pub fn gitignore_sync(
                 Ok((name, Ok(GitignoreResult::Unchanged))) => {
                     unchanged += 1;
                     yield HyperforgeEvent::Info {
-                        message: format!("  {}: unchanged", name),
+                        message: format!("  {name}: unchanged"),
                     };
                 }
                 Ok((name, Ok(GitignoreResult::Updated { added }))) => {
                     updated += 1;
                     yield HyperforgeEvent::Info {
-                        message: format!("{}  {}: added {} patterns", prefix, name, added),
+                        message: format!("{prefix}  {name}: added {added} patterns"),
                     };
                 }
                 Ok((name, Ok(GitignoreResult::Created { added }))) => {
                     created += 1;
                     yield HyperforgeEvent::Info {
-                        message: format!("{}  {}: created .gitignore ({} patterns)", prefix, name, added),
+                        message: format!("{prefix}  {name}: created .gitignore ({added} patterns)"),
                     };
                 }
                 Ok((name, Err(e))) => {
                     failed += 1;
                     yield HyperforgeEvent::Error {
-                        message: format!("  {}: {}", name, e),
+                        message: format!("  {name}: {e}"),
                     };
                 }
                 Err(e) => {
                     failed += 1;
                     yield HyperforgeEvent::Error {
-                        message: format!("Task error: {}", e),
+                        message: format!("Task error: {e}"),
                     };
                 }
             }
@@ -341,8 +342,7 @@ pub fn gitignore_sync(
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Gitignore sync complete: {} created, {} updated, {} unchanged, {} failed",
-                prefix, created, updated, unchanged, failed
+                "{prefix}Gitignore sync complete: {created} created, {updated} updated, {unchanged} unchanged, {failed} failed"
             ),
         };
     }

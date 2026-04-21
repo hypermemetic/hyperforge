@@ -15,7 +15,7 @@ fn main() {
 
     // args[0] = "hyperforge-ssh"
     // args[1..] = SSH arguments that git passes (hostname, command, etc.)
-    let ssh_args: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+    let ssh_args: Vec<&str> = args[1..].iter().map(std::string::String::as_str).collect();
 
     // Try to find the right key; fall back to plain ssh on any failure
     match find_ssh_key(&ssh_args) {
@@ -49,7 +49,7 @@ fn find_ssh_key(ssh_args: &[&str]) -> Option<String> {
         .join(".config")
         .join("hyperforge")
         .join("orgs")
-        .join(format!("{}.toml", org));
+        .join(format!("{org}.toml"));
 
     read_ssh_key_from_org_config(&org_config_path, &forge_name)
 }
@@ -130,9 +130,9 @@ fn read_ssh_key_from_org_config(config_path: &Path, forge: &str) -> Option<Strin
                 let value = value.trim().trim_matches('"').trim_matches('\'');
                 if !value.is_empty() {
                     // Expand ~ to home dir
-                    let expanded = if value.starts_with("~/") {
+                    let expanded = if let Some(rel) = value.strip_prefix("~/") {
                         if let Some(home) = dirs::home_dir() {
-                            home.join(&value[2..]).to_string_lossy().to_string()
+                            home.join(rel).to_string_lossy().to_string()
                         } else {
                             value.to_string()
                         }
@@ -161,7 +161,7 @@ fn exec_ssh_with_key(key_path: &str, ssh_args: &[&str]) -> ! {
         .exec();
 
     // exec() only returns on error
-    eprintln!("hyperforge-ssh: failed to exec ssh: {}", err);
+    eprintln!("hyperforge-ssh: failed to exec ssh: {err}");
     std::process::exit(1);
 }
 
@@ -171,6 +171,6 @@ fn exec_plain_ssh(ssh_args: &[&str]) -> ! {
         .args(ssh_args)
         .exec();
 
-    eprintln!("hyperforge-ssh: failed to exec ssh: {}", err);
+    eprintln!("hyperforge-ssh: failed to exec ssh: {err}");
     std::process::exit(1);
 }
