@@ -102,12 +102,14 @@ impl RepoHub {
     }
 }
 
+// TODO(HF-IR): remove the deprecated `hub` argument; hub mode is inferred from #[child] gates in plexus-macros 0.6.
 #[plexus_macros::activation(
     namespace = "repo",
     description = "Single-repo operations and registry CRUD",
     crate_path = "plexus_core",
     hub
 )]
+#[allow(deprecated)]
 impl RepoHub {
     /// List repositories for an organization (from LocalForge)
     #[plexus_macros::method(

@@ -473,12 +473,14 @@ impl Default for HyperforgeHub {
     }
 }
 
+// TODO(HF-IR): remove the deprecated `hub` argument; hub mode is inferred from #[child] gates in plexus-macros 0.6.
 #[plexus_macros::activation(
     namespace = "hyperforge",
     description = "Multi-forge repository management",
     crate_path = "plexus_core",
     hub
 )]
+#[allow(deprecated)]
 impl HyperforgeHub {
     /// Show hyperforge status
     #[plexus_macros::method(description = "Show hyperforge status and version")]
