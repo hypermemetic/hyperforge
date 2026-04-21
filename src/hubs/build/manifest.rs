@@ -1,4 +1,4 @@
-//! Manifest generation and analysis: unify, analyze, detect_name_mismatches.
+//! Manifest generation and analysis: unify, analyze, `detect_name_mismatches`.
 
 use async_stream::stream;
 use futures::Stream;
@@ -38,16 +38,16 @@ pub fn unify(
 
             let crates: Vec<crate::build_system::cargo_config::CrateInfo> = rust_repos
                 .iter()
-                .filter_map(|repo| {
+                .map(|repo| {
                     let name = repo.effective_name();
                     let version = repo.package_version.clone().unwrap_or_else(|| "0.0.0".to_string());
                     let rel_path = repo.dir_name.clone();
-                    Some(crate::build_system::cargo_config::CrateInfo {
+                    crate::build_system::cargo_config::CrateInfo {
                         name,
                         version,
                         path: rel_path,
                         dependencies: repo.dependencies.clone(),
-                    })
+                    }
                 })
                 .collect();
 
@@ -82,7 +82,7 @@ pub fn unify(
                     if !report.patches.is_empty() {
                         for (name, path) in &report.patches {
                             yield HyperforgeEvent::Info {
-                                message: format!("  patch: {} -> {}", name, path),
+                                message: format!("  patch: {name} -> {path}"),
                             };
                         }
                     }
@@ -100,13 +100,13 @@ pub fn unify(
                             action: cleanup_str.to_string(),
                         };
                         yield HyperforgeEvent::Info {
-                            message: format!("  {}{} [{}]", dry_prefix, desc, cleanup_str),
+                            message: format!("  {dry_prefix}{desc} [{cleanup_str}]"),
                         };
                     }
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to generate .cargo/config.toml: {}", e),
+                        message: format!("Failed to generate .cargo/config.toml: {e}"),
                     };
                 }
             }
@@ -156,7 +156,7 @@ pub fn unify(
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to generate cabal.project: {}", e),
+                        message: format!("Failed to generate cabal.project: {e}"),
                     };
                 }
             }
@@ -220,14 +220,18 @@ pub fn analyze(
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Cycle detected: {}", e),
+                            message: format!("Cycle detected: {e}"),
                         };
                     }
                 }
 
                 // Show mismatches summary
                 let mismatches = graph.version_mismatches();
-                if !mismatches.is_empty() {
+                if mismatches.is_empty() {
+                    yield HyperforgeEvent::Info {
+                        message: "No version mismatches detected.".to_string(),
+                    };
+                } else {
                     yield HyperforgeEvent::Info {
                         message: format!("\n{} version mismatches:", mismatches.len()),
                     };
@@ -239,10 +243,6 @@ pub fn analyze(
                             local_version: m.local_version.clone(),
                         };
                     }
-                } else {
-                    yield HyperforgeEvent::Info {
-                        message: "No version mismatches detected.".to_string(),
-                    };
                 }
             }
 
@@ -302,8 +302,7 @@ pub fn analyze(
             other => {
                 yield HyperforgeEvent::Error {
                     message: format!(
-                        "Unknown format '{}'. Valid: summary, graph, mismatches",
-                        other
+                        "Unknown format '{other}'. Valid: summary, graph, mismatches"
                     ),
                 };
             }
@@ -360,13 +359,12 @@ pub fn detect_name_mismatches(
         let unconfigured_count = ctx.unconfigured_repos.len();
         if mismatches == 0 && unconfigured_count == 0 {
             yield HyperforgeEvent::Info {
-                message: format!("All {} packages match their directory names. No unconfigured repos.", checked),
+                message: format!("All {checked} packages match their directory names. No unconfigured repos."),
             };
         } else {
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "{} name mismatches, {} unconfigured repos (across {} configured packages).",
-                    mismatches, unconfigured_count, checked
+                    "{mismatches} name mismatches, {unconfigured_count} unconfigured repos (across {checked} configured packages)."
                 ),
             };
         }

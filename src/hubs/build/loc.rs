@@ -16,7 +16,7 @@ fn measure_loc(repo_path: &std::path::Path) -> Result<(usize, usize, HashMap<Str
         .args(["ls-files"])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| format!("git ls-files failed: {}", e))?;
+        .map_err(|e| format!("git ls-files failed: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -103,7 +103,7 @@ pub fn loc(
                 Ok((repo_name, total_lines, total_files, by_extension, error)) => {
                     if let Some(e) = error {
                         yield HyperforgeEvent::Error {
-                            message: format!("{}: {}", repo_name, e),
+                            message: format!("{repo_name}: {e}"),
                         };
                     } else {
                         entries.push((repo_name, total_lines, total_files, by_extension));
@@ -111,7 +111,7 @@ pub fn loc(
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Task error: {}", e),
+                        message: format!("Task error: {e}"),
                     };
                 }
             }
@@ -142,7 +142,7 @@ pub fn loc(
         let mut ext_list: Vec<_> = workspace_ext.into_iter().collect();
         ext_list.sort_by(|a, b| b.1.cmp(&a.1));
         let top: Vec<String> = ext_list.iter().take(5)
-            .map(|(ext, lines)| format!(".{}: {}", ext, lines))
+            .map(|(ext, lines)| format!(".{ext}: {lines}"))
             .collect();
 
         yield HyperforgeEvent::Info {

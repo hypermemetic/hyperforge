@@ -45,7 +45,7 @@ pub fn run(
             Ok(t) => t,
             Err(e) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Dependency cycle detected: {:?}", e),
+                    message: format!("Dependency cycle detected: {e:?}"),
                 };
                 return;
             }
@@ -92,7 +92,7 @@ pub fn run(
         let mut total_repos = 0usize;
         let mut total_steps = 0usize;
         let mut skipped = 0usize;
-        for (_, (_, runners, skip)) in &repo_runners {
+        for (_, runners, skip) in repo_runners.values() {
             if *skip {
                 skipped += 1;
                 continue;
@@ -108,14 +108,13 @@ pub fn run(
             Some(0) => "level 0 (quick check)",
             Some(1) => "level 1 (full build)",
             Some(2) => "level 2 (containerized)",
-            Some(n) => { yield HyperforgeEvent::Info { message: format!("Level {}", n) }; "custom" },
+            Some(n) => { yield HyperforgeEvent::Info { message: format!("Level {n}") }; "custom" },
             None => "all local runners",
         };
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}Running {} — {} repos, ~{} steps, {} skipped",
-                dry, level_desc, total_repos, total_steps, skipped,
+                "{dry}Running {level_desc} — {total_repos} repos, ~{total_steps} steps, {skipped} skipped",
             ),
         };
 
@@ -167,7 +166,7 @@ pub fn run(
                         let build_cmd = runner.build.join(" ");
                         yield HyperforgeEvent::ValidateStep {
                             repo_name: name.clone(),
-                            step: format!("L{} build: {}", idx, build_cmd),
+                            step: format!("L{idx} build: {build_cmd}"),
                             status: "dry-run".into(),
                             duration_ms: 0,
                         };
@@ -175,7 +174,7 @@ pub fn run(
                             let test_cmd = runner.test.join(" ");
                             yield HyperforgeEvent::ValidateStep {
                                 repo_name: name.clone(),
-                                step: format!("L{} test: {}", idx, test_cmd),
+                                step: format!("L{idx} test: {test_cmd}"),
                                 status: "dry-run".into(),
                                 duration_ms: 0,
                             };
@@ -215,11 +214,11 @@ pub fn run(
                             let (status, ok) = match result {
                                 Ok(output) if output.success => ("passed".into(), true),
                                 Ok(output) => (format!("failed (exit {}): {}", output.code, output.stderr.chars().take(200).collect::<String>()), false),
-                                Err(e) => (format!("error: {}", e), false),
+                                Err(e) => (format!("error: {e}"), false),
                             };
                             steps.push((
                                 repo_name.clone(),
-                                format!("L{} build", idx),
+                                format!("L{idx} build"),
                                 status,
                                 duration_ms,
                                 ok,
@@ -244,11 +243,11 @@ pub fn run(
                             let (status, ok) = match result {
                                 Ok(output) if output.success => ("passed".into(), true),
                                 Ok(output) => (format!("failed (exit {}): {}", output.code, output.stderr.chars().take(200).collect::<String>()), false),
-                                Err(e) => (format!("error: {}", e), false),
+                                Err(e) => (format!("error: {e}"), false),
                             };
                             steps.push((
                                 repo_name.clone(),
-                                format!("L{} test", idx),
+                                format!("L{idx} test"),
                                 status,
                                 duration_ms,
                                 ok,
@@ -277,7 +276,7 @@ pub fn run(
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Task error: {}", e),
+                            message: format!("Task error: {e}"),
                         };
                         failed += 1;
                     }
@@ -287,7 +286,7 @@ pub fn run(
             // If any failures in this tier, stop (deps failed, downstream won't work)
             if failed > 0 {
                 yield HyperforgeEvent::Error {
-                    message: format!("Tier {} had failures — stopping", tier_idx),
+                    message: format!("Tier {tier_idx} had failures — stopping"),
                 };
                 break;
             }
@@ -376,7 +375,9 @@ pub fn init_configs(
                 message: format!("{}{}: {} runners [{}]", dry, name, ci.runners.len(), runner_desc.join(", ")),
             };
 
-            if !is_dry_run {
+            if is_dry_run {
+                written += 1;
+            } else {
                 // Load existing config or create minimal one
                 let mut config = repo.config.clone().unwrap_or_else(|| {
                     crate::config::HyperforgeConfig::default()
@@ -384,22 +385,19 @@ pub fn init_configs(
                 config.ci = Some(ci);
 
                 match config.save(&repo.path) {
-                    Ok(_) => { written += 1; }
+                    Ok(()) => { written += 1; }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to write config for {}: {}", name, e),
+                            message: format!("Failed to write config for {name}: {e}"),
                         };
                     }
                 }
-            } else {
-                written += 1;
             }
         }
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{}CI init: {} written, {} already configured, {} no build system",
-                dry, written, skipped_existing, skipped_no_bs,
+                "{dry}CI init: {written} written, {skipped_existing} already configured, {skipped_no_bs} no build system",
             ),
         };
     }
@@ -434,8 +432,8 @@ async fn execute_runner_cmd(
                     stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                     stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 }),
-                Ok(Err(e)) => Err(format!("Failed to execute: {}", e)),
-                Err(_) => Err(format!("Timeout after {}s", timeout_secs)),
+                Ok(Err(e)) => Err(format!("Failed to execute: {e}")),
+                Err(_) => Err(format!("Timeout after {timeout_secs}s")),
             }
         }
         RunnerType::Docker => {
@@ -453,7 +451,7 @@ async fn execute_runner_cmd(
             ];
             for (k, v) in env {
                 docker_args.push("-e".to_string());
-                docker_args.push(format!("{}={}", k, v));
+                docker_args.push(format!("{k}={v}"));
             }
             docker_args.push(img.to_string());
             docker_args.push("sh".to_string());
@@ -475,8 +473,8 @@ async fn execute_runner_cmd(
                     stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                     stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 }),
-                Ok(Err(e)) => Err(format!("Failed to execute docker: {}", e)),
-                Err(_) => Err(format!("Docker timeout after {}s", timeout_secs)),
+                Ok(Err(e)) => Err(format!("Failed to execute docker: {e}")),
+                Err(_) => Err(format!("Docker timeout after {timeout_secs}s")),
             }
         }
     }

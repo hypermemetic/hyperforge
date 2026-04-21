@@ -11,14 +11,21 @@ use std::sync::Arc;
 use crate::auth::AuthProvider;
 use super::{ImageTag, PackageInfo, RegistryError, RegistryPort, RegistryResult};
 
-/// GitHub packages list response
+/// GitHub packages list response.
+///
+/// `visibility` and `html_url` are deserialized from the wire for debug
+/// visibility and schema completeness; they're not consumed by our logic yet.
+/// Kept rather than dropped because they round-trip correctly and would need
+/// to come back when package visibility/URL is surfaced in events.
 #[derive(Debug, serde::Deserialize)]
 struct GhPackage {
     name: String,
     package_type: String,
     created_at: String,
+    #[allow(dead_code)]
     #[serde(default)]
     visibility: String,
+    #[allow(dead_code)]
     #[serde(default)]
     html_url: String,
 }
@@ -83,7 +90,7 @@ impl GitHubRegistryAdapter {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", token))
+            header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|e| RegistryError::AuthFailed(e.to_string()))?,
         );
         headers.insert(
@@ -130,7 +137,7 @@ impl RegistryPort for GitHubRegistryAdapter {
         {
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::AuthFailed(format!(
-                "Token may need read:packages scope: {}", body
+                "Token may need read:packages scope: {body}"
             )));
         }
 
@@ -138,12 +145,12 @@ impl RegistryPort for GitHubRegistryAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
         let packages: Vec<GhPackage> = response.json().await
-            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {}", e)))?;
+            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {e}")))?;
 
         Ok(packages.into_iter()
             .filter(|p| p.package_type == "container")
@@ -209,12 +216,12 @@ impl RegistryPort for GitHubRegistryAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::ApiError(format!(
-                "GitHub API error {}: {}", status, body
+                "GitHub API error {status}: {body}"
             )));
         }
 
         let versions: Vec<GhPackageVersion> = response.json().await
-            .map_err(|e| RegistryError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| RegistryError::ApiError(format!("Failed to parse response: {e}")))?;
 
         let mut tags = Vec::new();
         for version in versions {
@@ -223,9 +230,7 @@ impl RegistryPort for GitHubRegistryAdapter {
                 .map(|c| c.tags)
                 .unwrap_or_default();
 
-            let created_at = DateTime::parse_from_rfc3339(&version.created_at)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+            let created_at = DateTime::parse_from_rfc3339(&version.created_at).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
             if container_tags.is_empty() {
                 // Untagged image — still report it with digest as tag
@@ -256,7 +261,7 @@ impl RegistryPort for GitHubRegistryAdapter {
         // First, find the version ID for this tag
         let images = self.list_images(org, repo).await?;
         let target = images.iter().find(|img| img.tag == tag)
-            .ok_or_else(|| RegistryError::NotFound(format!("Tag '{}' not found", tag)))?;
+            .ok_or_else(|| RegistryError::NotFound(format!("Tag '{tag}' not found")))?;
 
         // We need the version ID — re-fetch versions to get it
         let url = format!(
@@ -286,12 +291,12 @@ impl RegistryPort for GitHubRegistryAdapter {
         };
 
         let versions: Vec<GhPackageVersion> = response.json().await
-            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {}", e)))?;
+            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {e}")))?;
 
         let version_id = versions.iter()
             .find(|v| v.name == target.digest)
             .map(|v| v.id)
-            .ok_or_else(|| RegistryError::NotFound(format!("Version for tag '{}' not found", tag)))?;
+            .ok_or_else(|| RegistryError::NotFound(format!("Version for tag '{tag}' not found")))?;
 
         // Delete the version
         let delete_url = format!(
@@ -309,14 +314,14 @@ impl RegistryPort for GitHubRegistryAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::ApiError(format!(
-                "Failed to delete version {}: {} {}", version_id, status, body
+                "Failed to delete version {version_id}: {status} {body}"
             )));
         }
 
         Ok(())
     }
 
-    fn registry_host(&self) -> &str {
+    fn registry_host(&self) -> &'static str {
         "ghcr.io"
     }
 }

@@ -19,6 +19,12 @@ pub struct HackageClient {
     http: reqwest::Client,
 }
 
+impl Default for HackageClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HackageClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
@@ -91,8 +97,7 @@ impl RegistryClient for HackageClient {
 
     async fn published_version(&self, name: &str) -> anyhow::Result<Option<PublishedVersion>> {
         let url = format!(
-            "https://hackage.haskell.org/package/{}/preferred",
-            name
+            "https://hackage.haskell.org/package/{name}/preferred"
         );
 
         let resp = self
@@ -115,7 +120,7 @@ impl RegistryClient for HackageClient {
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.first())
             .and_then(|v| v.as_str())
-            .map(|v| v.to_string());
+            .map(std::string::ToString::to_string);
 
         match version {
             Some(v) => Ok(Some(PublishedVersion {
@@ -141,10 +146,10 @@ impl RegistryClient for HackageClient {
                 .await?;
 
             let success = output.status.success();
-            let error = if !success {
-                Some(String::from_utf8_lossy(&output.stderr).trim().to_string())
-            } else {
+            let error = if success {
                 None
+            } else {
+                Some(String::from_utf8_lossy(&output.stderr).trim().to_string())
             };
 
             let version = crate::build_system::cabal::cabal_package_version(path)
@@ -190,24 +195,21 @@ impl RegistryClient for HackageClient {
             .find(|l| l.ends_with(".tar.gz"))
             .map(|l| l.trim().to_string());
 
-        let tarball = match tarball {
-            Some(t) => t,
-            None => {
-                let version = crate::build_system::cabal::cabal_package_version(path)
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Ok(PublishResult {
-                    package_name: name.to_string(),
-                    version,
-                    success: false,
-                    error: Some("cabal sdist did not produce a tarball path".to_string()),
-                });
-            }
+        let tarball = if let Some(t) = tarball { t } else {
+            let version = crate::build_system::cabal::cabal_package_version(path)
+                .unwrap_or_else(|| "unknown".to_string());
+            return Ok(PublishResult {
+                package_name: name.to_string(),
+                version,
+                success: false,
+                error: Some("cabal sdist did not produce a tarball path".to_string()),
+            });
         };
 
         // Step 2: upload the tarball with --token to bypass interactive username prompt
         let mut upload_args = vec!["upload".to_string(), "--publish".to_string()];
         if let Some(ref tok) = token {
-            upload_args.push(format!("--token={}", tok));
+            upload_args.push(format!("--token={tok}"));
         }
         upload_args.push(tarball);
         let output = tokio::process::Command::new("cabal")
@@ -217,12 +219,12 @@ impl RegistryClient for HackageClient {
             .await?;
 
         let success = output.status.success();
-        let error = if !success {
+        let error = if success {
+            None
+        } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             Some(format!("{}\n{}", stderr.trim(), stdout.trim()).trim().to_string())
-        } else {
-            None
         };
 
         let version = crate::build_system::cabal::cabal_package_version(path)
@@ -310,7 +312,7 @@ impl RegistryClient for HackageClient {
                 .output()
                 .await?;
 
-            let pkg_dir = format!("{}-{}", name, version);
+            let pkg_dir = format!("{name}-{version}");
             let output = tokio::process::Command::new("diff")
                 .args([
                     "-rq",
@@ -321,7 +323,7 @@ impl RegistryClient for HackageClient {
                 .await?;
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let prefix = format!("{}/", pkg_dir);
+            let prefix = format!("{pkg_dir}/");
             let files: Vec<String> = stdout
                 .lines()
                 .filter_map(|line| {

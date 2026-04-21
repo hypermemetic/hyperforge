@@ -1,6 +1,6 @@
-//! BuildHub — Development tools: manifest generation, publishing, cross-repo execution.
+//! `BuildHub` — Development tools: manifest generation, publishing, cross-repo execution.
 //!
-//! These methods never write LocalForge or call forge APIs. They operate purely
+//! These methods never write `LocalForge` or call forge APIs. They operate purely
 //! on the filesystem via workspace discovery.
 
 pub mod binstall;
@@ -17,10 +17,7 @@ pub mod packaging;
 pub mod release;
 pub mod repo_size;
 
-use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
-use serde_json::Value;
 
 use crate::hub::HyperforgeEvent;
 use crate::types::config::DistChannel;
@@ -31,7 +28,7 @@ use crate::types::Forge;
 pub struct BuildHub;
 
 impl BuildHub {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

@@ -59,13 +59,12 @@ pub fn generate_cargo_config(
 
     for krate in crates {
         for dep in &krate.dependencies {
-            if crate_names.contains(dep.name.as_str()) && !dep.is_path_dep {
-                if patch_names.insert(dep.name.clone()) {
+            if crate_names.contains(dep.name.as_str()) && !dep.is_path_dep
+                && patch_names.insert(dep.name.clone()) {
                     if let Some(target) = crates.iter().find(|c| c.name == dep.name) {
                         patches.push((dep.name.clone(), target.path.clone()));
                     }
                 }
-            }
         }
     }
     patches.sort_by(|a, b| a.0.cmp(&b.0));
@@ -76,10 +75,10 @@ pub fn generate_cargo_config(
 
     let mut doc = if config_path.exists() {
         let existing = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read .cargo/config.toml: {}", e))?;
+            .map_err(|e| format!("Failed to read .cargo/config.toml: {e}"))?;
         existing
             .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| format!("Failed to parse .cargo/config.toml: {}", e))?
+            .map_err(|e| format!("Failed to parse .cargo/config.toml: {e}"))?
     } else {
         let mut d = toml_edit::DocumentMut::new();
         d.decor_mut()
@@ -108,7 +107,7 @@ pub fn generate_cargo_config(
     // Determine action for .cargo/config.toml
     let action = if !dry_run {
         std::fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("Failed to create .cargo/ directory: {}", e))?;
+            .map_err(|e| format!("Failed to create .cargo/ directory: {e}"))?;
 
         if config_path.exists() {
             let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
@@ -116,12 +115,12 @@ pub fn generate_cargo_config(
                 FileAction::Unchanged
             } else {
                 std::fs::write(&config_path, &content)
-                    .map_err(|e| format!("Failed to write .cargo/config.toml: {}", e))?;
+                    .map_err(|e| format!("Failed to write .cargo/config.toml: {e}"))?;
                 FileAction::Updated
             }
         } else {
             std::fs::write(&config_path, &content)
-                .map_err(|e| format!("Failed to write .cargo/config.toml: {}", e))?;
+                .map_err(|e| format!("Failed to write .cargo/config.toml: {e}"))?;
             FileAction::Created
         }
     } else if config_path.exists() {
@@ -193,9 +192,9 @@ fn ensure_gitignore(
             if !already_ignored {
                 if !dry_run {
                     let new_contents = if contents.ends_with('\n') {
-                        format!("{}{}\n", contents, cargo_dir_pattern)
+                        format!("{contents}{cargo_dir_pattern}\n")
                     } else {
-                        format!("{}\n{}\n", contents, cargo_dir_pattern)
+                        format!("{contents}\n{cargo_dir_pattern}\n")
                     };
                     let _ = std::fs::write(&gitignore_path, new_contents);
                 }
@@ -204,7 +203,7 @@ fn ensure_gitignore(
         }
     } else {
         if !dry_run {
-            let _ = std::fs::write(&gitignore_path, format!("{}\n", cargo_dir_pattern));
+            let _ = std::fs::write(&gitignore_path, format!("{cargo_dir_pattern}\n"));
         }
         cleanup.push((".gitignore (created with .cargo/)".to_string(), FileAction::Created));
     }

@@ -11,7 +11,7 @@ use crate::hubs::utils::RepoFilter;
 
 /// Check dirty status for a single repo path.
 fn check_dirty(repo_path: &std::path::Path) -> Result<(String, bool, bool, bool), String> {
-    let status = Git::repo_status(repo_path).map_err(|e| format!("{}", e))?;
+    let status = Git::repo_status(repo_path).map_err(|e| format!("{e}"))?;
     Ok((
         status.branch,
         status.has_staged,
@@ -85,7 +85,7 @@ pub fn dirty(
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Task error: {}", e),
+                        message: format!("Task error: {e}"),
                     };
                 }
             }
@@ -95,7 +95,7 @@ pub fn dirty(
         for (repo_name, branch, has_staged, has_changes, has_untracked, error) in entries {
             if let Some(e) = error {
                 yield HyperforgeEvent::Error {
-                    message: format!("{}: {}", repo_name, e),
+                    message: format!("{repo_name}: {e}"),
                 };
                 continue;
             }
@@ -118,8 +118,7 @@ pub fn dirty(
 
         yield HyperforgeEvent::Info {
             message: format!(
-                "{} dirty, {} clean ({} repos checked)",
-                dirty_count, clean_count, total,
+                "{dirty_count} dirty, {clean_count} clean ({total} repos checked)",
             ),
         };
     }

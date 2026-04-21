@@ -1,5 +1,4 @@
 #[test]
 fn it_compiles() {
-    // Just verify the crate loads
-    assert!(true);
+    // Compilation of this file is the test; no runtime assertion needed.
 }

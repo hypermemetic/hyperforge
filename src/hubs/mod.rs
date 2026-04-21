@@ -24,7 +24,7 @@ pub use workspace::WorkspaceHub;
 #[derive(Clone)]
 pub struct HyperforgeState {
     pub sync_service: Arc<SymmetricSyncService>,
-    /// Cached LocalForge instances per org
+    /// Cached `LocalForge` instances per org
     pub local_forges: Arc<RwLock<HashMap<String, Arc<LocalForge>>>>,
     /// Base config directory (~/.config/hyperforge)
     pub config_dir: PathBuf,
@@ -44,7 +44,7 @@ impl HyperforgeState {
         }
     }
 
-    /// Get or create LocalForge for an org with file persistence
+    /// Get or create `LocalForge` for an org with file persistence
     pub async fn get_local_forge(&self, org: &str) -> Arc<LocalForge> {
         // Try to get existing
         {
@@ -70,7 +70,7 @@ impl HyperforgeState {
         forge
     }
 
-    /// Reload all cached LocalForge instances from disk
+    /// Reload all cached `LocalForge` instances from disk
     pub async fn reload(&self) -> Vec<String> {
         let org_names: Vec<String> = {
             let forges = self.local_forges.read().unwrap();
@@ -91,7 +91,7 @@ impl HyperforgeState {
         reloaded
     }
 
-    /// Evict a cached LocalForge instance for an org
+    /// Evict a cached `LocalForge` instance for an org
     pub async fn evict_org(&self, org: &str) {
         let mut forges = self.local_forges.write().unwrap();
         forges.remove(org);

@@ -1,7 +1,7 @@
 //! Containerized workspace validation (UNIFY-10)
 //!
 //! Runs builds and tests in Docker containers using the dependency graph
-//! for ordering and CiConfig for per-repo overrides.
+//! for ordering and `CiConfig` for per-repo overrides.
 
 use std::path::Path;
 use std::process::Command;
@@ -100,7 +100,7 @@ pub fn build_validation_plan(
 ) -> Result<ValidationPlan, String> {
     let tiers = graph
         .build_tiers()
-        .map_err(|e| format!("Cycle in dependency graph: {}", e))?;
+        .map_err(|e| format!("Cycle in dependency graph: {e}"))?;
 
     let config_map: std::collections::HashMap<&str, &RepoCiConfig> = ci_configs
         .iter()
@@ -113,12 +113,11 @@ pub fn build_validation_plan(
             let node = &graph.nodes[node_idx];
             let ci = config_map
                 .get(node.name.as_str())
+                .copied()
                 .cloned()
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut cfg = RepoCiConfig::default();
-                    cfg.repo_name = node.name.clone();
-                    cfg
+                .unwrap_or_else(|| RepoCiConfig {
+                    repo_name: node.name.clone(),
+                    ..RepoCiConfig::default()
                 });
 
             steps.push(ValidationStep {
@@ -236,7 +235,7 @@ fn run_docker_step(
     let start = Instant::now();
 
     let workspace_str = workspace_root.to_string_lossy();
-    let workdir = format!("/workspace/{}", repo_path);
+    let workdir = format!("/workspace/{repo_path}");
 
     let mut docker_args = vec![
         "run".to_string(),
@@ -251,7 +250,7 @@ fn run_docker_step(
 
     for (key, val) in env {
         docker_args.push("-e".to_string());
-        docker_args.push(format!("{}={}", key, val));
+        docker_args.push(format!("{key}={val}"));
     }
 
     docker_args.push(image.to_string());
@@ -267,7 +266,7 @@ fn run_docker_step(
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!("{}{}", stdout, stderr);
+            let combined = format!("{stdout}{stderr}");
 
             if output.status.success() {
                 ValidateStepResult {
@@ -296,7 +295,7 @@ fn run_docker_step(
             step: step_name.to_string(),
             status: StepStatus::Failed,
             duration_ms,
-            output: Some(format!("Failed to run docker: {}", e)),
+            output: Some(format!("Failed to run docker: {e}")),
         },
     }
 }

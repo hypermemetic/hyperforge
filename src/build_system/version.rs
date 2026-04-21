@@ -1,7 +1,7 @@
-//! SemVer parsing, comparison, and manifest version editing.
+//! `SemVer` parsing, comparison, and manifest version editing.
 //!
 //! Provides version parsing/bumping and format-preserving manifest editing
-//! for Cargo.toml (via toml_edit) and .cabal files (line-based replace).
+//! for Cargo.toml (via `toml_edit`) and .cabal files (line-based replace).
 
 use crate::build_system::BuildSystemKind;
 use crate::types::VersionBump;
@@ -32,7 +32,7 @@ impl SemVer {
     }
 
     /// Bump the version according to the given kind.
-    pub fn bump(&self, kind: &VersionBump) -> Self {
+    pub const fn bump(&self, kind: &VersionBump) -> Self {
         match kind {
             VersionBump::Patch => Self {
                 major: self.major,
@@ -52,10 +52,6 @@ impl SemVer {
         }
     }
 
-    /// Format as "major.minor.patch".
-    pub fn to_string(&self) -> String {
-        format!("{}.{}.{}", self.major, self.minor, self.patch)
-    }
 }
 
 impl std::fmt::Display for SemVer {
@@ -98,14 +94,14 @@ pub fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
         let a_val = a_parts.get(i).copied().unwrap_or(0);
         let b_val = b_parts.get(i).copied().unwrap_or(0);
         match a_val.cmp(&b_val) {
-            Ordering::Equal => continue,
+            Ordering::Equal => {}
             other => return Some(other),
         }
     }
     Some(Ordering::Equal)
 }
 
-/// Edit the version field in a Cargo.toml, preserving formatting via toml_edit.
+/// Edit the version field in a Cargo.toml, preserving formatting via `toml_edit`.
 ///
 /// Returns the new file content as a String.
 pub fn set_cargo_version(path: &Path, new_version: &str) -> anyhow::Result<String> {
@@ -129,7 +125,7 @@ pub fn set_cabal_version(path: &Path, new_version: &str) -> anyhow::Result<Strin
         .ok_or_else(|| anyhow::anyhow!("No .cabal file found in {}", path.display()))?;
 
     let content = std::fs::read_to_string(&cabal_path)?;
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut lines: Vec<String> = content.lines().map(std::string::ToString::to_string).collect();
     let mut found = false;
 
     for line in &mut lines {
@@ -137,7 +133,7 @@ pub fn set_cabal_version(path: &Path, new_version: &str) -> anyhow::Result<Strin
         if trimmed.to_lowercase().starts_with("version:") {
             // Preserve leading whitespace
             let leading: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-            *line = format!("{}version:            {}", leading, new_version);
+            *line = format!("{leading}version:            {new_version}");
             found = true;
             break;
         }
@@ -157,7 +153,7 @@ pub fn set_cabal_version(path: &Path, new_version: &str) -> anyhow::Result<Strin
 
 /// Edit the version in a package.json file.
 ///
-/// Uses serde_json to parse and rewrite while preserving the key set.
+/// Uses `serde_json` to parse and rewrite while preserving the key set.
 pub fn set_node_version(path: &Path, new_version: &str) -> anyhow::Result<String> {
     let pkg_path = path.join("package.json");
     let content = std::fs::read_to_string(&pkg_path)?;

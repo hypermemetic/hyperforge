@@ -1,6 +1,6 @@
-//! SymmetricSyncService - Bidirectional forge synchronization
+//! `SymmetricSyncService` - Bidirectional forge synchronization
 //!
-//! This service implements symmetric sync between any two ForgePort implementations:
+//! This service implements symmetric sync between any two `ForgePort` implementations:
 //! - sync(local, github): Push local state to GitHub
 //! - sync(github, local): Import GitHub repos to local state
 //! - sync(local, codeberg): Mirror repos to Codeberg
@@ -93,7 +93,7 @@ pub struct SymmetricSyncService;
 
 impl SymmetricSyncService {
     /// Create a new sync service
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 
@@ -105,7 +105,7 @@ impl SymmetricSyncService {
     /// * `org` - Organization name
     ///
     /// # Returns
-    /// SyncDiff containing operations needed to make target match source
+    /// `SyncDiff` containing operations needed to make target match source
     pub async fn diff(
         &self,
         source: Arc<dyn ForgePort>,
@@ -188,7 +188,7 @@ impl SymmetricSyncService {
     /// * `dry_run` - If true, don't actually execute operations
     ///
     /// # Returns
-    /// SyncDiff showing what was/would be done
+    /// `SyncDiff` showing what was/would be done
     pub async fn sync(
         &self,
         source: Arc<dyn ForgePort>,

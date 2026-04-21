@@ -20,7 +20,7 @@ pub enum ContainerRegistry {
 
 impl ContainerRegistry {
     /// Registry hostname for OCI operations
-    pub fn host(&self) -> &str {
+    pub const fn host(&self) -> &str {
         match self {
             Self::Ghcr => "ghcr.io",
             Self::Codeberg => "codeberg.org",
@@ -29,8 +29,8 @@ impl ContainerRegistry {
         }
     }
 
-    /// The forge name used for token lookup (e.g. "github" -> "github/{org}/packages_token")
-    pub fn token_forge_name(&self) -> &str {
+    /// The forge name used for token lookup (e.g. "github" -> "`github/{org}/packages_token`")
+    pub const fn token_forge_name(&self) -> &str {
         match self {
             Self::Ghcr => "github",
             Self::Codeberg => "codeberg",
@@ -110,7 +110,7 @@ pub enum RegistryAuth {
 
 impl RegistryAuth {
     /// Resolve credentials for a registry + org from the auth provider.
-    /// Tries packages_token first, then falls back to token.
+    /// Tries `packages_token` first, then falls back to token.
     pub async fn resolve(
         registry: &ContainerRegistry,
         org: &str,
@@ -119,20 +119,20 @@ impl RegistryAuth {
         let forge = registry.token_forge_name();
 
         // Try packages_token first (classic PAT with package scopes)
-        let packages_path = format!("{}/{}/packages_token", forge, org);
+        let packages_path = format!("{forge}/{org}/packages_token");
         if let Ok(Some(token)) = auth.get_secret(&packages_path).await {
             return Ok(Self::Token(token));
         }
 
         // Fall back to regular token
-        let default_path = format!("{}/{}/token", forge, org);
+        let default_path = format!("{forge}/{org}/token");
         match auth.get_secret(&default_path).await {
             Ok(Some(token)) => Ok(Self::Token(token)),
             Ok(None) => Err(format!(
                 "No token found for {} (tried {}/{}/packages_token and {}/{}/token)",
                 registry.host(), forge, org, forge, org,
             )),
-            Err(e) => Err(format!("Auth error: {}", e)),
+            Err(e) => Err(format!("Auth error: {e}")),
         }
     }
 }

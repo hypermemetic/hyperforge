@@ -103,7 +103,7 @@ impl AuthHub {
                 }
                 Err(e) => {
                     yield AuthEvent::Error {
-                        message: format!("Failed to get secret: {}", e),
+                        message: format!("Failed to get secret: {e}"),
                     };
                 }
             }
@@ -129,14 +129,14 @@ impl AuthHub {
             let secret = Secret::new(secret_key.clone(), value);
 
             match storage.set(secret).await {
-                Ok(_) => {
+                Ok(()) => {
                     yield AuthEvent::Success {
-                        message: format!("Secret set: {}", secret_key),
+                        message: format!("Secret set: {secret_key}"),
                     };
                 }
                 Err(e) => {
                     yield AuthEvent::Error {
-                        message: format!("Failed to set secret: {}", e),
+                        message: format!("Failed to set secret: {e}"),
                     };
                 }
             }
@@ -169,7 +169,7 @@ impl AuthHub {
                 }
                 Err(e) => {
                     yield AuthEvent::Error {
-                        message: format!("Failed to list secrets: {}", e),
+                        message: format!("Failed to list secrets: {e}"),
                     };
                 }
             }
@@ -193,14 +193,14 @@ impl AuthHub {
             let secret_path = SecretPath::new(secret_key.clone());
 
             match storage.delete(&secret_path).await {
-                Ok(_) => {
+                Ok(()) => {
                     yield AuthEvent::Success {
-                        message: format!("Secret deleted: {}", secret_key),
+                        message: format!("Secret deleted: {secret_key}"),
                     };
                 }
                 Err(e) => {
                     yield AuthEvent::Error {
-                        message: format!("Failed to delete secret: {}", e),
+                        message: format!("Failed to delete secret: {e}"),
                     };
                 }
             }
@@ -212,8 +212,15 @@ impl AuthHub {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use futures::StreamExt;
+    
 
+    /// Test hub factory.
+    ///
+    /// Referenced only by the commented-out `test_set_and_get_secret`,
+    /// `test_list_secrets`, and `test_delete_secret` tests below (pending a
+    /// stream-Unpin fix in `AuthHub`). Kept for when those tests are restored
+    /// (tracked by HF-TESTS — see commit body).
+    #[allow(dead_code)]
     async fn create_test_hub() -> (AuthHub, TempDir) {
         let temp = TempDir::new().unwrap();
         let storage = YamlStorage::new(temp.path().join("secrets.yaml"));

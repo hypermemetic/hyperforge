@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 let rpc_conv = |arc: Arc<DynamicHub>| {
                     DynamicHub::arc_into_rpc_module(arc)
-                        .map_err(|e| anyhow::anyhow!("Failed to create RPC module: {}", e))
+                        .map_err(|e| anyhow::anyhow!("Failed to create RPC module: {e}"))
                 };
                 match TransportServer::builder(secrets, rpc_conv)
                     .with_websocket(secrets_port)
@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     // Configure transport server
     let rpc_converter = |arc: Arc<DynamicHub>| {
         DynamicHub::arc_into_rpc_module(arc)
-            .map_err(|e| anyhow::anyhow!("Failed to create RPC module: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to create RPC module: {e}"))
     };
 
     let mut builder = TransportServer::builder(lforge, rpc_converter);

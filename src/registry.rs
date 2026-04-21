@@ -81,7 +81,7 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
-    pub fn new(config: RegistryConfig) -> Self {
+    pub const fn new(config: RegistryConfig) -> Self {
         Self { config }
     }
 
@@ -161,14 +161,14 @@ impl RegistryClient {
 
             if needs_replace {
                 // TCP connect to old backend to see if it's actually alive
-                let addr = format!("{}:{}", old_host, old_port);
-                let old_alive = match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    tokio::net::TcpStream::connect(&addr),
-                ).await {
-                    Ok(Ok(_)) => true,
-                    _ => false,
-                };
+                let addr = format!("{old_host}:{old_port}");
+                let old_alive = matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::net::TcpStream::connect(&addr),
+                    ).await,
+                    Ok(Ok(_))
+                );
 
                 if old_alive {
                     return Err(RegistryError::CommandFailed {

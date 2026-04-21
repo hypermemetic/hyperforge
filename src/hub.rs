@@ -1,16 +1,12 @@
-//! HyperforgeHub - Root activation for hyperforge
+//! `HyperforgeHub` - Root activation for hyperforge
 //!
 //! This is a hub plugin that routes to child sub-hubs:
 //! - repo: Single-repo operations and registry CRUD
 //! - workspace: Multi-repo workspace orchestration
 
 use async_stream::stream;
-use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, AuthContext, ChildRouter, ChildSummary, PlexusError, PlexusStream};
-use plexus_core::request::RawRequestContext;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -377,7 +373,7 @@ async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Opt
             let client = reqwest::Client::new();
             let res = client
                 .get(*url_pattern)
-                .header("Authorization", format!("{} {}", auth_scheme, token))
+                .header("Authorization", format!("{auth_scheme} {token}"))
                 .header("User-Agent", "hyperforge")
                 .send()
                 .await;
@@ -387,12 +383,12 @@ async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Opt
                     let code = resp.status().as_u16();
                     (
                         "invalid".to_string(),
-                        Some(format!("HTTP {} from {}", code, url_pattern)),
+                        Some(format!("HTTP {code} from {url_pattern}")),
                     )
                 }
                 Err(e) => (
                     "invalid".to_string(),
-                    Some(format!("Request failed: {}", e)),
+                    Some(format!("Request failed: {e}")),
                 ),
             }
         }
@@ -400,7 +396,7 @@ async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Opt
             let client = reqwest::Client::new();
             let res = client
                 .get("https://api.github.com/user")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("User-Agent", "hyperforge")
                 .send()
                 .await;
@@ -413,7 +409,7 @@ async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Opt
                         .unwrap_or("");
                     let have: Vec<&str> = scopes_header
                         .split(',')
-                        .map(|s| s.trim())
+                        .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .collect();
                     let missing: Vec<&&str> = required
@@ -440,12 +436,12 @@ async fn validate_credential(spec: &CredentialSpec, token: &str) -> (String, Opt
                     let code = resp.status().as_u16();
                     (
                         "invalid".to_string(),
-                        Some(format!("HTTP {} from GitHub /user", code)),
+                        Some(format!("HTTP {code} from GitHub /user")),
                     )
                 }
                 Err(e) => (
                     "invalid".to_string(),
-                    Some(format!("Request failed: {}", e)),
+                    Some(format!("Request failed: {e}")),
                 ),
             }
         }
@@ -459,7 +455,7 @@ pub struct HyperforgeHub {
 }
 
 impl HyperforgeHub {
-    /// Create a new HyperforgeHub instance
+    /// Create a new `HyperforgeHub` instance
     pub fn new() -> Self {
         Self {
             state: HyperforgeState::new(),
@@ -473,15 +469,35 @@ impl Default for HyperforgeHub {
     }
 }
 
-// TODO(HF-IR): remove the deprecated `hub` argument; hub mode is inferred from #[child] gates in plexus-macros 0.6.
 #[plexus_macros::activation(
     namespace = "hyperforge",
     description = "Multi-forge repository management",
-    crate_path = "plexus_core",
-    hub
+    crate_path = "plexus_core"
 )]
-#[allow(deprecated)]
 impl HyperforgeHub {
+    /// Single-repo operations and registry CRUD.
+    #[plexus_macros::child]
+    fn repo(&self) -> RepoHub {
+        RepoHub::new(self.state.clone())
+    }
+
+    /// Multi-repo workspace orchestration.
+    #[plexus_macros::child]
+    fn workspace(&self) -> WorkspaceHub {
+        WorkspaceHub::new(self.state.clone())
+    }
+
+    /// Build system orchestration (cargo, cabal, node, packaging).
+    ///
+    /// `&self` is required by `#[plexus_macros::child]` (the macro
+    /// generates a `ChildRouter` accessor that takes `&Self`). `BuildHub`
+    /// carries no state of its own, so the receiver is unused here.
+    #[plexus_macros::child]
+    #[allow(clippy::unused_self)]
+    const fn build(&self) -> BuildHub {
+        BuildHub::new()
+    }
+
     /// Show hyperforge status
     #[plexus_macros::method(description = "Show hyperforge status and version")]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
@@ -511,7 +527,7 @@ impl HyperforgeHub {
         }
     }
 
-    /// Bootstrap an org — import all repos from remote forges into LocalForge
+    /// Bootstrap an org — import all repos from remote forges into `LocalForge`
     #[plexus_macros::method(
         description = "Bootstrap an org — import all repos from remote forges into LocalForge, creating the canonical state mirror. Can generate SSH keys and set a workspace path.",
         params(
@@ -546,14 +562,11 @@ impl HyperforgeHub {
                     if part.is_empty() {
                         continue;
                     }
-                    match HyperforgeConfig::parse_forge(part) {
-                        Some(forge) => parsed_forges.push((part.to_lowercase().to_string(), forge)),
-                        None => {
-                            yield HyperforgeEvent::Error {
-                                message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", part),
-                            };
-                            return;
-                        }
+                    if let Some(forge) = HyperforgeConfig::parse_forge(part) { parsed_forges.push((part.to_lowercase().clone(), forge)) } else {
+                        yield HyperforgeEvent::Error {
+                            message: format!("Invalid forge: {part}. Must be github, codeberg, or gitlab"),
+                        };
+                        return;
                     }
                 }
             }
@@ -602,7 +615,7 @@ impl HyperforgeHub {
                                 }
                                 Err(e) => {
                                     yield HyperforgeEvent::Error {
-                                        message: format!("  Failed to generate SSH key for {}: {}", forge_str, e),
+                                        message: format!("  Failed to generate SSH key for {forge_str}: {e}"),
                                     };
                                     return;
                                 }
@@ -617,7 +630,7 @@ impl HyperforgeHub {
 
                 if let Some(ref wp) = workspace_path {
                     yield HyperforgeEvent::Info {
-                        message: format!("  {}Workspace path: {}", dry_prefix, wp),
+                        message: format!("  {dry_prefix}Workspace path: {wp}"),
                     };
                     if !is_dry_run {
                         org_config.workspace_path = Some(wp.clone());
@@ -627,7 +640,7 @@ impl HyperforgeHub {
                 if !is_dry_run {
                     if let Err(e) = org_config.save(&config_dir, &org) {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to save org config: {}", e),
+                            message: format!("Failed to save org config: {e}"),
                         };
                         return;
                     }
@@ -642,13 +655,13 @@ impl HyperforgeHub {
                 match make_adapter(forge_str, &org, ot.clone()) {
                     Ok(adapter) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("  Authenticated with {}", forge_str),
+                            message: format!("  Authenticated with {forge_str}"),
                         };
                         adapters.push((forge_str.clone(), forge_enum.clone(), adapter));
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("  Failed to authenticate with {}: {}", forge_str, e),
+                            message: format!("  Failed to authenticate with {forge_str}: {e}"),
                         };
                         return;
                     }
@@ -662,14 +675,14 @@ impl HyperforgeHub {
 
             for (forge_str, forge_enum, adapter) in &adapters {
                 yield HyperforgeEvent::Info {
-                    message: format!("  {}Importing repos from {}...", dry_prefix, forge_str),
+                    message: format!("  {dry_prefix}Importing repos from {forge_str}..."),
                 };
 
                 let list_result = match adapter.list_repos_incremental(&org, None).await {
                     Ok(lr) => lr,
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("  Failed to list repos from {}: {}", forge_str, e),
+                            message: format!("  Failed to list repos from {forge_str}: {e}"),
                         };
                         continue;
                     }
@@ -696,12 +709,12 @@ impl HyperforgeHub {
                         }
 
                         yield HyperforgeEvent::Info {
-                            message: format!("  {}Found {} repos on {}", dry_prefix, forge_count, forge_str),
+                            message: format!("  {dry_prefix}Found {forge_count} repos on {forge_str}"),
                         };
                     }
                 } else {
                     yield HyperforgeEvent::Info {
-                        message: format!("  {} returned not-modified (no repos to import)", forge_str),
+                        message: format!("  {forge_str} returned not-modified (no repos to import)"),
                     };
                 }
 
@@ -714,7 +727,7 @@ impl HyperforgeHub {
                         etag: list_result.etag.clone(),
                     }) {
                         yield HyperforgeEvent::Error {
-                            message: format!("  Failed to store sync state for {}: {}", forge_str, e),
+                            message: format!("  Failed to store sync state for {forge_str}: {e}"),
                         };
                     }
                 }
@@ -724,7 +737,7 @@ impl HyperforgeHub {
             if !is_dry_run && total_upserted > 0 {
                 if let Err(e) = local.save_to_yaml().await {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to save LocalForge for {}: {}", org, e),
+                        message: format!("Failed to save LocalForge for {org}: {e}"),
                     };
                 }
             }
@@ -737,14 +750,13 @@ impl HyperforgeHub {
 
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "{}Begin complete: {} unique repos in LocalForge for '{}'",
-                    dry_prefix, unique_count, org,
+                    "{dry_prefix}Begin complete: {unique_count} unique repos in LocalForge for '{org}'",
                 ),
             };
 
             for (forge_str, count) in &per_forge_counts {
                 yield HyperforgeEvent::Info {
-                    message: format!("  {}: {} repos imported", forge_str, count),
+                    message: format!("  {forge_str}: {count} repos imported"),
                 };
             }
 
@@ -792,7 +804,7 @@ impl HyperforgeHub {
                 };
                 for (forge, key_path) in &org_config.ssh {
                     yield HyperforgeEvent::Info {
-                        message: format!("  {}: {}", forge, key_path),
+                        message: format!("  {forge}: {key_path}"),
                     };
                 }
             }
@@ -819,16 +831,14 @@ impl HyperforgeHub {
             // Validate forge name
             if HyperforgeConfig::parse_forge(&forge).is_none() {
                 yield HyperforgeEvent::Error {
-                    message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                    message: format!("Invalid forge: {forge}. Must be github, codeberg, or gitlab"),
                 };
                 return;
             }
 
             // Expand ~ in key path for validation
             let expanded = if key.starts_with("~/") {
-                dirs::home_dir()
-                    .map(|h| h.join(&key[2..]))
-                    .unwrap_or_else(|| std::path::PathBuf::from(&key))
+                dirs::home_dir().map_or_else(|| std::path::PathBuf::from(&key), |h| h.join(&key[2..]))
             } else {
                 std::path::PathBuf::from(&key)
             };
@@ -847,7 +857,7 @@ impl HyperforgeHub {
                 Ok(()) => {
                     let config_path = OrgConfig::config_path(&config_dir, &org);
                     yield HyperforgeEvent::Info {
-                        message: format!("Set SSH key for {} on org '{}': {}", forge, org, key),
+                        message: format!("Set SSH key for {forge} on org '{org}': {key}"),
                     };
                     yield HyperforgeEvent::Info {
                         message: format!("Saved to {}", config_path.display()),
@@ -855,7 +865,7 @@ impl HyperforgeHub {
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to save org config: {}", e),
+                        message: format!("Failed to save org config: {e}"),
                     };
                 }
             }
@@ -879,7 +889,7 @@ impl HyperforgeHub {
         stream! {
             if HyperforgeConfig::parse_forge(&forge).is_none() {
                 yield HyperforgeEvent::Error {
-                    message: format!("Invalid forge: {}. Must be github, codeberg, or gitlab", forge),
+                    message: format!("Invalid forge: {forge}. Must be github, codeberg, or gitlab"),
                 };
                 return;
             }
@@ -887,7 +897,7 @@ impl HyperforgeHub {
             let org_config = OrgConfig::load(&config_dir, &org);
             if org_config.ssh_key_for_forge(&forge).is_none() {
                 yield HyperforgeEvent::Error {
-                    message: format!("No SSH key configured for {} on org '{}'. Run begin with --generate_ssh_key true first.", forge, org),
+                    message: format!("No SSH key configured for {forge} on org '{org}'. Run begin with --generate_ssh_key true first."),
                 };
                 return;
             }
@@ -920,7 +930,7 @@ impl HyperforgeHub {
             if let Ok(entries) = std::fs::read_dir(&orgs_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "toml") {
+                    if path.extension().is_some_and(|e| e == "toml") {
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                             orgs.push(stem.to_string());
                         }
@@ -939,7 +949,7 @@ impl HyperforgeHub {
 
             for org in &orgs {
                 let org_config = OrgConfig::load(&config_dir, org);
-                let forges: Vec<&str> = org_config.ssh.keys().map(|k| k.as_str()).collect();
+                let forges: Vec<&str> = org_config.ssh.keys().map(std::string::String::as_str).collect();
                 let wp = org_config.workspace_path.as_deref().unwrap_or("(not set)");
                 yield HyperforgeEvent::Info {
                     message: format!(
@@ -986,13 +996,13 @@ impl HyperforgeHub {
             let org_data_dir = config_dir.join("orgs").join(&org);
             if !config_path.exists() && !org_data_dir.exists() {
                 yield HyperforgeEvent::Error {
-                    message: format!("Organization '{}' not found.", org),
+                    message: format!("Organization '{org}' not found."),
                 };
                 return;
             }
 
             yield HyperforgeEvent::Info {
-                message: format!("{}Deleting organization '{}'...", dry_prefix, org),
+                message: format!("{dry_prefix}Deleting organization '{org}'..."),
             };
 
             // 1. Remove org config TOML
@@ -1003,7 +1013,7 @@ impl HyperforgeHub {
                 if !is_dry_run {
                     if let Err(e) = std::fs::remove_file(&config_path) {
                         yield HyperforgeEvent::Error {
-                            message: format!("  Failed to remove config: {}", e),
+                            message: format!("  Failed to remove config: {e}"),
                         };
                     }
                 }
@@ -1017,7 +1027,7 @@ impl HyperforgeHub {
                 if !is_dry_run {
                     if let Err(e) = std::fs::remove_dir_all(&org_data_dir) {
                         yield HyperforgeEvent::Error {
-                            message: format!("  Failed to remove data dir: {}", e),
+                            message: format!("  Failed to remove data dir: {e}"),
                         };
                     }
                 }
@@ -1029,12 +1039,12 @@ impl HyperforgeHub {
                     let wp_path = std::path::PathBuf::from(wp);
                     if wp_path.exists() {
                         yield HyperforgeEvent::Info {
-                            message: format!("  {}Remove workspace: {}", dry_prefix, wp),
+                            message: format!("  {dry_prefix}Remove workspace: {wp}"),
                         };
                         if !is_dry_run {
                             if let Err(e) = std::fs::remove_dir_all(&wp_path) {
                                 yield HyperforgeEvent::Error {
-                                    message: format!("  Failed to remove workspace dir: {}", e),
+                                    message: format!("  Failed to remove workspace dir: {e}"),
                                 };
                             }
                         }
@@ -1052,7 +1062,7 @@ impl HyperforgeHub {
             }
 
             yield HyperforgeEvent::Info {
-                message: format!("{}Organization '{}' deleted.", dry_prefix, org),
+                message: format!("{dry_prefix}Organization '{org}' deleted."),
             };
         }
     }
@@ -1156,8 +1166,7 @@ impl HyperforgeHub {
             if cred_map.is_empty() {
                 yield HyperforgeEvent::Info {
                     message: format!(
-                        "No credentials needed for {} repo(s). No forges or dist channels configured.",
-                        matched_repos,
+                        "No credentials needed for {matched_repos} repo(s). No forges or dist channels configured.",
                     ),
                 };
                 return;
@@ -1179,7 +1188,7 @@ impl HyperforgeHub {
                 Ok(a) => a,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to create auth provider: {}", e),
+                        message: format!("Failed to create auth provider: {e}"),
                     };
                     return;
                 }
@@ -1219,8 +1228,7 @@ impl HyperforgeHub {
 
                 yield HyperforgeEvent::Info {
                     message: format!(
-                        "  {} {} \u{2014} {} (needed by: {})",
-                        status_icon, key_path, status_label, needed_by,
+                        "  {status_icon} {key_path} \u{2014} {status_label} (needed by: {needed_by})",
                     ),
                 };
             }
@@ -1233,8 +1241,8 @@ impl HyperforgeHub {
                     present_count,
                     total,
                     if missing_count > 0 {
-                        let org_hint = orgs_seen.iter().next().map(|o| o.as_str()).unwrap_or("ORG");
-                        format!(" Run `auth setup --org {}` to set up missing ones.", org_hint)
+                        let org_hint = orgs_seen.iter().next().map_or("ORG", std::string::String::as_str);
+                        format!(" Run `auth setup --org {org_hint}` to set up missing ones.")
                     } else {
                         " All credentials present.".to_string()
                     },
@@ -1294,8 +1302,7 @@ impl HyperforgeHub {
                 if forges.is_empty() {
                     yield HyperforgeEvent::Error {
                         message: format!(
-                            "No forges configured for org '{}'. Run `begin` first or specify --forge.",
-                            org
+                            "No forges configured for org '{org}'. Run `begin` first or specify --forge."
                         ),
                     };
                     return;
@@ -1340,14 +1347,14 @@ impl HyperforgeHub {
                 Ok(s) => s,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to open secrets store: {}", e),
+                        message: format!("Failed to open secrets store: {e}"),
                     };
                     return;
                 }
             };
             if let Err(e) = storage.load().await {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to load secrets store: {}", e),
+                    message: format!("Failed to load secrets store: {e}"),
                 };
                 return;
             }
@@ -1458,8 +1465,7 @@ impl HyperforgeHub {
             yield HyperforgeEvent::Info { message: String::new() };
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "{} configured, {} need setup",
-                    configured_count, missing_count,
+                    "{configured_count} configured, {missing_count} need setup",
                 ),
             };
         }
@@ -1487,14 +1493,14 @@ impl HyperforgeHub {
                 Ok(s) => s,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to initialize secrets storage: {}", e),
+                        message: format!("Failed to initialize secrets storage: {e}"),
                     };
                     return;
                 }
             };
             if let Err(e) = storage.load().await {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to load secrets: {}", e),
+                    message: format!("Failed to load secrets: {e}"),
                 };
                 return;
             }
@@ -1509,7 +1515,7 @@ impl HyperforgeHub {
                     if let Ok(entries) = std::fs::read_dir(&orgs_dir) {
                         for entry in entries.flatten() {
                             let path = entry.path();
-                            if path.extension().map_or(false, |e| e == "toml") {
+                            if path.extension().is_some_and(|e| e == "toml") {
                                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                                     found.push(stem.to_string());
                                 }
@@ -1618,54 +1624,10 @@ impl HyperforgeHub {
 
             yield HyperforgeEvent::Info {
                 message: format!(
-                    "{} valid, {} missing, {} invalid out of {} credentials checked",
-                    valid, missing, invalid, total,
+                    "{valid} valid, {missing} missing, {invalid} invalid out of {total} credentials checked",
                 ),
             };
         }
     }
 
-    /// Get child plugin summaries for the hub schema
-    pub fn plugin_children(&self) -> Vec<ChildSummary> {
-        let repo = RepoHub::new(self.state.clone());
-        let workspace = WorkspaceHub::new(self.state.clone());
-        let build = BuildHub::new();
-
-        vec![
-            child_summary(&repo),
-            child_summary(&workspace),
-            child_summary(&build),
-        ]
-    }
-}
-
-/// Extract a ChildSummary from any Activation
-fn child_summary<T: Activation>(activation: &T) -> ChildSummary {
-    let schema = activation.plugin_schema();
-    ChildSummary {
-        namespace: schema.namespace,
-        description: schema.description,
-        hash: schema.hash,
-    }
-}
-
-/// ChildRouter implementation for nested method routing
-#[async_trait]
-impl ChildRouter for HyperforgeHub {
-    fn router_namespace(&self) -> &str {
-        "hyperforge"
-    }
-
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>, raw_ctx: Option<&RawRequestContext>) -> Result<PlexusStream, PlexusError> {
-        Activation::call(self, method, params, auth, raw_ctx).await
-    }
-
-    async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
-        match name {
-            "repo" => Some(Box::new(RepoHub::new(self.state.clone()))),
-            "workspace" => Some(Box::new(WorkspaceHub::new(self.state.clone()))),
-            "build" => Some(Box::new(BuildHub::new())),
-            _ => None,
-        }
-    }
 }

@@ -17,6 +17,12 @@ pub struct CratesIoClient {
     http: reqwest::Client,
 }
 
+impl Default for CratesIoClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CratesIoClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
@@ -28,7 +34,7 @@ impl CratesIoClient {
 
     /// Fetch the SHA256 checksum for a specific version from crates.io.
     async fn published_checksum(&self, name: &str, version: &str) -> anyhow::Result<Option<String>> {
-        let url = format!("https://crates.io/api/v1/crates/{}/{}", name, version);
+        let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
         let resp = self.http.get(&url).send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -42,7 +48,7 @@ impl CratesIoClient {
             .get("version")
             .and_then(|v| v.get("checksum"))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         Ok(checksum)
     }
@@ -68,8 +74,7 @@ impl CratesIoClient {
 
             // Download published .crate
             let url = format!(
-                "https://static.crates.io/crates/{}/{}-{}.crate",
-                name, name, version
+                "https://static.crates.io/crates/{name}/{name}-{version}.crate"
             );
             let resp = self.http.get(&url).send().await?;
             if !resp.status().is_success() {
@@ -91,7 +96,7 @@ impl CratesIoClient {
                 .await?;
 
             // Diff
-            let pkg_dir = format!("{}-{}", name, version);
+            let pkg_dir = format!("{name}-{version}");
             let output = tokio::process::Command::new("diff")
                 .args([
                     "-rq",
@@ -102,7 +107,7 @@ impl CratesIoClient {
                 .await?;
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let prefix = format!("{}/", pkg_dir);
+            let prefix = format!("{pkg_dir}/");
             let files: Vec<String> = stdout
                 .lines()
                 .filter_map(|line| {
@@ -144,7 +149,7 @@ impl RegistryClient for CratesIoClient {
     }
 
     async fn published_version(&self, name: &str) -> anyhow::Result<Option<PublishedVersion>> {
-        let url = format!("https://crates.io/api/v1/crates/{}", name);
+        let url = format!("https://crates.io/api/v1/crates/{name}");
 
         let resp = self.http.get(&url).send().await?;
 
@@ -159,7 +164,7 @@ impl RegistryClient for CratesIoClient {
             .get("crate")
             .and_then(|c| c.get("max_stable_version"))
             .and_then(|v| v.as_str())
-            .map(|v| v.to_string());
+            .map(std::string::ToString::to_string);
 
         match version {
             Some(v) => Ok(Some(PublishedVersion {
@@ -188,12 +193,12 @@ impl RegistryClient for CratesIoClient {
             .await?;
 
         let success = output.status.success();
-        let error = if !success {
+        let error = if success {
+            None
+        } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             Some(format!("{}\n{}", stderr.trim(), stdout.trim()).trim().to_string())
-        } else {
-            None
         };
 
         let version = crate::build_system::cargo::cargo_package_version(path)
@@ -234,7 +239,7 @@ impl RegistryClient for CratesIoClient {
         let crate_file = path
             .join("target")
             .join("package")
-            .join(format!("{}-{}.crate", name, version));
+            .join(format!("{name}-{version}.crate"));
 
         let bytes = match tokio::fs::read(&crate_file).await {
             Ok(b) => b,

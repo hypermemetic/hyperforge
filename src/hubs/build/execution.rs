@@ -66,7 +66,7 @@ pub fn exec(
             .map(|r| (r.dir_name.clone(), r.path.clone(), command.clone()))
             .collect();
 
-        let concurrency = if is_sequential { 1 } else { 0 }; // 0 = unbounded
+        let concurrency = usize::from(is_sequential); // 0 = unbounded
         let exec_results = crate::commands::runner::run_batch(
             exec_inputs,
             concurrency,
@@ -86,7 +86,7 @@ pub fn exec(
                         (repo_name, exit_code, stdout, stderr)
                     }
                     Err(e) => {
-                        (repo_name, -1, String::new(), format!("Failed to execute: {}", e))
+                        (repo_name, -1, String::new(), format!("Failed to execute: {e}"))
                     }
                 }
             },
@@ -104,7 +104,7 @@ pub fn exec(
                 }
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Task error: {}", e),
+                        message: format!("Task error: {e}"),
                     };
                 }
             }
@@ -113,7 +113,7 @@ pub fn exec(
         // Summary
         let total = repos.len();
         yield HyperforgeEvent::Info {
-            message: format!("Exec complete: ran across {} repos", total),
+            message: format!("Exec complete: ran across {total} repos"),
         };
     }
 }
@@ -145,14 +145,16 @@ pub fn validate(
         let ci_configs: Vec<(String, crate::build_system::validate::RepoCiConfig)> = ctx
             .repos
             .iter()
-            .filter_map(|repo| {
+            .map(|repo| {
                 let existing_ci = repo.config.as_ref().and_then(|c| c.ci.as_ref());
                 let ci = crate::types::config::resolve_ci_config(existing_ci, &repo.build_systems);
                 let name = repo.effective_name();
 
-                let mut cfg = crate::build_system::validate::RepoCiConfig::default();
-                cfg.repo_name = name.clone();
-                cfg.skip = ci.skip_validate;
+                let mut cfg = crate::build_system::validate::RepoCiConfig {
+                    repo_name: name.clone(),
+                    skip: ci.skip_validate,
+                    ..crate::build_system::validate::RepoCiConfig::default()
+                };
 
                 // Find the first Docker runner for containerized validation
                 if let Some(docker_runner) = ci.runners.iter().find(|r| {
@@ -179,7 +181,7 @@ pub fn validate(
                     cfg.env = last_runner.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 }
 
-                Some((name, cfg))
+                (name, cfg)
             })
             .collect();
 
@@ -195,7 +197,7 @@ pub fn validate(
             }
             Err(e) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to build validation plan: {}", e),
+                    message: format!("Failed to build validation plan: {e}"),
                 };
                 return;
             }

@@ -25,7 +25,7 @@ use crate::types::Forge;
 pub(crate) fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
         .map(Arc::new)
-        .map_err(|e| format!("Failed to create auth provider: {}", e))
+        .map_err(|e| format!("Failed to create auth provider: {e}"))
 }
 
 pub(crate) fn make_release_adapter(
@@ -36,11 +36,11 @@ pub(crate) fn make_release_adapter(
     match forge {
         "github" => GitHubReleaseAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ReleasePort>)
-            .map_err(|e| format!("github: {}", e)),
+            .map_err(|e| format!("github: {e}")),
         "codeberg" => CodebergReleaseAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ReleasePort>)
-            .map_err(|e| format!("codeberg: {}", e)),
-        other => Err(format!("Releases not supported for forge: {}", other)),
+            .map_err(|e| format!("codeberg: {e}")),
+        other => Err(format!("Releases not supported for forge: {other}")),
     }
 }
 
@@ -71,13 +71,13 @@ fn resolve_forges(repo: &DiscoveredRepo, forge_override: &Option<String>) -> Vec
     if let Some(ref f) = forge_override {
         f.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
     } else {
-        repo.forges().iter().map(|s| s.to_string()).collect()
+        repo.forges().iter().map(std::string::ToString::to_string).collect()
     }
 }
 
 /// Resolve the org from a discovered repo's config
 fn resolve_org(repo: &DiscoveredRepo) -> Option<String> {
-    repo.org().map(|s| s.to_string())
+    repo.org().map(std::string::ToString::to_string)
 }
 
 /// Parse comma-separated target triples, defaulting to native
@@ -97,24 +97,22 @@ fn is_single_repo(path: &std::path::Path) -> bool {
     path.join("Cargo.toml").exists()
         || std::fs::read_dir(path)
             .ok()
-            .map(|entries| {
+            .is_some_and(|entries| {
                 entries
-                    .filter_map(|e| e.ok())
+                    .filter_map(std::result::Result::ok)
                     .any(|e| {
                         e.path()
                             .extension()
-                            .map(|ext| ext == "cabal")
-                            .unwrap_or(false)
+                            .is_some_and(|ext| ext == "cabal")
                     })
             })
-            .unwrap_or(false)
 }
 
-/// Build a DiscoveredRepo from a single repo path (not a workspace)
+/// Build a `DiscoveredRepo` from a single repo path (not a workspace)
 fn discover_single_repo(path: &std::path::Path) -> Result<DiscoveredRepo, String> {
     let path = path
         .canonicalize()
-        .map_err(|e| format!("Cannot resolve path: {}", e))?;
+        .map_err(|e| format!("Cannot resolve path: {e}"))?;
 
     let dir_name = path
         .file_name()
@@ -175,7 +173,7 @@ fn resolve_targets_with_dist(
     // Check dist config
     if let Some(dist) = load_dist_config(repo) {
         if !dist.targets.is_empty() {
-            return dist.targets.iter().map(|t| TargetTriple::new(t)).collect();
+            return dist.targets.iter().map(TargetTriple::new).collect();
         }
     }
     // Fallback to native host
@@ -202,11 +200,11 @@ fn resolve_forges_with_dist(
                 return Vec::new();
             }
             // forge-release is in channels — use repo's configured forges
-            return repo.forges().iter().map(|s| s.to_string()).collect();
+            return repo.forges().iter().map(std::string::ToString::to_string).collect();
         }
     }
     // No dist config — fall back to repo's configured forges
-    repo.forges().iter().map(|s| s.to_string()).collect()
+    repo.forges().iter().map(std::string::ToString::to_string).collect()
 }
 
 /// Collect org/forge/channel data from repos and run pre-flight auth.
@@ -234,7 +232,7 @@ async fn run_release_preflight(
         let forges: Vec<String> = if let Some(ref f) = forge_override_str {
             vec![f.clone()]
         } else {
-            repo.forges().iter().map(|s| s.to_string()).collect()
+            repo.forges().iter().map(std::string::ToString::to_string).collect()
         };
 
         let forge_set = org_forges.entry(org.clone()).or_default();
@@ -258,7 +256,7 @@ async fn run_release_preflight(
         Ok(a) => a,
         Err(e) => {
             return vec![HyperforgeEvent::Error {
-                message: format!("Pre-flight: {}", e),
+                message: format!("Pre-flight: {e}"),
             }];
         }
     };
@@ -299,14 +297,11 @@ async fn release_single_repo(
 
     let dry_prefix = if is_dry_run { "[dry-run] " } else { "" };
 
-    let (bin_targets, version) = match repo_binary_info(repo) {
-        Some(info) => info,
-        None => {
-            events.push(HyperforgeEvent::Info {
-                message: format!("Skipping {} (no binary targets or no version)", repo.dir_name),
-            });
-            return (events, counts);
-        }
+    let (bin_targets, version) = if let Some(info) = repo_binary_info(repo) { info } else {
+        events.push(HyperforgeEvent::Info {
+            message: format!("Skipping {} (no binary targets or no version)", repo.dir_name),
+        });
+        return (events, counts);
     };
 
     counts.has_binaries = true;
@@ -351,7 +346,7 @@ async fn release_single_repo(
                 repo_name: repo_name.clone(),
                 target: triple.triple.clone(),
                 status: "packaging".to_string(),
-                detail: Some(format!("would create {}", stem)),
+                detail: Some(format!("would create {stem}")),
             });
             counts.targets += 1;
             continue;
@@ -360,7 +355,7 @@ async fn release_single_repo(
         let results = compile_and_package(
             &repo.path,
             bs_kind,
-            &[triple.clone()],
+            std::slice::from_ref(triple),
             &binary_names,
             &version,
             &output_dir,
@@ -398,10 +393,10 @@ async fn release_single_repo(
     // Create git tag if needed
     if !is_dry_run && !Git::tag_exists(&repo.path, tag) {
         events.push(HyperforgeEvent::Info {
-            message: format!("  Creating git tag {} in {}", tag, repo_name),
+            message: format!("  Creating git tag {tag} in {repo_name}"),
         });
         let tag_output = tokio::process::Command::new("git")
-            .args(["tag", "-a", tag, "-m", &format!("Release {}", tag)])
+            .args(["tag", "-a", tag, "-m", &format!("Release {tag}")])
             .current_dir(&repo.path)
             .output()
             .await;
@@ -410,23 +405,23 @@ async fn release_single_repo(
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 events.push(HyperforgeEvent::Error {
-                    message: format!("  Failed to create tag {}: {}", tag, stderr),
+                    message: format!("  Failed to create tag {tag}: {stderr}"),
                 });
             }
             Err(e) => {
                 events.push(HyperforgeEvent::Error {
-                    message: format!("  Failed to run git tag: {}", e),
+                    message: format!("  Failed to run git tag: {e}"),
                 });
             }
         }
     } else if is_dry_run {
         if Git::tag_exists(&repo.path, tag) {
             events.push(HyperforgeEvent::Info {
-                message: format!("{}  Tag {} already exists in {}", dry_prefix, tag, repo_name),
+                message: format!("{dry_prefix}  Tag {tag} already exists in {repo_name}"),
             });
         } else {
             events.push(HyperforgeEvent::Info {
-                message: format!("{}  Would create git tag {} in {}", dry_prefix, tag, repo_name),
+                message: format!("{dry_prefix}  Would create git tag {tag} in {repo_name}"),
             });
         }
     }
@@ -435,19 +430,16 @@ async fn release_single_repo(
     let target_forges = resolve_forges(repo, forge_override);
     if target_forges.is_empty() {
         events.push(HyperforgeEvent::Info {
-            message: format!("  {} has no configured forges -- skipping release upload", repo_name),
+            message: format!("  {repo_name} has no configured forges -- skipping release upload"),
         });
         return (events, counts);
     }
 
-    let org = match resolve_org(repo) {
-        Some(o) => o,
-        None => {
-            events.push(HyperforgeEvent::Info {
-                message: format!("  {} has no org configured -- skipping release upload", repo_name),
-            });
-            return (events, counts);
-        }
+    let org = if let Some(o) = resolve_org(repo) { o } else {
+        events.push(HyperforgeEvent::Info {
+            message: format!("  {repo_name} has no org configured -- skipping release upload"),
+        });
+        return (events, counts);
     };
 
     if is_dry_run {
@@ -529,7 +521,7 @@ async fn release_single_repo(
                         repo_name: repo_name.clone(),
                         target: "all".to_string(),
                         status: "uploading".to_string(),
-                        detail: Some(format!("{} to {}", filename, forge_name)),
+                        detail: Some(format!("{filename} to {forge_name}")),
                     });
 
                     let data = match tokio::fs::read(archive_path).await {
@@ -542,7 +534,7 @@ async fn release_single_repo(
                                 asset_name: filename.clone(),
                                 size_bytes: 0,
                                 success: false,
-                                error: Some(format!("Failed to read archive: {}", e)),
+                                error: Some(format!("Failed to read archive: {e}")),
                             });
                             counts.failed += 1;
                             continue;
@@ -637,7 +629,7 @@ pub fn release(
                 Ok(r) => vec![r],
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to discover repo: {}", e),
+                        message: format!("Failed to discover repo: {e}"),
                     };
                     return;
                 }
@@ -812,7 +804,7 @@ pub fn release_all(
             Ok(order) => order,
             Err(e) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Dependency cycle detected: {}", e),
+                    message: format!("Dependency cycle detected: {e}"),
                 };
                 // Fall back to original order
                 (0..all_repos.len()).collect()

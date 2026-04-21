@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// Org-level configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrgConfig {
-    /// SSH key paths per forge (forge_name -> key_path)
+    /// SSH key paths per forge (`forge_name` -> `key_path`)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ssh: HashMap<String, String>,
 
@@ -23,7 +23,7 @@ pub struct OrgConfig {
 impl OrgConfig {
     /// Path to the org config file: ~/.config/hyperforge/orgs/{org}.toml
     pub fn config_path(config_dir: &Path, org: &str) -> PathBuf {
-        config_dir.join("orgs").join(format!("{}.toml", org))
+        config_dir.join("orgs").join(format!("{org}.toml"))
     }
 
     /// Load org config from disk. Returns default if file doesn't exist.
@@ -40,12 +40,12 @@ impl OrgConfig {
         let path = Self::config_path(config_dir, org);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create org config dir: {}", e))?;
+                .map_err(|e| format!("Failed to create org config dir: {e}"))?;
         }
         let content = toml::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize org config: {}", e))?;
+            .map_err(|e| format!("Failed to serialize org config: {e}"))?;
         std::fs::write(&path, content)
-            .map_err(|e| format!("Failed to write org config: {}", e))?;
+            .map_err(|e| format!("Failed to write org config: {e}"))?;
         Ok(())
     }
 
@@ -56,7 +56,7 @@ impl OrgConfig {
 
     /// Get SSH key for a specific forge
     pub fn ssh_key_for_forge(&self, forge: &str) -> Option<&str> {
-        self.ssh.get(forge).map(|s| s.as_str())
+        self.ssh.get(forge).map(std::string::String::as_str)
     }
 
     /// Directory for generated SSH keys: ~/.config/hyperforge/orgs/{org}/keys/
@@ -66,7 +66,7 @@ impl OrgConfig {
 
     /// Path to a generated SSH key for an org/forge: keys/{forge}_ed25519
     pub fn ssh_key_path(config_dir: &Path, org: &str, forge: &str) -> PathBuf {
-        Self::keys_dir(config_dir, org).join(format!("{}_ed25519", forge))
+        Self::keys_dir(config_dir, org).join(format!("{forge}_ed25519"))
     }
 
     /// Generate an ed25519 SSH keypair for an org/forge combination.
@@ -83,7 +83,7 @@ impl OrgConfig {
         std::fs::create_dir_all(&keys_dir)
             .map_err(|e| format!("Failed to create keys dir {}: {}", keys_dir.display(), e))?;
 
-        let comment = format!("hyperforge:{}@{}", org, forge);
+        let comment = format!("hyperforge:{org}@{forge}");
         let output = std::process::Command::new("ssh-keygen")
             .args([
                 "-t", "ed25519",
@@ -92,7 +92,7 @@ impl OrgConfig {
                 "-C", &comment,
             ])
             .output()
-            .map_err(|e| format!("Failed to run ssh-keygen: {}", e))?;
+            .map_err(|e| format!("Failed to run ssh-keygen: {e}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -152,8 +152,10 @@ mod tests {
     #[test]
     fn test_workspace_path_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let mut config = OrgConfig::default();
-        config.workspace_path = Some("/home/user/workspace".to_string());
+        let config = OrgConfig {
+            workspace_path: Some("/home/user/workspace".to_string()),
+            ..OrgConfig::default()
+        };
         config.save(tmp.path(), "myorg").unwrap();
 
         let loaded = OrgConfig::load(tmp.path(), "myorg");

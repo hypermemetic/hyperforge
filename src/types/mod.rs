@@ -27,11 +27,11 @@ pub enum Forge {
 
 impl Forge {
     /// Return the lowercase string representation used in config files and adapters.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            Forge::GitHub => "github",
-            Forge::Codeberg => "codeberg",
-            Forge::GitLab => "gitlab",
+            Self::GitHub => "github",
+            Self::Codeberg => "codeberg",
+            Self::GitLab => "gitlab",
         }
     }
 }
@@ -49,11 +49,10 @@ impl Visibility {
     /// Parse a visibility string ("public" or "private"), case-insensitive.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
-            "public" => Ok(Visibility::Public),
-            "private" => Ok(Visibility::Private),
+            "public" => Ok(Self::Public),
+            "private" => Ok(Self::Private),
             _ => Err(format!(
-                "Invalid visibility: {}. Must be public or private",
-                s
+                "Invalid visibility: {s}. Must be public or private"
             )),
         }
     }
@@ -79,9 +78,9 @@ impl VersionBump {
     /// Parse a bump kind from an optional string, defaulting to Patch.
     pub fn from_str_or_patch(s: Option<&str>) -> Self {
         match s {
-            Some("minor") => VersionBump::Minor,
-            Some("major") => VersionBump::Major,
-            _ => VersionBump::Patch,
+            Some("minor") => Self::Minor,
+            Some("major") => Self::Major,
+            _ => Self::Patch,
         }
     }
 }

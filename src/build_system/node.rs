@@ -13,14 +13,14 @@ pub fn is_node_project(path: &Path) -> bool {
 pub fn node_package_name(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path.join("package.json")).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
-    doc.get("name")?.as_str().map(|s| s.to_string())
+    doc.get("name")?.as_str().map(std::string::ToString::to_string)
 }
 
 /// Parse the package version from package.json
 pub fn node_package_version(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path.join("package.json")).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
-    doc.get("version")?.as_str().map(|s| s.to_string())
+    doc.get("version")?.as_str().map(std::string::ToString::to_string)
 }
 
 /// Parse dependencies from package.json
@@ -77,7 +77,7 @@ pub fn parse_node_deps(path: &Path) -> Vec<DepRef> {
 ///
 /// Node/npm does not have registry support in hyperforge yet, so this
 /// returns `None`. Callers should fall back to directory-scoped diff.
-pub fn node_publishable_files(_path: &Path) -> Option<Vec<String>> {
+pub const fn node_publishable_files(_path: &Path) -> Option<Vec<String>> {
     None
 }
 

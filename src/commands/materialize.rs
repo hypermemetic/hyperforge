@@ -1,6 +1,6 @@
-//! Materialize a RepoRecord onto disk.
+//! Materialize a `RepoRecord` onto disk.
 //!
-//! Projects the config-first registry state (LocalForge) into per-repo
+//! Projects the config-first registry state (`LocalForge`) into per-repo
 //! `.hyperforge/config.toml` and reconciles git remotes to match.
 
 use std::path::Path;
@@ -84,10 +84,10 @@ pub fn materialize(
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    let repo_name = if record.name != dir_name {
-        Some(record.name.clone())
-    } else {
+    let repo_name = if record.name == dir_name {
         None
+    } else {
+        Some(record.name.clone())
     };
 
     let default_branch = if record.default_branch == "main" {
@@ -116,7 +116,7 @@ pub fn materialize(
         if !opts.dry_run {
             config
                 .save(repo_path)
-                .map_err(|e| format!("failed to write config: {}", e))?;
+                .map_err(|e| format!("failed to write config: {e}"))?;
         }
         report.config_written = true;
     }
@@ -127,7 +127,7 @@ pub fn materialize(
         // Compute desired remotes from record.forges
         let mut desired: Vec<(String, String)> = Vec::new(); // (remote_name, url)
 
-        for forge_str in record.forges.iter() {
+        for forge_str in &record.forges {
             // Determine the org for this forge: check forge_config override, fall back to param
             let org_for_forge = record
                 .forge_config
@@ -145,7 +145,7 @@ pub fn materialize(
 
         // Get current remotes
         let current_remotes = Git::list_remotes(repo_path)
-            .map_err(|e| format!("failed to list remotes: {}", e))?;
+            .map_err(|e| format!("failed to list remotes: {e}"))?;
 
         for (remote_name, desired_url) in &desired {
             if let Some(existing) = current_remotes.iter().find(|r| r.name == *remote_name) {
@@ -153,7 +153,7 @@ pub fn materialize(
                 if existing.fetch_url != *desired_url {
                     if !opts.dry_run {
                         Git::set_remote_url(repo_path, remote_name, desired_url)
-                            .map_err(|e| format!("failed to set remote url: {}", e))?;
+                            .map_err(|e| format!("failed to set remote url: {e}"))?;
                     }
                     report.remotes_updated.push(remote_name.clone());
                 }
@@ -162,7 +162,7 @@ pub fn materialize(
                 // Remote does not exist — add it
                 if !opts.dry_run {
                     Git::add_remote(repo_path, remote_name, desired_url)
-                        .map_err(|e| format!("failed to add remote: {}", e))?;
+                        .map_err(|e| format!("failed to add remote: {e}"))?;
                 }
                 report.remotes_added.push(remote_name.clone());
             }
@@ -173,7 +173,7 @@ pub fn materialize(
 
     if opts.hooks {
         let installed = crate::commands::hooks::install_pre_push_hook(repo_path, opts.dry_run)
-            .map_err(|e| format!("failed to install pre-push hook: {}", e))?;
+            .map_err(|e| format!("failed to install pre-push hook: {e}"))?;
         report.hooks_installed = installed;
     }
 
@@ -189,14 +189,14 @@ pub fn materialize(
             let org_config = OrgConfig::load(&config_dir, org);
             // Pick the first org-level key that matches one of our forges
             record.forges.iter()
-                .find_map(|f| org_config.ssh_key_for_forge(f).map(|k| k.to_string()))
+                .find_map(|f| org_config.ssh_key_for_forge(f).map(std::string::ToString::to_string))
         });
 
         match ssh_key {
             Some(key_path) => {
                 if !opts.dry_run {
                     Git::configure_ssh(repo_path, &key_path)
-                        .map_err(|e| format!("failed to configure SSH wrapper: {}", e))?;
+                        .map_err(|e| format!("failed to configure SSH wrapper: {e}"))?;
                 }
                 report.ssh_configured = true;
             }

@@ -28,17 +28,17 @@ fn get_forge_adapter(forge: &Forge, org: &str) -> Result<Arc<dyn ForgePort>> {
 pub async fn list_repos(forge: &Forge, org: &str) -> Result<Vec<Repo>> {
     let adapter = get_forge_adapter(forge, org)?;
     adapter.list_repos(org).await
-        .context(format!("Failed to list repos for {} on {:?}", org, forge))
+        .context(format!("Failed to list repos for {org} on {forge:?}"))
 }
 
 /// Import repositories from a forge
 ///
-/// Clones all repositories from the specified forge/org into target_dir
+/// Clones all repositories from the specified forge/org into `target_dir`
 pub async fn import_repos(forge: &Forge, org: &str, target_dir: &str) -> Result<()> {
     let repos = list_repos(forge, org).await?;
 
     if repos.is_empty() {
-        println!("No repositories found for {} on {:?}", org, forge);
+        println!("No repositories found for {org} on {forge:?}");
         return Ok(());
     }
 
@@ -70,9 +70,9 @@ pub async fn import_repos(forge: &Forge, org: &str, target_dir: &str) -> Result<
 /// Format clone URL for a repository
 fn format_clone_url(forge: &Forge, org: &str, repo_name: &str) -> String {
     match forge {
-        Forge::GitHub => format!("https://github.com/{}/{}.git", org, repo_name),
-        Forge::Codeberg => format!("https://codeberg.org/{}/{}.git", org, repo_name),
-        Forge::GitLab => format!("https://gitlab.com/{}/{}.git", org, repo_name),
+        Forge::GitHub => format!("https://github.com/{org}/{repo_name}.git"),
+        Forge::Codeberg => format!("https://codeberg.org/{org}/{repo_name}.git"),
+        Forge::GitLab => format!("https://gitlab.com/{org}/{repo_name}.git"),
     }
 }
 

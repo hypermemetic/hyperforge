@@ -46,11 +46,9 @@ struct GiteaAsset {
 
 impl GiteaRelease {
     fn into_release_info(self) -> ReleaseInfo {
-        let created_at = DateTime::parse_from_rfc3339(&self.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        let created_at = DateTime::parse_from_rfc3339(&self.created_at).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
-        let assets = self.assets.into_iter().map(|a| a.into_asset_info()).collect();
+        let assets = self.assets.into_iter().map(GiteaAsset::into_asset_info).collect();
 
         ReleaseInfo {
             id: self.id,
@@ -67,9 +65,7 @@ impl GiteaRelease {
 
 impl GiteaAsset {
     fn into_asset_info(self) -> AssetInfo {
-        let created_at = DateTime::parse_from_rfc3339(&self.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        let created_at = DateTime::parse_from_rfc3339(&self.created_at).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
         AssetInfo {
             id: self.id,
@@ -133,32 +129,29 @@ impl CodebergReleaseAdapter {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("token {}", token))
+            header::HeaderValue::from_str(&format!("token {token}"))
                 .map_err(|e| ReleaseError::AuthFailed(e.to_string()))?,
         );
         Ok(headers)
     }
 
-    /// Check response for common auth/not-found errors and return appropriate ReleaseError
+    /// Check response for common auth/not-found errors and return appropriate `ReleaseError`
     fn check_error_status(status: reqwest::StatusCode, body: &str) -> Option<ReleaseError> {
         if status == reqwest::StatusCode::UNAUTHORIZED
             || status == reqwest::StatusCode::FORBIDDEN
         {
             return Some(ReleaseError::AuthFailed(format!(
-                "Codeberg auth error: {}",
-                body
+                "Codeberg auth error: {body}"
             )));
         }
         if status == reqwest::StatusCode::NOT_FOUND {
             return Some(ReleaseError::NotFound(format!(
-                "Codeberg resource not found: {}",
-                body
+                "Codeberg resource not found: {body}"
             )));
         }
         if !status.is_success() {
             return Some(ReleaseError::ApiError(format!(
-                "Codeberg API error {}: {}",
-                status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
         None
@@ -202,13 +195,13 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let release: GiteaRelease = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(release.into_release_info())
     }
@@ -237,7 +230,7 @@ impl ReleasePort for CodebergReleaseAdapter {
         let part = multipart::Part::bytes(data)
             .file_name(filename.to_string())
             .mime_str(content_type)
-            .map_err(|e| ReleaseError::ApiError(format!("Invalid content type: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Invalid content type: {e}")))?;
 
         let form = multipart::Form::new().part("attachment", part);
 
@@ -254,13 +247,13 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let asset: GiteaAsset = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(asset.into_asset_info())
     }
@@ -285,15 +278,15 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let releases: Vec<GiteaRelease> = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
-        Ok(releases.into_iter().map(|r| r.into_release_info()).collect())
+        Ok(releases.into_iter().map(GiteaRelease::into_release_info).collect())
     }
 
     async fn get_release_by_tag(
@@ -325,13 +318,13 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let release: GiteaRelease = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
         Ok(Some(release.into_release_info()))
     }
@@ -356,7 +349,7 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         Ok(())
@@ -387,15 +380,15 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         let assets: Vec<GiteaAsset> = response
             .json()
             .await
-            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ReleaseError::ApiError(format!("Failed to parse response: {e}")))?;
 
-        Ok(assets.into_iter().map(|a| a.into_asset_info()).collect())
+        Ok(assets.into_iter().map(GiteaAsset::into_asset_info).collect())
     }
 
     async fn delete_asset(&self, org: &str, repo: &str, asset_id: u64) -> ReleaseResult<()> {
@@ -419,7 +412,7 @@ impl ReleasePort for CodebergReleaseAdapter {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::check_error_status(status, &body)
-                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {}: {}", status, body))));
+                .unwrap_or_else(|| ReleaseError::ApiError(format!("HTTP {status}: {body}"))));
         }
 
         Ok(())
@@ -464,7 +457,7 @@ mod tests {
         let asset = &info.assets[0];
         assert_eq!(asset.id, 100);
         assert_eq!(asset.name, "app-linux-x86_64.tar.gz");
-        assert_eq!(asset.size_bytes, 8388608);
+        assert_eq!(asset.size_bytes, 8_388_608);
     }
 
     #[test]

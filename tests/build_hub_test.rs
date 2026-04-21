@@ -1,10 +1,10 @@
-//! Tests for the WorkspaceHub → BuildHub split.
+//! Tests for the `WorkspaceHub` → `BuildHub` split.
 //!
 //! Covers:
 //! - Schema: method lists for both hubs are correct and non-overlapping
-//! - Routing: DynamicHub routes to build child hub via dotted paths
+//! - Routing: `DynamicHub` routes to build child hub via dotted paths
 //! - Dispatch: build methods actually execute and return typed events
-//! - Utils: shared helpers (glob_match, dry_prefix)
+//! - Utils: shared helpers (`glob_match`, `dry_prefix`)
 
 use futures::StreamExt;
 use hyperforge::hubs::build::BuildHub;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 // Helpers
 // ============================================================================
 
-/// Collect all HyperforgeEvent items from a PlexusStream.
+/// Collect all `HyperforgeEvent` items from a `PlexusStream`.
 async fn collect_events(
     mut stream: plexus_core::plexus::PlexusStream,
 ) -> Vec<HyperforgeEvent> {
@@ -163,8 +163,7 @@ fn no_method_overlap_between_hubs() {
 
     assert!(
         non_schema_overlap.is_empty(),
-        "Unexpected method overlap between BuildHub and WorkspaceHub: {:?}",
-        non_schema_overlap
+        "Unexpected method overlap between BuildHub and WorkspaceHub: {non_schema_overlap:?}"
     );
 }
 
@@ -190,8 +189,7 @@ fn root_hub_lists_build_as_child() {
 
     assert!(
         child_namespaces.contains(&"build"),
-        "root hub should list 'build' as child, got: {:?}",
-        child_namespaces
+        "root hub should list 'build' as child, got: {child_namespaces:?}"
     );
     assert!(
         child_namespaces.contains(&"repo"),
@@ -292,8 +290,7 @@ async fn route_build_detect_name_mismatches() {
 
     assert!(
         unconfigured_msgs.iter().any(|m| m.contains("gamma")),
-        "should report gamma as unconfigured, got: {:?}",
-        unconfigured_msgs
+        "should report gamma as unconfigured, got: {unconfigured_msgs:?}"
     );
 }
 
@@ -398,12 +395,11 @@ async fn route_build_unify_dry_run() {
     assert!(has_rust_info, "unify should find Rust crates in test workspace");
 
     // Should have a UnifyResult for cargo config
-    let unify_results: Vec<_> = events
+    let has_unify_result = events
         .iter()
-        .filter(|e| matches!(e, HyperforgeEvent::UnifyResult { .. }))
-        .collect();
+        .any(|e| matches!(e, HyperforgeEvent::UnifyResult { .. }));
     assert!(
-        !unify_results.is_empty(),
+        has_unify_result,
         "unify should produce UnifyResult events"
     );
 

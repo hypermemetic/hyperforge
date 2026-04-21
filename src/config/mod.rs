@@ -136,7 +136,7 @@ impl HyperforgeConfig {
     }
 
     /// Builder method: set visibility
-    pub fn with_visibility(mut self, visibility: Visibility) -> Self {
+    pub const fn with_visibility(mut self, visibility: Visibility) -> Self {
         self.visibility = visibility;
         self
     }
@@ -230,7 +230,7 @@ impl HyperforgeConfig {
         }
 
         // Default: first forge is "origin", others use forge name
-        if self.forges.first().map(|f| f.as_str()) == Some(forge) {
+        if self.forges.first().map(std::string::String::as_str) == Some(forge) {
             "origin".to_string()
         } else {
             forge.to_string()
@@ -239,7 +239,7 @@ impl HyperforgeConfig {
 
     /// Get SSH key path for a forge
     pub fn ssh_key_for_forge(&self, forge: &str) -> Option<&str> {
-        self.ssh.get(forge).map(|s| s.as_str())
+        self.ssh.get(forge).map(std::string::String::as_str)
     }
 
     /// Get the repo name (explicit or from path)
@@ -250,7 +250,7 @@ impl HyperforgeConfig {
                 repo_path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
             })
             .unwrap_or_else(|| "unknown".to_string())
     }
@@ -278,8 +278,7 @@ impl HyperforgeConfig {
             if Self::parse_forge(forge).is_none() {
                 return Err(ConfigError::Invalid {
                     message: format!(
-                        "Unknown forge: {}. Valid forges: github, codeberg, gitlab",
-                        forge
+                        "Unknown forge: {forge}. Valid forges: github, codeberg, gitlab"
                     ),
                 });
             }

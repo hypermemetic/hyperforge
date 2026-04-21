@@ -71,13 +71,10 @@ pub fn transitive_closure(graph: &DepGraph, targets: &[usize]) -> Vec<usize> {
     // Filter topo_order to closure set for correct ordering.
     // If cycle detected, still return the full closure — use discovery order
     // (deps-first since we DFS from targets) which is a best-effort ordering.
-    match graph.topo_order() {
-        Ok(order) => order.into_iter().filter(|idx| visited.contains(idx)).collect(),
-        Err(_) => {
-            let mut result: Vec<usize> = visited.into_iter().collect();
-            result.sort(); // deterministic fallback
-            result
-        }
+    if let Ok(order) = graph.topo_order() { order.into_iter().filter(|idx| visited.contains(idx)).collect() } else {
+        let mut result: Vec<usize> = visited.into_iter().collect();
+        result.sort_unstable(); // deterministic fallback
+        result
     }
 }
 
@@ -109,23 +106,17 @@ pub async fn build_publish_plan(
         };
 
         // Get registry client
-        let registry = match package::registry_for(&build_system) {
-            Some(r) => r,
-            None => {
-                excluded.push((
-                    node.name.clone(),
-                    format!("no registry for build system '{}'", node.build_system),
-                ));
-                continue;
-            }
+        let registry = if let Some(r) = package::registry_for(&build_system) { r } else {
+            excluded.push((
+                node.name.clone(),
+                format!("no registry for build system '{}'", node.build_system),
+            ));
+            continue;
         };
 
-        let local_version = match &node.version {
-            Some(v) => v.clone(),
-            None => {
-                excluded.push((node.name.clone(), "no version in manifest".to_string()));
-                continue;
-            }
+        let local_version = if let Some(v) = &node.version { v.clone() } else {
+            excluded.push((node.name.clone(), "no version in manifest".to_string()));
+            continue;
         };
 
         let pkg_path = workspace_root.join(&node.path);
@@ -140,7 +131,7 @@ pub async fn build_publish_plan(
                     path: pkg_path,
                     local_version: local_version.clone(),
                     published_version: None,
-                    action: PublishAction::Error(format!("registry query failed: {}", e)),
+                    action: PublishAction::Error(format!("registry query failed: {e}")),
                     target_version: local_version,
                     node_idx: idx,
                 });
@@ -192,9 +183,7 @@ fn determine_action(
                 Some(Ordering::Equal) => {
                     if is_direct_target {
                         // Direct target with same version — auto-bump
-                        let bumped = SemVer::parse(local_version)
-                            .map(|v| v.bump(auto_bump_kind).to_string())
-                            .unwrap_or_else(|| local_version.to_string());
+                        let bumped = SemVer::parse(local_version).map_or_else(|| local_version.to_string(), |v| v.bump(auto_bump_kind).to_string());
                         (PublishAction::AutoBump, bumped)
                     } else {
                         // Transitive dep already published at this version — skip
@@ -205,8 +194,7 @@ fn determine_action(
                     // Local behind published — error
                     (
                         PublishAction::Error(format!(
-                            "local version {} < published {}",
-                            local_version, published
+                            "local version {local_version} < published {published}"
                         )),
                         local_version.to_string(),
                     )
@@ -215,8 +203,7 @@ fn determine_action(
                     // Parse failure
                     (
                         PublishAction::Error(format!(
-                            "cannot compare versions: local={}, published={}",
-                            local_version, published
+                            "cannot compare versions: local={local_version}, published={published}"
                         )),
                         local_version.to_string(),
                     )

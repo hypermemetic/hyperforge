@@ -52,7 +52,7 @@ impl CodebergRegistryAdapter {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("token {}", token))
+            header::HeaderValue::from_str(&format!("token {token}"))
                 .map_err(|e| RegistryError::AuthFailed(e.to_string()))?,
         );
         Ok(headers)
@@ -84,7 +84,7 @@ impl RegistryPort for CodebergRegistryAdapter {
         {
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::AuthFailed(format!(
-                "Codeberg auth error: {}", body
+                "Codeberg auth error: {body}"
             )));
         }
 
@@ -92,12 +92,12 @@ impl RegistryPort for CodebergRegistryAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
         let packages: Vec<GiteaPackage> = response.json().await
-            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {}", e)))?;
+            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {e}")))?;
 
         // Group by name, count versions
         let mut by_name: std::collections::HashMap<String, Vec<GiteaPackage>> = std::collections::HashMap::new();
@@ -141,19 +141,17 @@ impl RegistryPort for CodebergRegistryAdapter {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
         let packages: Vec<GiteaPackage> = response.json().await
-            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {}", e)))?;
+            .map_err(|e| RegistryError::ApiError(format!("Failed to parse: {e}")))?;
 
         Ok(packages.into_iter()
             .filter(|p| p.name == repo)
             .map(|p| {
-                let created_at = DateTime::parse_from_rfc3339(&p.created_at)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
+                let created_at = DateTime::parse_from_rfc3339(&p.created_at).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
                 ImageTag {
                     tag: p.version,
                     digest: String::new(),
@@ -179,21 +177,21 @@ impl RegistryPort for CodebergRegistryAdapter {
             .map_err(|e| RegistryError::NetworkError(e.to_string()))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(RegistryError::NotFound(format!("Tag '{}' not found", tag)));
+            return Err(RegistryError::NotFound(format!("Tag '{tag}' not found")));
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(RegistryError::ApiError(format!(
-                "Codeberg API error {}: {}", status, body
+                "Codeberg API error {status}: {body}"
             )));
         }
 
         Ok(())
     }
 
-    fn registry_host(&self) -> &str {
+    fn registry_host(&self) -> &'static str {
         "codeberg.org"
     }
 }

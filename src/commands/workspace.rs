@@ -1,7 +1,7 @@
 //! Workspace discovery - scan filesystem to find repos and derive context
 //!
 //! Scans immediate children of a workspace directory to find git repos
-//! with hyperforge configuration, building a WorkspaceContext that
+//! with hyperforge configuration, building a `WorkspaceContext` that
 //! aggregates orgs and forges across all discovered repos.
 
 use std::collections::BTreeSet;
@@ -63,7 +63,7 @@ impl DiscoveredRepo {
     pub fn forges(&self) -> Vec<&str> {
         self.config
             .as_ref()
-            .map(|c| c.forges.iter().map(|f| f.as_str()).collect())
+            .map(|c| c.forges.iter().map(std::string::String::as_str).collect())
             .unwrap_or_default()
     }
 
@@ -107,8 +107,7 @@ impl WorkspaceContext {
                 r.org() == Some(org)
                     && r.config
                         .as_ref()
-                        .map(|c| c.forges.iter().any(|f| f == forge))
-                        .unwrap_or(false)
+                        .is_some_and(|c| c.forges.iter().any(|f| f == forge))
             })
             .collect()
     }
@@ -118,16 +117,16 @@ impl WorkspaceContext {
         let mut systems = BTreeSet::new();
         for repo in &self.repos {
             for bs in &repo.build_systems {
-                systems.insert(format!("{}", bs));
+                systems.insert(format!("{bs}"));
             }
         }
         systems
             .into_iter()
-            .filter_map(|s| match s.as_str() {
-                "cargo" => Some(BuildSystemKind::Cargo),
-                "cabal" => Some(BuildSystemKind::Cabal),
-                "node" => Some(BuildSystemKind::Node),
-                _ => Some(BuildSystemKind::Unknown),
+            .map(|s| match s.as_str() {
+                "cargo" => BuildSystemKind::Cargo,
+                "cabal" => BuildSystemKind::Cabal,
+                "node" => BuildSystemKind::Node,
+                _ => BuildSystemKind::Unknown,
             })
             .collect()
     }
@@ -156,7 +155,7 @@ impl WorkspaceContext {
     }
 }
 
-/// Build a DepGraph from discovered repos.
+/// Build a `DepGraph` from discovered repos.
 pub fn build_dep_graph(repos: &[DiscoveredRepo]) -> crate::build_system::dep_graph::DepGraph {
     let mut nodes = Vec::new();
     let mut all_deps = Vec::new();
@@ -175,7 +174,7 @@ pub fn build_dep_graph(repos: &[DiscoveredRepo]) -> crate::build_system::dep_gra
     crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps)
 }
 
-/// Build a DepGraph excluding dev dependencies (for publish ordering).
+/// Build a `DepGraph` excluding dev dependencies (for publish ordering).
 pub fn build_publish_dep_graph(repos: &[DiscoveredRepo]) -> crate::build_system::dep_graph::DepGraph {
     let mut nodes = Vec::new();
     let mut all_deps = Vec::new();
@@ -195,7 +194,7 @@ pub fn build_publish_dep_graph(repos: &[DiscoveredRepo]) -> crate::build_system:
     crate::build_system::dep_graph::DepGraph::build(nodes, &all_deps)
 }
 
-/// Build a `Repo` (suitable for LocalForge) from a discovered repo's config.
+/// Build a `Repo` (suitable for `LocalForge`) from a discovered repo's config.
 ///
 /// First forge → origin, remaining → mirrors.
 /// Returns `None` if config is missing, has no org, or has no valid forges.
@@ -230,7 +229,7 @@ pub fn repo_from_config(discovered: &DiscoveredRepo) -> Option<Repo> {
     Some(repo)
 }
 
-/// Scan immediate children of workspace_path to discover repos.
+/// Scan immediate children of `workspace_path` to discover repos.
 ///
 /// Pure filesystem reads — no git commands, no network.
 /// Only scans one level deep (immediate children).
@@ -243,7 +242,7 @@ pub fn discover_workspace(workspace_path: &Path) -> WorkspaceResult<WorkspaceCon
 
     if !workspace_path.is_dir() {
         return Err(WorkspaceError::NotADirectory {
-            path: workspace_path.clone(),
+            path: workspace_path,
         });
     }
 

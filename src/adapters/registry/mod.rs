@@ -1,6 +1,6 @@
 //! Container registry adapters for listing, pushing, and deleting images.
 //!
-//! Separate from ForgePort — different domain (OCI/Docker), different auth scopes,
+//! Separate from `ForgePort` — different domain (OCI/Docker), different auth scopes,
 //! different API surfaces.
 
 pub mod codeberg;

@@ -25,14 +25,14 @@ impl SecretPath {
     /// Build from components (forge, org, key)
     pub fn from_parts(forge: &str, org: &str, key: &str) -> Self {
         Self {
-            path: format!("{}/{}/{}", forge, org, key),
+            path: format!("{forge}/{org}/{key}"),
         }
     }
 
     /// Build from registry token path
     pub fn registry(registry: &str) -> Self {
         Self {
-            path: format!("{}/token", registry),
+            path: format!("{registry}/token"),
         }
     }
 

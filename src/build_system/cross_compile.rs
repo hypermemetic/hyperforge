@@ -18,11 +18,11 @@ pub enum ArchiveFormat {
 
 impl ArchiveFormat {
     /// File extension for this archive format
-    pub fn extension(&self) -> &str {
+    pub const fn extension(&self) -> &str {
         match self {
-            ArchiveFormat::TarGz => ".tar.gz",
-            ArchiveFormat::Zip => ".zip",
-            ArchiveFormat::TarXz => ".tar.xz",
+            Self::TarGz => ".tar.gz",
+            Self::Zip => ".zip",
+            Self::TarXz => ".tar.xz",
         }
     }
 }
@@ -34,7 +34,7 @@ pub struct TargetTriple {
 }
 
 impl TargetTriple {
-    /// Create a new TargetTriple from a string
+    /// Create a new `TargetTriple` from a string
     pub fn new(triple: impl Into<String>) -> Self {
         Self {
             triple: triple.into(),
@@ -140,7 +140,7 @@ pub fn host_triple() -> String {
         "unknown-unknown"
     };
 
-    format!("{}-{}", arch, os)
+    format!("{arch}-{os}")
 }
 
 /// Compile a project for a specific target triple.
@@ -159,8 +159,7 @@ pub async fn compile_for_target(
         BuildSystemKind::Cargo => compile_rust(repo_path, target, binary_names).await,
         BuildSystemKind::Cabal => compile_haskell(repo_path, target, binary_names).await,
         other => Err(format!(
-            "cross-compilation not supported for {} projects",
-            other
+            "cross-compilation not supported for {other} projects"
         )),
     }
 }
@@ -187,7 +186,7 @@ async fn compile_rust(
         .current_dir(repo_path)
         .output()
         .await
-        .map_err(|e| format!("failed to spawn {}: {}", program, e))?;
+        .map_err(|e| format!("failed to spawn {program}: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -205,7 +204,7 @@ async fn compile_rust(
             .join("target")
             .join(&target.triple)
             .join("release")
-            .join(format!("{}{}", name, ext));
+            .join(format!("{name}{ext}"));
         if binary_path.exists() {
             binaries.push(binary_path);
         } else {
@@ -233,11 +232,11 @@ async fn compile_haskell(
         .current_dir(repo_path)
         .output()
         .await
-        .map_err(|e| format!("failed to spawn cabal: {}", e))?;
+        .map_err(|e| format!("failed to spawn cabal: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("cabal build failed: {}", stderr));
+        return Err(format!("cabal build failed: {stderr}"));
     }
 
     // Use `cabal list-bin` to find each binary
@@ -248,7 +247,7 @@ async fn compile_haskell(
             .current_dir(repo_path)
             .output()
             .await
-            .map_err(|e| format!("failed to run cabal list-bin: {}", e))?;
+            .map_err(|e| format!("failed to run cabal list-bin: {e}"))?;
 
         if !list_bin.status.success() {
             return Err(format!(
@@ -263,7 +262,7 @@ async fn compile_haskell(
         if binary_path.exists() {
             binaries.push(binary_path);
         } else {
-            return Err(format!("binary not found at: {}", path_str));
+            return Err(format!("binary not found at: {path_str}"));
         }
     }
 
@@ -314,7 +313,7 @@ fn create_tar_gz(
     archive_path: &Path,
 ) -> Result<(), String> {
     let file = std::fs::File::create(archive_path)
-        .map_err(|e| format!("failed to create archive file: {}", e))?;
+        .map_err(|e| format!("failed to create archive file: {e}"))?;
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
 
@@ -327,19 +326,19 @@ fn create_tar_gz(
         // Apply target extension if not already present
         let ext = target.binary_extension();
         let entry_name = if !ext.is_empty() && !file_name.ends_with(ext) {
-            format!("{}/{}{}", stem, file_name, ext)
+            format!("{stem}/{file_name}{ext}")
         } else {
-            format!("{}/{}", stem, file_name)
+            format!("{stem}/{file_name}")
         };
 
         tar.append_path_with_name(binary_path, &entry_name)
-            .map_err(|e| format!("failed to add {} to archive: {}", file_name, e))?;
+            .map_err(|e| format!("failed to add {file_name} to archive: {e}"))?;
     }
 
     tar.into_inner()
-        .map_err(|e| format!("failed to finalize tar: {}", e))?
+        .map_err(|e| format!("failed to finalize tar: {e}"))?
         .finish()
-        .map_err(|e| format!("failed to finalize gzip: {}", e))?;
+        .map_err(|e| format!("failed to finalize gzip: {e}"))?;
 
     Ok(())
 }
@@ -364,7 +363,7 @@ pub async fn compile_and_package(
                 target: t.clone(),
                 archive_path: None,
                 success: false,
-                error: Some(format!("failed to create output dir: {}", e)),
+                error: Some(format!("failed to create output dir: {e}")),
             })
             .collect();
     }
@@ -391,7 +390,7 @@ pub async fn compile_and_package(
                             target: target.clone(),
                             archive_path: None,
                             success: false,
-                            error: Some(format!("packaging failed: {}", e)),
+                            error: Some(format!("packaging failed: {e}")),
                         },
                     }
                 }
@@ -423,7 +422,7 @@ mod tests {
     #[test]
     fn test_target_triple_display() {
         let target = TargetTriple::new("aarch64-apple-darwin");
-        assert_eq!(format!("{}", target), "aarch64-apple-darwin");
+        assert_eq!(format!("{target}"), "aarch64-apple-darwin");
     }
 
     #[test]
@@ -490,8 +489,7 @@ mod tests {
         // Should be a recognized platform
         assert!(
             host.contains("linux") || host.contains("darwin") || host.contains("windows"),
-            "unexpected host triple: {}",
-            host
+            "unexpected host triple: {host}"
         );
     }
 
@@ -543,7 +541,7 @@ mod tests {
         let entries: Vec<String> = archive
             .entries()
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.path().unwrap().to_string_lossy().to_string())
             .collect();
 
@@ -582,7 +580,7 @@ mod tests {
         let entries: Vec<String> = archive
             .entries()
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.path().unwrap().to_string_lossy().to_string())
             .collect();
 

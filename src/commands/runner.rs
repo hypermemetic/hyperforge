@@ -1,4 +1,4 @@
-//! WorkspaceRunner — reusable concurrency abstraction for workspace-level batch operations.
+//! `WorkspaceRunner` — reusable concurrency abstraction for workspace-level batch operations.
 //!
 //! Eliminates duplicated JoinSet/chunking boilerplate across workspace methods.
 //! All functions return `Vec<(usize, R)>` where usize is the original index,
@@ -57,8 +57,8 @@ where
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(value)) => results.push(Ok(value)),
-                Ok(Err(e)) => results.push(Err(format!("spawn_blocking panic: {}", e))),
-                Err(e) => results.push(Err(format!("JoinSet error: {}", e))),
+                Ok(Err(e)) => results.push(Err(format!("spawn_blocking panic: {e}"))),
+                Err(e) => results.push(Err(format!("JoinSet error: {e}"))),
             }
         }
     }
@@ -98,7 +98,7 @@ where
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(value) => results.push(Ok(value)),
-                Err(e) => results.push(Err(format!("JoinSet error: {}", e))),
+                Err(e) => results.push(Err(format!("JoinSet error: {e}"))),
             }
         }
     }
@@ -115,12 +115,16 @@ where
 ///     Err(e) => { yield HyperforgeEvent::Error { ... }; return; }
 /// };
 /// ```
+// `HyperforgeEvent` is intentionally a broad enum carrying every event variant
+// so callers can propagate failures uniformly as yield values. Boxing it here
+// would force every call site through an extra dereference for no benefit.
+#[allow(clippy::result_large_err)]
 pub fn discover_or_bail(
     path: &std::path::Path,
 ) -> Result<crate::commands::workspace::WorkspaceContext, crate::hub::HyperforgeEvent> {
     crate::commands::workspace::discover_workspace(path).map_err(|e| {
         crate::hub::HyperforgeEvent::Error {
-            message: format!("Discovery failed: {}", e),
+            message: format!("Discovery failed: {e}"),
         }
     })
 }
@@ -161,7 +165,7 @@ pub async fn run_diff_batch(
         let result = sync_service
             .diff(local, adapter, &org_name)
             .await
-            .map_err(|e| format!("Diff failed for {}/{}: {}", org_name, forge_name, e));
+            .map_err(|e| format!("Diff failed for {org_name}/{forge_name}: {e}"));
         DiffBatchEntry {
             org_name,
             forge_name,
@@ -183,11 +187,18 @@ pub struct PushBatchResult {
     pub failed_repos: Vec<String>,
 }
 
+/// Result row from a parallel push batch: `(dir_name, repo_path, push_outcome)`.
+pub type PushBatchRow = (
+    String,
+    std::path::PathBuf,
+    crate::commands::push::PushResult<crate::commands::push::PushReport>,
+);
+
 /// Process the results of a parallel push batch into events and counts.
 ///
 /// This is the shared result processing used by both `push_all` and sync Phase 8.
 pub fn collect_push_results(
-    results: Vec<Result<(String, std::path::PathBuf, crate::commands::push::PushResult<crate::commands::push::PushReport>), String>>,
+    results: Vec<Result<PushBatchRow, String>>,
 ) -> PushBatchResult {
     let mut events = Vec::new();
     let mut success_count = 0usize;
@@ -199,7 +210,7 @@ pub fn collect_push_results(
             Ok(v) => v,
             Err(e) => {
                 events.push(crate::hub::HyperforgeEvent::Error {
-                    message: format!("Task error: {}", e),
+                    message: format!("Task error: {e}"),
                 });
                 failed_count += 1;
                 continue;
@@ -251,7 +262,7 @@ pub fn collect_push_results(
 
 /// Result of running a validation gate.
 pub struct ValidationGateResult {
-    /// Events to yield to the caller (ValidateStep, ValidateSummary, Error)
+    /// Events to yield to the caller (`ValidateStep`, `ValidateSummary`, Error)
     pub events: Vec<crate::hub::HyperforgeEvent>,
     /// Whether validation passed (None if not run, Some(true) if passed, Some(false) if failed)
     pub passed: Option<bool>,
@@ -305,7 +316,7 @@ pub fn run_validation_gate(
         }
         Err(e) => ValidationGateResult {
             events: vec![crate::hub::HyperforgeEvent::Error {
-                message: format!("Validation plan failed: {} — aborting push.", e),
+                message: format!("Validation plan failed: {e} — aborting push."),
             }],
             passed: Some(false),
         },
@@ -323,7 +334,7 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         let mut values: Vec<i32> = results.into_iter().map(|r| r.unwrap()).collect();
-        values.sort();
+        values.sort_unstable();
         assert_eq!(values, vec![2, 4, 6, 8, 10]);
     }
 
@@ -334,7 +345,7 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         let mut values: Vec<i32> = results.into_iter().map(|r| r.unwrap()).collect();
-        values.sort();
+        values.sort_unstable();
         assert_eq!(values, vec![3, 6, 9, 12, 15]);
     }
 
@@ -345,7 +356,7 @@ mod tests {
 
         assert_eq!(results.len(), 20);
         let mut values: Vec<i32> = results.into_iter().map(|r| r.unwrap()).collect();
-        values.sort();
+        values.sort_unstable();
         assert_eq!(values, (1..21).collect::<Vec<_>>());
     }
 
@@ -363,7 +374,7 @@ mod tests {
 
         assert_eq!(results.len(), 10);
         let mut values: Vec<i32> = results.into_iter().map(|r| r.unwrap()).collect();
-        values.sort();
+        values.sort_unstable();
         assert_eq!(values, vec![0, 1, 4, 9, 16, 25, 36, 49, 64, 81]);
     }
 }

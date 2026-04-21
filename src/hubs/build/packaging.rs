@@ -1,4 +1,4 @@
-//! Package registry operations: package_diff, publish, bump.
+//! Package registry operations: `package_diff`, publish, bump.
 
 use async_stream::stream;
 use futures::Stream;
@@ -54,7 +54,7 @@ fn bump_commit_tag(
                 registry: registry_kind_for(build_system),
                 action: crate::hub::PublishActionKind::Failed,
                 success: false,
-                error: Some(format!("git status failed: {}", e)),
+                error: Some(format!("git status failed: {e}")),
             });
             return BumpResult { events, success: false };
         }
@@ -72,7 +72,7 @@ fn bump_commit_tag(
             registry: registry_kind_for(build_system),
             action: crate::hub::PublishActionKind::Failed,
             success: false,
-            error: Some(format!("version bump failed: {}", e)),
+            error: Some(format!("version bump failed: {e}")),
         });
         return BumpResult { events, success: false };
     }
@@ -98,15 +98,15 @@ fn bump_commit_tag(
             }
         }
 
-        let commit_msg = format!("chore: bump {} to {}", package_name, new_version);
+        let commit_msg = format!("chore: bump {package_name} to {new_version}");
         let _ = Git::commit(repo_path, &commit_msg);
     }
 
     if !skip_tag {
-        let tag_name = format!("{}-v{}", package_name, new_version);
-        let tag_msg = format!("Release {} v{}", package_name, new_version);
+        let tag_name = format!("{package_name}-v{new_version}");
+        let tag_msg = format!("Release {package_name} v{new_version}");
         match Git::tag(repo_path, &tag_name, Some(&tag_msg)) {
-            Ok(_) => {
+            Ok(()) => {
                 events.push(HyperforgeEvent::PublishStep {
                     package_name: package_name.to_string(),
                     version: new_version.to_string(),
@@ -118,7 +118,7 @@ fn bump_commit_tag(
             }
             Err(e) => {
                 events.push(HyperforgeEvent::Info {
-                    message: format!("  Warning: failed to create tag {}: {}", tag_name, e),
+                    message: format!("  Warning: failed to create tag {tag_name}: {e}"),
                 });
             }
         }
@@ -127,7 +127,7 @@ fn bump_commit_tag(
     BumpResult { events, success: true }
 }
 
-fn registry_kind_for(bs: &BuildSystemKind) -> crate::hub::PackageRegistry {
+const fn registry_kind_for(bs: &BuildSystemKind) -> crate::hub::PackageRegistry {
     match bs {
         BuildSystemKind::Cargo => crate::hub::PackageRegistry::CratesIo,
         BuildSystemKind::Cabal => crate::hub::PackageRegistry::Hackage,
@@ -264,7 +264,7 @@ pub fn package_diff(
                             changed_files = Some(files);
                         }
                     }
-                    Ok(DriftResult::Identical) | Ok(DriftResult::Unknown) => {}
+                    Ok(DriftResult::Identical | DriftResult::Unknown) => {}
                     Err(_) => {}
                 }
             }
@@ -330,10 +330,7 @@ pub fn publish(
         let targets: Vec<usize> = graph.nodes.iter().enumerate()
             .filter(|(_, node)| {
                 if filter.is_empty() {
-                    match node.build_system.as_str() {
-                        "cargo" | "cabal" => true,
-                        _ => false,
-                    }
+                    matches!(node.build_system.as_str(), "cargo" | "cabal")
                 } else {
                     filter.matches(&node.name)
                 }
@@ -358,7 +355,7 @@ pub fn publish(
             Ok(p) => p,
             Err(e) => {
                 yield HyperforgeEvent::Error {
-                    message: format!("Failed to build publish plan: {}", e),
+                    message: format!("Failed to build publish plan: {e}"),
                 };
                 return;
             }
@@ -367,7 +364,7 @@ pub fn publish(
         // Report exclusions
         for (name, reason) in &plan.excluded {
             yield HyperforgeEvent::Info {
-                message: format!("{}Excluded {}: {}", dry_prefix, name, reason),
+                message: format!("{dry_prefix}Excluded {name}: {reason}"),
             };
         }
 
@@ -493,7 +490,7 @@ pub fn publish(
                                 let tag_msg = format!("Release {} v{}", step.name, step.target_version);
                                 if let Err(e) = Git::tag(&step.path, &tag_name, Some(&tag_msg)) {
                                     yield HyperforgeEvent::Info {
-                                        message: format!("  Warning: failed to create tag {}: {}", tag_name, e),
+                                        message: format!("  Warning: failed to create tag {tag_name}: {e}"),
                                     };
                                 } else {
                                     tags_created += 1;
@@ -530,7 +527,7 @@ pub fn publish(
                                 registry: registry_kind,
                                 action: crate::hub::PublishActionKind::Failed,
                                 success: false,
-                                error: Some(format!("{}", e)),
+                                error: Some(format!("{e}")),
                             };
                         }
                     }
@@ -592,29 +589,25 @@ pub fn bump(
 
         for repo in &repos {
             let name = repo.package_name.as_deref().unwrap_or(&repo.dir_name);
-            let current_version = match &repo.package_version {
-                Some(v) => v.clone(),
-                None => {
-                    yield HyperforgeEvent::Info {
-                        message: format!("  {}: skipped (no version)", name),
-                    };
-                    continue;
-                }
+            let current_version = if let Some(v) = &repo.package_version { v.clone() } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {name}: skipped (no version)"),
+                };
+                continue;
             };
 
-            let parsed = match crate::build_system::version::SemVer::parse(&current_version) {
-                Some(v) => v,
-                None => {
-                    yield HyperforgeEvent::Info {
-                        message: format!("  {}: skipped (unparseable version: {})", name, current_version),
-                    };
-                    continue;
-                }
+            let parsed = if let Some(v) = crate::build_system::version::SemVer::parse(&current_version) { v } else {
+                yield HyperforgeEvent::Info {
+                    message: format!("  {name}: skipped (unparseable version: {current_version})"),
+                };
+                continue;
             };
 
             let new_version = parsed.bump(&bump_kind).to_string();
 
-            if !is_dry_run {
+            if is_dry_run {
+                bumped += 1;
+            } else {
                 let result = bump_commit_tag(
                     &repo.path,
                     name,
@@ -632,8 +625,6 @@ pub fn bump(
                     failed += 1;
                     continue;
                 }
-            } else {
-                bumped += 1;
             }
 
             yield HyperforgeEvent::PublishStep {
@@ -647,7 +638,7 @@ pub fn bump(
         }
 
         yield HyperforgeEvent::Info {
-            message: format!("{}Bump complete: {} bumped, {} failed", dry_prefix, bumped, failed),
+            message: format!("{dry_prefix}Bump complete: {bumped} bumped, {failed} failed"),
         };
     }
 }

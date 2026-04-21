@@ -17,7 +17,7 @@ pub fn cargo_package_name(path: &Path) -> Option<String> {
     doc.get("package")?
         .get("name")?
         .as_str()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// Parse the package version from Cargo.toml
@@ -27,7 +27,7 @@ pub fn cargo_package_version(path: &Path) -> Option<String> {
     doc.get("package")?
         .get("version")?
         .as_str()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// Detect binary targets from Cargo.toml
@@ -57,7 +57,7 @@ pub fn cargo_binary_targets(path: &Path) -> Vec<BinaryTarget> {
         .and_then(|v| v.as_array())
         .map(|bins| {
             bins.iter()
-                .filter_map(|b| b.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter_map(|b| b.get("name").and_then(|n| n.as_str()).map(std::string::ToString::to_string))
                 .collect()
         })
         .unwrap_or_default();
@@ -80,7 +80,7 @@ pub fn cargo_binary_targets(path: &Path) -> Vec<BinaryTarget> {
             targets.push(BinaryTarget {
                 name: pkg_name.to_string(),
                 build_system: BuildSystemKind::Cargo,
-                repo_path: repo_path.clone(),
+                repo_path,
             });
         }
     }
@@ -195,8 +195,8 @@ fn parse_dep_table(table: &toml::map::Map<String, toml::Value>, is_dev: bool) ->
             }
             // Table form: dep = { version = "1.0", path = "../dep", ... }
             toml::Value::Table(t) => {
-                let version = t.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let dep_path = t.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let version = t.get("version").and_then(|v| v.as_str()).map(std::string::ToString::to_string);
+                let dep_path = t.get("path").and_then(|v| v.as_str()).map(std::string::ToString::to_string);
                 let is_path = dep_path.is_some();
 
                 deps.push(DepRef {
@@ -212,32 +212,6 @@ fn parse_dep_table(table: &toml::map::Map<String, toml::Value>, is_dev: bool) ->
     }
 
     deps
-}
-
-/// Expand a workspace member pattern to concrete paths.
-///
-/// Handles direct paths (e.g., "crates/foo") and simple trailing wildcards
-/// (e.g., "crates/*"). Does not support full glob syntax.
-fn expand_workspace_member(root: &Path, pattern: &str) -> Vec<std::path::PathBuf> {
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        // Glob: list subdirectories of the prefix
-        let parent = root.join(prefix);
-        match std::fs::read_dir(&parent) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    } else if pattern.contains('*') {
-        // More complex glob patterns — skip rather than pull in a glob crate.
-        // In practice, Cargo workspaces use "dir/*" or literal paths.
-        Vec::new()
-    } else {
-        // Direct path
-        vec![root.join(pattern)]
-    }
 }
 
 #[cfg(test)]

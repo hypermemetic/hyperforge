@@ -1,14 +1,11 @@
-//! ImagesHub — Container image management subactivation
+//! `ImagesHub` — Container image management subactivation
 //!
-//! A child plugin under RepoHub, accessible as:
+//! A child plugin under `RepoHub`, accessible as:
 //!   synapse lforge hyperforge repo images list --org foo --name bar
 //!   synapse lforge hyperforge repo images delete --org foo --name bar --tag v1.0
 
 use async_stream::stream;
-use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
-use serde_json::Value;
 use std::sync::Arc;
 
 use crate::adapters::forge_port::ForgePort;
@@ -27,7 +24,7 @@ pub struct ImagesHub {
 }
 
 impl ImagesHub {
-    pub fn new(state: HyperforgeState) -> Self {
+    pub const fn new(state: HyperforgeState) -> Self {
         Self { state }
     }
 }
@@ -40,18 +37,18 @@ fn make_registry_adapter(
     match forge {
         "github" => GitHubRegistryAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn RegistryPort>)
-            .map_err(|e| format!("github: {}", e)),
+            .map_err(|e| format!("github: {e}")),
         "codeberg" => CodebergRegistryAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn RegistryPort>)
-            .map_err(|e| format!("codeberg: {}", e)),
-        other => Err(format!("Container registry not supported for forge: {}", other)),
+            .map_err(|e| format!("codeberg: {e}")),
+        other => Err(format!("Container registry not supported for forge: {other}")),
     }
 }
 
 fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
         .map(Arc::new)
-        .map_err(|e| format!("Failed to create auth provider: {}", e))
+        .map_err(|e| format!("Failed to create auth provider: {e}"))
 }
 
 #[plexus_macros::activation(
@@ -85,7 +82,7 @@ impl ImagesHub {
                     Ok(r) => Some(r),
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Invalid regex '{}': {}", pattern, e),
+                            message: format!("Invalid regex '{pattern}': {e}"),
                         };
                         return;
                     }
@@ -132,7 +129,7 @@ impl ImagesHub {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Skipping {} ({})", forge_name, e),
+                            message: format!("Skipping {forge_name} ({e})"),
                         };
                         continue;
                     }
@@ -142,7 +139,7 @@ impl ImagesHub {
                     Ok(tags) => {
                         if tags.is_empty() {
                             yield HyperforgeEvent::Info {
-                                message: format!("No images found for {}/{} on {}", org, name, forge_name),
+                                message: format!("No images found for {org}/{name} on {forge_name}"),
                             };
                             continue;
                         }
@@ -165,7 +162,7 @@ impl ImagesHub {
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to list images on {}: {}", forge_name, e),
+                            message: format!("Failed to list images on {forge_name}: {e}"),
                         };
                     }
                 }
@@ -196,7 +193,7 @@ impl ImagesHub {
                     Ok(r) => Some(r),
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Invalid regex '{}': {}", pattern, e),
+                            message: format!("Invalid regex '{pattern}': {e}"),
                         };
                         return;
                     }
@@ -231,7 +228,7 @@ impl ImagesHub {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Skipping {} ({})", forge_name, e),
+                            message: format!("Skipping {forge_name} ({e})"),
                         };
                         continue;
                     }
@@ -241,7 +238,7 @@ impl ImagesHub {
                     Ok(packages) => {
                         if packages.is_empty() {
                             yield HyperforgeEvent::Info {
-                                message: format!("No packages found for {} on {}", org, forge_name),
+                                message: format!("No packages found for {org} on {forge_name}"),
                             };
                             continue;
                         }
@@ -252,9 +249,7 @@ impl ImagesHub {
                                     continue;
                                 }
                             }
-                            let created = pkg.created_at
-                                .map(|dt| dt.to_rfc3339())
-                                .unwrap_or_else(|| "unknown".to_string());
+                            let created = pkg.created_at.map_or_else(|| "unknown".to_string(), |dt| dt.to_rfc3339());
                             yield HyperforgeEvent::Info {
                                 message: format!(
                                     "  {}/{} on {} — {} tag(s), created {}",
@@ -266,14 +261,14 @@ impl ImagesHub {
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to list packages on {}: {}", forge_name, e),
+                            message: format!("Failed to list packages on {forge_name}: {e}"),
                         };
                     }
                 }
             }
 
             yield HyperforgeEvent::Info {
-                message: format!("{} package(s) found.", total),
+                message: format!("{total} package(s) found."),
             };
         }
     }
@@ -312,7 +307,7 @@ impl ImagesHub {
 
             if !build_path.exists() {
                 yield HyperforgeEvent::Error {
-                    message: format!("Build path does not exist: {}", path),
+                    message: format!("Build path does not exist: {path}"),
                 };
                 return;
             }
@@ -322,14 +317,11 @@ impl ImagesHub {
                 df.clone()
             } else {
                 let candidates = ["Dockerfile", "Containerfile", "docker/Dockerfile"];
-                match candidates.iter().find(|c| build_path.join(c).exists()) {
-                    Some(c) => c.to_string(),
-                    None => {
-                        yield HyperforgeEvent::Error {
-                            message: format!("No Dockerfile found in {}. Tried: {}", path, candidates.join(", ")),
-                        };
-                        return;
-                    }
+                if let Some(c) = candidates.iter().find(|c| build_path.join(c).exists()) { c.to_string() } else {
+                    yield HyperforgeEvent::Error {
+                        message: format!("No Dockerfile found in {}. Tried: {}", path, candidates.join(", ")),
+                    };
+                    return;
                 }
             };
 
@@ -348,7 +340,7 @@ impl ImagesHub {
                     .to_string()
             });
             let image_tag = tag.unwrap_or_else(|| "latest".to_string());
-            let local_tag = format!("{}:{}", image_name, image_tag);
+            let local_tag = format!("{image_name}:{image_tag}");
 
             // Resolve target registries from forge names
             let target_registries: Vec<ContainerRegistry> = if let Some(f) = forge {
@@ -378,7 +370,7 @@ impl ImagesHub {
                 Ok(d) => d,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Docker unavailable: {}. Is Docker/Colima running?", e),
+                        message: format!("Docker unavailable: {e}. Is Docker/Colima running?"),
                     };
                     return;
                 }
@@ -388,7 +380,7 @@ impl ImagesHub {
             match crate::docker::check_state(&docker).await {
                 crate::docker::DockerState::Available { version } => {
                     yield HyperforgeEvent::Info {
-                        message: format!("Docker {} connected", version),
+                        message: format!("Docker {version} connected"),
                     };
                 }
                 crate::docker::DockerState::NotRunning => {
@@ -414,12 +406,12 @@ impl ImagesHub {
                 match crate::docker::build_image(&docker, &build_path, &df_relative, &local_tag).await {
                     Ok(_id) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Build succeeded: {}", local_tag),
+                            message: format!("Build succeeded: {local_tag}"),
                         };
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Build failed: {}", e),
+                            message: format!("Build failed: {e}"),
                         };
                         return;
                     }
@@ -439,7 +431,7 @@ impl ImagesHub {
                 let image_ref = ImageRef::new(registry.clone(), &org, &image_name, &image_tag);
 
                 yield HyperforgeEvent::Info {
-                    message: format!("{}Pushing {}", dry_prefix, image_ref),
+                    message: format!("{dry_prefix}Pushing {image_ref}"),
                 };
 
                 if is_dry_run {
@@ -556,8 +548,7 @@ impl ImagesHub {
 
             if is_dry_run {
                 yield HyperforgeEvent::Info {
-                    message: format!("{}Would delete {}:{} from {}/{} on {}",
-                        dry_prefix, name, tag, org, name, forge_str),
+                    message: format!("{dry_prefix}Would delete {name}:{tag} from {org}/{name} on {forge_str}"),
                 };
                 return;
             }

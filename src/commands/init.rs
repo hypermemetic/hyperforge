@@ -42,7 +42,7 @@ pub type InitResult<T> = Result<T, InitError>;
 /// Options for the init command
 #[derive(Debug, Clone)]
 pub struct InitOptions {
-    /// Forges to configure (e.g., ["github", "codeberg"])
+    /// Forges to configure (e.g., `["github", "codeberg"]`)
     pub forges: Vec<String>,
 
     /// Organization/username on forges
@@ -108,7 +108,7 @@ impl InitOptions {
         self
     }
 
-    pub fn with_visibility(mut self, visibility: Visibility) -> Self {
+    pub const fn with_visibility(mut self, visibility: Visibility) -> Self {
         self.visibility = visibility;
         self
     }
@@ -123,22 +123,22 @@ impl InitOptions {
         self
     }
 
-    pub fn force(mut self) -> Self {
+    pub const fn force(mut self) -> Self {
         self.force = true;
         self
     }
 
-    pub fn dry_run(mut self) -> Self {
+    pub const fn dry_run(mut self) -> Self {
         self.dry_run = true;
         self
     }
 
-    pub fn no_hooks(mut self) -> Self {
+    pub const fn no_hooks(mut self) -> Self {
         self.no_hooks = true;
         self
     }
 
-    pub fn no_ssh_wrapper(mut self) -> Self {
+    pub const fn no_ssh_wrapper(mut self) -> Self {
         self.no_ssh_wrapper = true;
         self
     }
@@ -183,7 +183,7 @@ pub struct RemoteAdded {
 /// * `options` - Init options
 ///
 /// # Returns
-/// InitReport describing what was done
+/// `InitReport` describing what was done
 pub fn init(path: &Path, options: InitOptions) -> InitResult<InitReport> {
     // Validate forges
     for forge in &options.forges {
@@ -317,7 +317,7 @@ pub fn init(path: &Path, options: InitOptions) -> InitResult<InitReport> {
                 }
                 Err(e) => {
                     // Non-fatal: log but continue
-                    eprintln!("Warning: failed to install pre-push hook: {}", e);
+                    eprintln!("Warning: failed to install pre-push hook: {e}");
                 }
             }
         }

@@ -57,7 +57,7 @@ pub trait RegistryClient: Send + Sync {
     /// Returns None if the package has never been published.
     async fn published_version(&self, name: &str) -> anyhow::Result<Option<PublishedVersion>>;
 
-    /// Publish a package. If dry_run is true, validate without actually publishing.
+    /// Publish a package. If `dry_run` is true, validate without actually publishing.
     async fn publish(
         &self,
         path: &Path,

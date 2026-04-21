@@ -1,8 +1,8 @@
-//! LocalForge - In-memory forge state mirror with YAML persistence
+//! `LocalForge` - In-memory forge state mirror with YAML persistence
 //!
-//! LocalForge implements ForgePort and serves as the local source of truth
+//! `LocalForge` implements `ForgePort` and serves as the local source of truth
 //! for repository configurations. Internally it stores `RepoRecord` for
-//! rich lifecycle tracking, while the ForgePort trait boundary converts
+//! rich lifecycle tracking, while the `ForgePort` trait boundary converts
 //! to/from `Repo` for compatibility with remote forge adapters.
 
 use async_trait::async_trait;
@@ -28,7 +28,7 @@ pub struct ForgeSyncState {
 pub struct LocalForge {
     /// Organization name
     org: String,
-    /// Repository state (repo_name -> RepoRecord)
+    /// Repository state (`repo_name` -> `RepoRecord`)
     repos: Arc<RwLock<HashMap<String, RepoRecord>>>,
     /// Per-forge sync state
     forges: Arc<RwLock<HashMap<Forge, ForgeSyncState>>>,
@@ -39,7 +39,7 @@ pub struct LocalForge {
 }
 
 impl LocalForge {
-    /// Create a new LocalForge for the given organization
+    /// Create a new `LocalForge` for the given organization
     pub fn new(org: impl Into<String>) -> Self {
         Self {
             org: org.into(),
@@ -50,7 +50,7 @@ impl LocalForge {
         }
     }
 
-    /// Create a LocalForge with a config path for persistence
+    /// Create a `LocalForge` with a config path for persistence
     pub fn with_config_path(org: impl Into<String>, path: PathBuf) -> Self {
         Self {
             org: org.into(),
@@ -63,22 +63,22 @@ impl LocalForge {
 
     /// Acquire a read lock on the repos map
     fn read_repos(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, RepoRecord>>, ForgeError> {
-        self.repos.read().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+        self.repos.read().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {e}")))
     }
 
     /// Acquire a write lock on the repos map
     fn write_repos(&self) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<String, RepoRecord>>, ForgeError> {
-        self.repos.write().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+        self.repos.write().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {e}")))
     }
 
     /// Acquire a read lock on the forge states map
     fn read_forges(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<Forge, ForgeSyncState>>, ForgeError> {
-        self.forges.read().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+        self.forges.read().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {e}")))
     }
 
     /// Acquire a write lock on the forge states map
     fn write_forges(&self) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<Forge, ForgeSyncState>>, ForgeError> {
-        self.forges.write().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {}", e)))
+        self.forges.write().map_err(|e| ForgeError::ApiError(format!("Lock poisoned: {e}")))
     }
 
     /// Get the organization name
@@ -98,7 +98,7 @@ impl LocalForge {
         }
     }
 
-    /// Add a repository to local state (converts Repo to RepoRecord internally)
+    /// Add a repository to local state (converts Repo to `RepoRecord` internally)
     ///
     /// If a dismissed (soft-deleted) record exists with the same name, it will be
     /// overwritten, allowing re-creation of previously deleted repos.
@@ -112,7 +112,7 @@ impl LocalForge {
         }
 
         let record = RepoRecord::from_repo(&repo);
-        repos.insert(repo.name.clone(), record);
+        repos.insert(repo.name, record);
         Ok(())
     }
 
@@ -130,7 +130,7 @@ impl LocalForge {
     pub fn all_repos(&self) -> ForgeResult<Vec<Repo>> {
         let repos = self.read_repos()?;
 
-        Ok(repos.values().map(|r| r.to_repo()).collect())
+        Ok(repos.values().map(super::super::types::repo::RepoRecord::to_repo).collect())
     }
 
     // --- RepoRecord API ---
@@ -240,7 +240,7 @@ impl LocalForge {
         Err(ForgeError::SerdeError("Failed to parse repos.yaml in either old or new format".to_string()))
     }
 
-    /// Save repositories to YAML file (new format with RepoRecord)
+    /// Save repositories to YAML file (new format with `RepoRecord`)
     pub async fn save_to_yaml(&self) -> ForgeResult<()> {
         let path = self.config_path.as_ref()
             .ok_or_else(|| ForgeError::ApiError("No config path set".to_string()))?;
@@ -250,14 +250,14 @@ impl LocalForge {
             let repos = self.read_repos()?;
             let states = self.read_forges()?;
             let ot = self.owner_type.read().map_err(|e| {
-                ForgeError::ApiError(format!("Lock poisoned: {}", e))
+                ForgeError::ApiError(format!("Lock poisoned: {e}"))
             })?;
 
             let repo_map: HashMap<String, RepoRecord> = repos.iter()
                 .map(|(name, record)| (name.clone(), record.clone()))
                 .collect();
             let state_map: HashMap<String, ForgeSyncState> = states.iter()
-                .map(|(forge, state)| (format!("{:?}", forge).to_lowercase(), state.clone()))
+                .map(|(forge, state)| (format!("{forge:?}").to_lowercase(), state.clone()))
                 .collect();
             (repo_map, state_map, ot.clone())
         }; // Locks are dropped here
@@ -300,7 +300,7 @@ impl ForgePort for LocalForge {
         let repos = self.read_repos()?;
 
         repos.get(name)
-            .map(|r| r.to_repo())
+            .map(super::super::types::repo::RepoRecord::to_repo)
             .ok_or_else(|| ForgeError::RepoNotFound { name: name.to_string() })
     }
 
@@ -404,7 +404,7 @@ impl ForgePort for LocalForge {
     }
 }
 
-/// YAML file format for repos.yaml (new format with RepoRecord)
+/// YAML file format for repos.yaml (new format with `RepoRecord`)
 #[derive(Debug, Serialize, Deserialize)]
 struct ReposYaml {
     #[serde(default)]
@@ -643,7 +643,7 @@ mod tests {
         let yaml_path = tmp.path().join("repos.yaml");
 
         // Write old format
-        let old_yaml = r#"repos:
+        let old_yaml = r"repos:
   my-repo:
     name: my-repo
     description: A test repo
@@ -652,7 +652,7 @@ mod tests {
     mirrors:
       - codeberg
     protected: false
-"#;
+";
         tokio::fs::write(&yaml_path, old_yaml).await.unwrap();
 
         // Load with new code
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(record.default_branch, "main");
 
         // Test update_record
-        let mut updated = record.clone();
+        let mut updated = record;
         updated.managed = true;
         updated.default_branch = "develop".to_string();
         forge.update_record(&updated).unwrap();

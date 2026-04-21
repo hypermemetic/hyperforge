@@ -1,4 +1,4 @@
-//! ForgePort trait - unified interface for forge operations
+//! `ForgePort` trait - unified interface for forge operations
 //!
 //! This trait provides a common interface for interacting with code forges
 //! (GitHub, Codeberg, etc.) and the local forge (in-memory state).
@@ -13,7 +13,7 @@ use crate::types::Repo;
 pub struct ListResult {
     /// Repos if modified, None if not modified (304)
     pub repos: Option<Vec<Repo>>,
-    /// ETag from response for future conditional requests
+    /// `ETag` from response for future conditional requests
     pub etag: Option<String>,
     /// Whether the data was modified since last check
     pub modified: bool,
@@ -42,7 +42,7 @@ pub enum ForgeError {
     #[error("API error: {0}")]
     ApiError(String),
 
-    /// I/O error (for LocalForge file operations)
+    /// I/O error (for `LocalForge` file operations)
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -57,9 +57,9 @@ pub type ForgeResult<T> = std::result::Result<T, ForgeError>;
 /// Unified interface for forge operations
 ///
 /// This trait is implemented by:
-/// - LocalForge: In-memory state backed by repos.yaml
-/// - GitHubAdapter: GitHub API client
-/// - CodebergAdapter: Codeberg API client
+/// - `LocalForge`: In-memory state backed by repos.yaml
+/// - `GitHubAdapter`: GitHub API client
+/// - `CodebergAdapter`: Codeberg API client
 #[async_trait]
 pub trait ForgePort: Send + Sync {
     /// List all repositories for the given organization
@@ -95,7 +95,7 @@ pub trait ForgePort: Send + Sync {
         }
     }
 
-    /// List repos with conditional request support (ETag)
+    /// List repos with conditional request support (`ETag`)
     ///
     /// If an `etag` from a previous response is provided, the forge may return
     /// a 304 Not Modified response, avoiding the cost of re-transferring and

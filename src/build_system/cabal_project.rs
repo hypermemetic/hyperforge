@@ -46,7 +46,7 @@ pub fn generate_cabal_project(
     content.push_str("-- Do not edit manually; re-run `workspace unify` to regenerate.\n\n");
     content.push_str("packages:\n");
     for pkg in &pkg_paths {
-        content.push_str(&format!("  {}/\n", pkg));
+        content.push_str(&format!("  {pkg}/\n"));
     }
 
     let project_path = workspace_root.join("cabal.project");
@@ -58,12 +58,12 @@ pub fn generate_cabal_project(
                 FileAction::Unchanged
             } else {
                 std::fs::write(&project_path, &content)
-                    .map_err(|e| format!("Failed to write cabal.project: {}", e))?;
+                    .map_err(|e| format!("Failed to write cabal.project: {e}"))?;
                 FileAction::Updated
             }
         } else {
             std::fs::write(&project_path, &content)
-                .map_err(|e| format!("Failed to write cabal.project: {}", e))?;
+                .map_err(|e| format!("Failed to write cabal.project: {e}"))?;
             FileAction::Created
         }
     } else if project_path.exists() {

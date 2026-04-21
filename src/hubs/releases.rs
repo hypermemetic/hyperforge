@@ -1,15 +1,12 @@
-//! ReleasesHub — Release management subactivation
+//! `ReleasesHub` — Release management subactivation
 //!
-//! A child plugin under RepoHub, accessible as:
+//! A child plugin under `RepoHub`, accessible as:
 //!   synapse lforge hyperforge repo releases list --org foo --name bar
 //!   synapse lforge hyperforge repo releases create --org foo --name bar --tag v1.0.0
 //!   synapse lforge hyperforge repo releases upload --org foo --name bar --tag v1.0.0 --file ./dist/app.tar.gz
 
 use async_stream::stream;
-use async_trait::async_trait;
 use futures::Stream;
-use plexus_core::plexus::{Activation, AuthContext, ChildRouter, PlexusError, PlexusStream};
-use serde_json::Value;
 use std::sync::Arc;
 
 use crate::adapters::forge_port::ForgePort;
@@ -28,7 +25,7 @@ pub struct ReleasesHub {
 }
 
 impl ReleasesHub {
-    pub fn new(state: HyperforgeState) -> Self {
+    pub const fn new(state: HyperforgeState) -> Self {
         Self { state }
     }
 }
@@ -41,18 +38,18 @@ fn make_release_adapter(
     match forge {
         "github" => GitHubReleaseAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ReleasePort>)
-            .map_err(|e| format!("github: {}", e)),
+            .map_err(|e| format!("github: {e}")),
         "codeberg" => CodebergReleaseAdapter::new(auth, org)
             .map(|a| Box::new(a) as Box<dyn ReleasePort>)
-            .map_err(|e| format!("codeberg: {}", e)),
-        other => Err(format!("Releases not supported for forge: {}", other)),
+            .map_err(|e| format!("codeberg: {e}")),
+        other => Err(format!("Releases not supported for forge: {other}")),
     }
 }
 
 fn make_auth() -> Result<Arc<YamlAuthProvider>, String> {
     YamlAuthProvider::new()
         .map(Arc::new)
-        .map_err(|e| format!("Failed to create auth provider: {}", e))
+        .map_err(|e| format!("Failed to create auth provider: {e}"))
 }
 
 /// Guess content type from filename extension
@@ -123,7 +120,7 @@ impl ReleasesHub {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Skipping {} ({})", forge_name, e),
+                            message: format!("Skipping {forge_name} ({e})"),
                         };
                         continue;
                     }
@@ -133,7 +130,7 @@ impl ReleasesHub {
                     Ok(releases) => {
                         if releases.is_empty() {
                             yield HyperforgeEvent::Info {
-                                message: format!("No releases found for {}/{} on {}", org, name, forge_name),
+                                message: format!("No releases found for {org}/{name} on {forge_name}"),
                             };
                             continue;
                         }
@@ -153,7 +150,7 @@ impl ReleasesHub {
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to list releases on {}: {}", forge_name, e),
+                            message: format!("Failed to list releases on {forge_name}: {e}"),
                         };
                     }
                 }
@@ -271,7 +268,7 @@ impl ReleasesHub {
             let file_path = std::path::Path::new(&file);
             if !file_path.exists() {
                 yield HyperforgeEvent::Error {
-                    message: format!("File not found: {}", file),
+                    message: format!("File not found: {file}"),
                 };
                 return;
             }
@@ -286,7 +283,7 @@ impl ReleasesHub {
                 Ok(d) => d,
                 Err(e) => {
                     yield HyperforgeEvent::Error {
-                        message: format!("Failed to read file {}: {}", file, e),
+                        message: format!("Failed to read file {file}: {e}"),
                     };
                     return;
                 }
@@ -333,7 +330,7 @@ impl ReleasesHub {
                             asset_name: filename.clone(),
                             size_bytes,
                             success: false,
-                            error: Some(format!("Release with tag '{}' not found on {}", tag, forge_name)),
+                            error: Some(format!("Release with tag '{tag}' not found on {forge_name}")),
                         };
                         continue;
                     }
@@ -345,7 +342,7 @@ impl ReleasesHub {
                             asset_name: filename.clone(),
                             size_bytes,
                             success: false,
-                            error: Some(format!("Failed to find release: {}", e)),
+                            error: Some(format!("Failed to find release: {e}")),
                         };
                         continue;
                     }
@@ -420,8 +417,7 @@ impl ReleasesHub {
             for forge_name in &target_forges {
                 if is_dry_run {
                     yield HyperforgeEvent::Info {
-                        message: format!("{}Would delete release {} for {}/{} on {}",
-                            dry_prefix, tag, org, name, forge_name),
+                        message: format!("{dry_prefix}Would delete release {tag} for {org}/{name} on {forge_name}"),
                     };
                     continue;
                 }
@@ -449,7 +445,7 @@ impl ReleasesHub {
                             forge: forge_name.clone(),
                             tag: tag.clone(),
                             success: false,
-                            error: Some(format!("Release with tag '{}' not found on {}", tag, forge_name)),
+                            error: Some(format!("Release with tag '{tag}' not found on {forge_name}")),
                         };
                         continue;
                     }
@@ -459,7 +455,7 @@ impl ReleasesHub {
                             forge: forge_name.clone(),
                             tag: tag.clone(),
                             success: false,
-                            error: Some(format!("Failed to find release: {}", e)),
+                            error: Some(format!("Failed to find release: {e}")),
                         };
                         continue;
                     }
@@ -524,7 +520,7 @@ impl ReleasesHub {
                     Ok(a) => a,
                     Err(e) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Skipping {} ({})", forge_name, e),
+                            message: format!("Skipping {forge_name} ({e})"),
                         };
                         continue;
                     }
@@ -535,13 +531,13 @@ impl ReleasesHub {
                     Ok(Some(r)) => r,
                     Ok(None) => {
                         yield HyperforgeEvent::Info {
-                            message: format!("Release '{}' not found for {}/{} on {}", tag, org, name, forge_name),
+                            message: format!("Release '{tag}' not found for {org}/{name} on {forge_name}"),
                         };
                         continue;
                     }
                     Err(e) => {
                         yield HyperforgeEvent::Error {
-                            message: format!("Failed to find release on {}: {}", forge_name, e),
+                            message: format!("Failed to find release on {forge_name}: {e}"),
                         };
                         continue;
                     }
@@ -550,7 +546,7 @@ impl ReleasesHub {
                 // The release already has assets embedded from get_release_by_tag
                 if release.assets.is_empty() {
                     yield HyperforgeEvent::Info {
-                        message: format!("No assets for release {} on {}", tag, forge_name),
+                        message: format!("No assets for release {tag} on {forge_name}"),
                     };
                     continue;
                 }
@@ -572,7 +568,7 @@ impl ReleasesHub {
     }
 }
 
-/// Resolve which forges to target, same pattern as ImagesHub
+/// Resolve which forges to target, same pattern as `ImagesHub`
 async fn resolve_target_forges(
     state: &HyperforgeState,
     org: &str,

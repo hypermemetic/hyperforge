@@ -11,10 +11,10 @@ pub struct KeychainBridge {
 }
 
 impl KeychainBridge {
-    /// Create a new KeychainBridge for the given organization
+    /// Create a new `KeychainBridge` for the given organization
     pub fn new(org_name: &str) -> Self {
         Self {
-            service_prefix: format!("hyperforge:{}", org_name),
+            service_prefix: format!("hyperforge:{org_name}"),
         }
     }
 
@@ -127,7 +127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires macOS and actual keychain access
+    #[ignore = "requires macOS with keychain access"]
     async fn test_set_and_get() {
         let bridge = KeychainBridge::new("test-org");
         let key = "test-token";
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires macOS and actual keychain access
+    #[ignore = "requires macOS with keychain access"]
     async fn test_get_nonexistent() {
         let bridge = KeychainBridge::new("test-org");
         let result = bridge.get("nonexistent-key").await.unwrap();
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires macOS and actual keychain access
+    #[ignore = "requires macOS with keychain access"]
     async fn test_delete_nonexistent() {
         let bridge = KeychainBridge::new("test-org");
         // Should not error even if key doesn't exist

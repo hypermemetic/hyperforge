@@ -37,7 +37,7 @@ pub fn cabal_package_version(path: &Path) -> Option<String> {
 
 /// Parse a top-level field from cabal file content
 fn parse_cabal_field(content: &str, field: &str) -> Option<String> {
-    let prefix = format!("{}:", field);
+    let prefix = format!("{field}:");
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.to_lowercase().starts_with(&prefix) {
@@ -192,7 +192,7 @@ fn parse_dep_list(
 ///
 /// Cabal does not have a lightweight file-listing command, so this
 /// returns `None`. Callers should fall back to directory-scoped diff.
-pub fn cabal_publishable_files(_path: &Path) -> Option<Vec<String>> {
+pub const fn cabal_publishable_files(_path: &Path) -> Option<Vec<String>> {
     None
 }
 
@@ -247,7 +247,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("test.cabal"),
-            r#"name:           test
+            r"name:           test
 version:        0.1.0
 
 library
@@ -260,7 +260,7 @@ library
 executable test-exe
   build-depends:
     , optparse-applicative >=0.16
-"#,
+",
         )
         .unwrap();
 
@@ -282,7 +282,7 @@ executable test-exe
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("synapse.cabal"),
-            r#"name:           synapse
+            r"name:           synapse
 version:        0.2.0
 
 library
@@ -291,7 +291,7 @@ library
 executable synapse
   main-is: Main.hs
   build-depends: base >=4.7
-"#,
+",
         )
         .unwrap();
 
@@ -306,7 +306,7 @@ executable synapse
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("myapp.cabal"),
-            r#"name:           myapp
+            r"name:           myapp
 version:        1.0.0
 
 library
@@ -320,7 +320,7 @@ executable myapp-migrate
 
 executable myapp-worker
   main-is: Worker.hs
-"#,
+",
         )
         .unwrap();
 

@@ -37,7 +37,7 @@ impl YamlAuthProvider {
     }
 
     /// Create with a custom secrets file path
-    pub fn with_path(path: PathBuf) -> Self {
+    pub const fn with_path(path: PathBuf) -> Self {
         Self {
             secrets_path: path,
         }
