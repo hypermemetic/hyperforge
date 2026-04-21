@@ -1,6 +1,6 @@
 [package]
 name = "hyperforge"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2021"
 description = "Multi-forge repository management"
 license = "MIT"
@@ -23,8 +23,8 @@ path = "src/bin/hyperforge-ssh.rs"
 
 [dependencies]
 # Hub framework integration
-plexus-core = "0.4"
-plexus-macros = "0.4"
+plexus-core = "0.5"
+plexus-macros = "0.5"
 plexus-transport = "0.2"
 
 # Async
