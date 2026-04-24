@@ -1,7 +1,7 @@
 ---
 id: V5PROV-4
 title: "Codeberg adapter: implement create_repo, delete_repo, repo_exists"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PROV-2]
 unlocks: [V5PROV-9]

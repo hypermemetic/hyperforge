@@ -191,41 +191,152 @@ impl ForgePort for CodebergAdapter {
     }
 
     // -----------------------------------------------------------------
-    // V5PROV-2 trait stubs; real impl lands in V5PROV-4.
+    // V5PROV-4 lifecycle methods.
     // -----------------------------------------------------------------
 
     async fn create_repo(
         &self,
-        _remote: &Remote,
-        _repo_ref: &RepoRef,
-        _visibility: ProviderVisibility,
-        _description: &str,
-        _auth: &ForgeAuth<'_>,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        visibility: ProviderVisibility,
+        description: &str,
+        auth: &ForgeAuth<'_>,
     ) -> Result<(), ForgePortError> {
-        Err(ForgePortError::unsupported_field(
-            "codeberg create_repo: not yet implemented (V5PROV-4)",
-        ))
+        // Gitea v1 has no `internal` visibility in our portable surface.
+        if matches!(visibility, ProviderVisibility::Internal) {
+            return Err(ForgePortError::unsupported_visibility(
+                "codeberg.org (Gitea) does not support visibility 'internal'",
+            ));
+        }
+        let _ = extract_host(remote.url.as_str());
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+
+        let private = matches!(visibility, ProviderVisibility::Private);
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "name".to_string(),
+            Value::String(repo_ref.name.as_str().to_string()),
+        );
+        body.insert("private".to_string(), Value::Bool(private));
+        if !description.is_empty() {
+            body.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+
+        // Org endpoint first; fall back to `/user/repos` on 404.
+        let org_url = format!(
+            "https://{}/api/v1/orgs/{}/repos",
+            self.host, repo_ref.org
+        );
+        let resp = client
+            .post(&org_url)
+            .headers(headers.clone())
+            .json(&Value::Object(body.clone()))
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("post {org_url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == StatusCode::CONFLICT {
+            return Err(ForgePortError::conflict(format!(
+                "codeberg repo '{}/{}' already exists",
+                repo_ref.org, repo_ref.name
+            )));
+        }
+        if status == StatusCode::UNPROCESSABLE_ENTITY {
+            let b = resp.text().await.unwrap_or_default();
+            if b.contains("already exists") || b.contains("taken") {
+                return Err(ForgePortError::conflict(format!(
+                    "codeberg repo '{}/{}' already exists",
+                    repo_ref.org, repo_ref.name
+                )));
+            }
+            return Err(ForgePortError::network(format!("codeberg 422: {b}")));
+        }
+        if status == StatusCode::NOT_FOUND {
+            let user_url = format!("https://{}/api/v1/user/repos", self.host);
+            let resp2 = client
+                .post(&user_url)
+                .headers(headers)
+                .json(&Value::Object(body))
+                .send()
+                .await
+                .map_err(|e| ForgePortError::network(format!("post {user_url}: {e}")))?;
+            let s2 = resp2.status();
+            if s2.is_success() {
+                return Ok(());
+            }
+            if s2 == StatusCode::CONFLICT {
+                return Err(ForgePortError::conflict(format!(
+                    "codeberg repo '{}/{}' already exists",
+                    repo_ref.org, repo_ref.name
+                )));
+            }
+            let b = resp2.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(s2, &b));
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
     }
 
     async fn delete_repo(
         &self,
-        _remote: &Remote,
-        _repo_ref: &RepoRef,
-        _auth: &ForgeAuth<'_>,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        auth: &ForgeAuth<'_>,
     ) -> Result<(), ForgePortError> {
-        Err(ForgePortError::unsupported_field(
-            "codeberg delete_repo: not yet implemented (V5PROV-4)",
-        ))
+        let _ = extract_host(remote.url.as_str());
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = self.api_url(repo_ref);
+
+        let resp = client
+            .delete(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("delete {url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() || status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
     }
 
     async fn repo_exists(
         &self,
-        _remote: &Remote,
-        _repo_ref: &RepoRef,
-        _auth: &ForgeAuth<'_>,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        auth: &ForgeAuth<'_>,
     ) -> Result<bool, ForgePortError> {
-        Err(ForgePortError::unsupported_field(
-            "codeberg repo_exists: not yet implemented (V5PROV-4)",
-        ))
+        let _ = extract_host(remote.url.as_str());
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = self.api_url(repo_ref);
+
+        let resp = client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
     }
 }
