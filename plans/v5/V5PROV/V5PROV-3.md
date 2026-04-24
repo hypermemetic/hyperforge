@@ -1,7 +1,7 @@
 ---
 id: V5PROV-3
 title: "GitHub adapter: implement create_repo, delete_repo, repo_exists"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PROV-2]
 unlocks: [V5PROV-6, V5PROV-7, V5PROV-8, V5PROV-9]
