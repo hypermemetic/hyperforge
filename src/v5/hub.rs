@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::v5::orgs::OrgsHub;
 use crate::v5::repos::ReposHub;
+use crate::v5::secrets::{SecretRef, SecretResolver, YamlSecretStore};
 use crate::v5::workspaces::WorkspacesHub;
 
 /// Events emitted by the v5 root hub.
@@ -30,6 +31,11 @@ pub enum HyperforgeV5Event {
         version: String,
         config_dir: String,
     },
+    /// Secret-resolve success (V5CORE-4). Carries the plaintext value
+    /// under `.value`. Only emitted by `resolve_secret`; the redaction
+    /// rule from CONTRACTS §types prohibits every other method from
+    /// including resolved values.
+    SecretResolved { value: String },
     /// Generic error event.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +102,42 @@ impl HyperforgeHub {
         let config_dir = self.state.config_dir.display().to_string();
         stream! {
             yield HyperforgeV5Event::Status { version, config_dir };
+        }
+    }
+
+    /// Resolve a `secrets://<path>` reference through the embedded
+    /// secret store and emit the plaintext value.
+    ///
+    /// This method exists to give tests a wire surface for the
+    /// `SecretResolver` capability (V5CORE-4 acceptance #1). Production
+    /// callers use the trait directly; no other wire method emits
+    /// resolved secrets (redaction rule from CONTRACTS §types).
+    #[plexus_macros::method(params(
+        secret_ref = "secrets:// reference to resolve"
+    ))]
+    pub async fn resolve_secret(
+        &self,
+        secret_ref: String,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let store = YamlSecretStore::new(&self.state.config_dir);
+        stream! {
+            let parsed = match SecretRef::parse(&secret_ref) {
+                Ok(r) => r,
+                Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some(e.code().to_string()),
+                        message: format!("{secret_ref}: {e}"),
+                    };
+                    return;
+                }
+            };
+            match store.resolve(&parsed) {
+                Ok(value) => yield HyperforgeV5Event::SecretResolved { value },
+                Err(e) => yield HyperforgeV5Event::Error {
+                    code: Some(e.code().to_string()),
+                    message: e.to_string(),
+                },
+            }
         }
     }
 }

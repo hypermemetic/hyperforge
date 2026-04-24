@@ -8,4 +8,5 @@ pub mod config;
 pub mod hub;
 pub mod orgs;
 pub mod repos;
+pub mod secrets;
 pub mod workspaces;
