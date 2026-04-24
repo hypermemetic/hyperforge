@@ -346,3 +346,39 @@ fn v5ws_9() {
 fn v5ws_10() {
     run_one("v5ws_10").unwrap();
 }
+
+// One #[test] per V5PROV script. V5PROV-2 is tier 1 (trait/schema
+// surface). V5PROV-3..9 are tier 2 (real forge API) and SKIP-clean
+// under the default invocation.
+#[test]
+fn v5prov_2() {
+    run_one("v5prov_2").unwrap();
+}
+#[test]
+fn v5prov_3() {
+    run_one("v5prov_3").unwrap();
+}
+#[test]
+fn v5prov_4() {
+    run_one("v5prov_4").unwrap();
+}
+#[test]
+fn v5prov_5() {
+    run_one("v5prov_5").unwrap();
+}
+#[test]
+fn v5prov_6() {
+    run_one("v5prov_6").unwrap();
+}
+#[test]
+fn v5prov_7() {
+    run_one("v5prov_7").unwrap();
+}
+#[test]
+fn v5prov_8() {
+    run_one("v5prov_8").unwrap();
+}
+#[test]
+fn v5prov_9() {
+    run_one("v5prov_9").unwrap();
+}

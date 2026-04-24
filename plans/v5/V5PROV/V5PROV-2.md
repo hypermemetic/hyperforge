@@ -1,7 +1,7 @@
 ---
 id: V5PROV-2
 title: "ForgePort trait: add create_repo, delete_repo, repo_exists"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: [V5PROV-3, V5PROV-4, V5PROV-5, V5PROV-6, V5PROV-7, V5PROV-8]

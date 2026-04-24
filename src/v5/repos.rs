@@ -40,15 +40,18 @@ use crate::v5::secrets::{SecretResolver, YamlSecretStore};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RepoEvent {
     /// Emitted by `forge_port_schema` (and harness capability probe).
-    /// Names the exact four-field D3 intersection.
+    /// Names the exact four-field D3 intersection + the three
+    /// lifecycle methods pinned by V5PROV-2 (D10).
     ForgePortSchema {
         fields: Vec<String>,
+        methods: Vec<String>,
         error_classes: Vec<String>,
     },
     /// Capability alias emitted alongside `forge_port_schema` for
     /// harness discoverability; same payload.
     Capability {
         fields: Vec<String>,
+        methods: Vec<String>,
         error_classes: Vec<String>,
     },
     /// One summary per repo (streamed by `list`).
@@ -343,8 +346,10 @@ fn validation_event(msg: impl Into<String>) -> RepoEvent {
     crate_path = "plexus_core"
 )]
 impl ReposHub {
-    /// V5REPOS-2 capability surface: announces the four D3 fields +
-    /// five error classes as a single flat event.
+    /// V5REPOS-2 / V5PROV-2 capability surface: announces the four D3
+    /// fields, the five original error classes plus `conflict` and
+    /// `unsupported_visibility`, and the seven trait method names
+    /// (four metadata + three lifecycle).
     #[plexus_macros::method]
     pub async fn forge_port_schema(
         &self,
@@ -354,18 +359,32 @@ impl ReposHub {
                 .iter()
                 .map(|k| k.as_str().to_string())
                 .collect();
+            let methods = vec![
+                "create_repo".to_string(),
+                "delete_repo".to_string(),
+                "read_metadata".to_string(),
+                "repo_exists".to_string(),
+                "write_metadata".to_string(),
+            ];
             let error_classes = vec![
                 "auth".to_string(),
+                "conflict".to_string(),
                 "network".to_string(),
                 "not_found".to_string(),
                 "rate_limited".to_string(),
                 "unsupported_field".to_string(),
+                "unsupported_visibility".to_string(),
             ];
             yield RepoEvent::ForgePortSchema {
                 fields: fields.clone(),
+                methods: methods.clone(),
                 error_classes: error_classes.clone(),
             };
-            yield RepoEvent::Capability { fields, error_classes };
+            yield RepoEvent::Capability {
+                fields,
+                methods,
+                error_classes,
+            };
         }
     }
 

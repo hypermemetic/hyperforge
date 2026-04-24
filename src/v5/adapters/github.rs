@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::v5::adapters::{
     extract_host, ForgeAuth, ForgeMetadata, ForgePort, ForgePortError, MetadataFields,
+    ProviderVisibility,
 };
 use crate::v5::config::{ProviderKind, Remote, RepoRef};
 
@@ -196,5 +197,44 @@ impl ForgePort for GithubAdapter {
         }
         // Echo the applied fields back.
         Ok(fields.clone())
+    }
+
+    // -----------------------------------------------------------------
+    // V5PROV-2 trait stubs; real impl lands in V5PROV-3.
+    // -----------------------------------------------------------------
+
+    async fn create_repo(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _visibility: ProviderVisibility,
+        _description: &str,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "github create_repo: not yet implemented (V5PROV-3)",
+        ))
+    }
+
+    async fn delete_repo(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "github delete_repo: not yet implemented (V5PROV-3)",
+        ))
+    }
+
+    async fn repo_exists(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<bool, ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "github repo_exists: not yet implemented (V5PROV-3)",
+        ))
     }
 }

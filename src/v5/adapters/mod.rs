@@ -78,7 +78,11 @@ pub struct ForgeMetadata {
 /// untouched on the remote.
 pub type MetadataFields = BTreeMap<DriftFieldKind, serde_json::Value>;
 
-/// Closed error class set for v1 (per V5REPOS-2).
+/// Closed error class set for v1.
+///
+/// Original five are per V5REPOS-2. `Conflict` and
+/// `UnsupportedVisibility` were added by V5PROV-2 (D10) for the three
+/// lifecycle methods on `ForgePort`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeErrorClass {
@@ -87,6 +91,11 @@ pub enum ForgeErrorClass {
     Network,
     UnsupportedField,
     RateLimited,
+    /// create_repo only — the repo already exists on the remote.
+    Conflict,
+    /// create_repo only — the provider does not support the requested
+    /// visibility variant (e.g., `internal` on github.com/codeberg.org).
+    UnsupportedVisibility,
 }
 
 impl ForgeErrorClass {
@@ -98,6 +107,8 @@ impl ForgeErrorClass {
             Self::Network => "network",
             Self::UnsupportedField => "unsupported_field",
             Self::RateLimited => "rate_limited",
+            Self::Conflict => "conflict",
+            Self::UnsupportedVisibility => "unsupported_visibility",
         }
     }
 }
@@ -142,6 +153,16 @@ impl ForgePortError {
     pub fn rate_limited(msg: impl Into<String>) -> Self {
         Self::new(ForgeErrorClass::RateLimited, msg)
     }
+
+    #[must_use]
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self::new(ForgeErrorClass::Conflict, msg)
+    }
+
+    #[must_use]
+    pub fn unsupported_visibility(msg: impl Into<String>) -> Self {
+        Self::new(ForgeErrorClass::UnsupportedVisibility, msg)
+    }
 }
 
 impl std::fmt::Display for ForgePortError {
@@ -166,10 +187,47 @@ pub struct ForgeAuth<'a> {
     pub resolver: &'a dyn SecretResolver,
 }
 
-/// Portable metadata capability. Read/write only the D3 intersection.
+/// `ProviderVisibility` (per CONTRACTS §types).
 ///
-/// Adapters MAY read additional fields internally; they MUST NOT leak
-/// provider-specific shapes through this trait.
+/// Adapters reject the variants their provider lacks by returning
+/// `ForgePortError { class: unsupported_visibility }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderVisibility {
+    Public,
+    Private,
+    Internal,
+}
+
+impl ProviderVisibility {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// Case-insensitive parse of `public` / `private` / `internal`.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "public" => Ok(Self::Public),
+            "private" => Ok(Self::Private),
+            "internal" => Ok(Self::Internal),
+            other => Err(format!(
+                "invalid visibility '{other}'; allowed: public, private, internal"
+            )),
+        }
+    }
+}
+
+/// Portable capability trait over the three forges.
+///
+/// Read/write the D3 metadata intersection, plus the three lifecycle
+/// methods pinned by V5PROV-2 (D10): `create_repo`, `delete_repo`,
+/// `repo_exists`. Adapters MAY read additional fields internally; they
+/// MUST NOT leak provider-specific shapes through this trait.
 #[async_trait]
 pub trait ForgePort: Send + Sync {
     /// Provider variant this adapter handles.
@@ -191,6 +249,46 @@ pub trait ForgePort: Send + Sync {
         fields: &MetadataFields,
         auth: &ForgeAuth<'_>,
     ) -> Result<MetadataFields, ForgePortError>;
+
+    /// Create the repo on the remote.
+    ///
+    /// On an already-existing repo, returns
+    /// `ForgePortError { class: conflict }`. On an
+    /// adapter-unsupported `visibility`, returns
+    /// `ForgePortError { class: unsupported_visibility }` without
+    /// issuing the API call.
+    async fn create_repo(
+        &self,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        visibility: ProviderVisibility,
+        description: &str,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError>;
+
+    /// Delete the repo on the remote.
+    ///
+    /// On a missing repo, returns
+    /// `ForgePortError { class: not_found }` (not a silent success —
+    /// callers distinguish "already gone" from "auth fails" via the
+    /// error class).
+    async fn delete_repo(
+        &self,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError>;
+
+    /// Probe whether the remote repo exists and is reachable with the
+    /// given credentials. `Ok(true)` = exists and readable;
+    /// `Ok(false)` = doesn't exist; `Err { class: auth }` = we can't
+    /// even check.
+    async fn repo_exists(
+        &self,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<bool, ForgePortError>;
 }
 
 // ---------------------------------------------------------------------

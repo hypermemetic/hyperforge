@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::v5::adapters::{
     extract_host, ForgeAuth, ForgeMetadata, ForgePort, ForgePortError, MetadataFields,
+    ProviderVisibility,
 };
 use crate::v5::config::{ProviderKind, Remote, RepoRef};
 
@@ -187,5 +188,44 @@ impl ForgePort for CodebergAdapter {
             return Err(Self::map_status_error(status, &b));
         }
         Ok(fields.clone())
+    }
+
+    // -----------------------------------------------------------------
+    // V5PROV-2 trait stubs; real impl lands in V5PROV-4.
+    // -----------------------------------------------------------------
+
+    async fn create_repo(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _visibility: ProviderVisibility,
+        _description: &str,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "codeberg create_repo: not yet implemented (V5PROV-4)",
+        ))
+    }
+
+    async fn delete_repo(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "codeberg delete_repo: not yet implemented (V5PROV-4)",
+        ))
+    }
+
+    async fn repo_exists(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<bool, ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "codeberg repo_exists: not yet implemented (V5PROV-4)",
+        ))
     }
 }
