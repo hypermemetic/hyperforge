@@ -184,6 +184,23 @@ pub async fn delete_on_forge(
     adapter.delete_repo(remote, repo_ref, &auth).await
 }
 
+/// V5PARITY-2: list repos on a forge for an org. `provider` is
+/// supplied explicitly because there's no per-repo `Remote` yet at
+/// import time.
+pub async fn list_on_forge(
+    provider: ProviderKind,
+    org: &crate::v5::config::OrgName,
+    resolver: &dyn SecretResolver,
+    token_ref: Option<&str>,
+) -> Result<Vec<crate::v5::adapters::RemoteRepo>, ForgePortError> {
+    let adapter = for_provider(provider);
+    let auth = ForgeAuth {
+        token_ref,
+        resolver,
+    };
+    adapter.list_repos(org, &auth).await
+}
+
 /// Generic metadata write on the forge. Used by `repos.push`.
 pub async fn write_metadata_on_forge(
     remote: &Remote,

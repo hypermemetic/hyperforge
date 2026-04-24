@@ -327,4 +327,71 @@ impl ForgePort for GitlabAdapter {
         let b = resp.text().await.unwrap_or_default();
         Err(Self::map_status_error(status, &b))
     }
+
+    async fn list_repos(
+        &self,
+        org: &crate::v5::config::OrgName,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<Vec<crate::v5::adapters::RemoteRepo>, ForgePortError> {
+        // GitLab: /groups/{org}/projects — org might be a group OR a user;
+        // try group first, fall back to user.
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let host = "gitlab.com";
+        let mut items = Vec::new();
+        let mut page = 1u32;
+        let mut tried_user = false;
+        loop {
+            let url = if tried_user {
+                format!("https://{host}/api/v4/users/{}/projects?page={page}&per_page=50", org.as_str())
+            } else {
+                format!(
+                    "https://{host}/api/v4/groups/{}/projects?page={page}&per_page=50",
+                    urlencoding::encode(org.as_str())
+                )
+            };
+            let resp = client
+                .get(&url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND && page == 1 && !tried_user && items.is_empty() {
+                tried_user = true;
+                continue;
+            }
+            if !status.is_success() {
+                let b = resp.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, &b));
+            }
+            let body: serde_json::Value = resp.json().await
+                .map_err(|e| ForgePortError::network(format!("parse: {e}")))?;
+            let before = items.len();
+            if let Some(arr) = body.as_array() {
+                for item in arr {
+                    let name = item.get("path").and_then(|v| v.as_str())
+                        .or_else(|| item.get("name").and_then(|v| v.as_str()))
+                        .unwrap_or("").to_string();
+                    if name.is_empty() { continue; }
+                    let url = item.get("http_url_to_repo").and_then(|v| v.as_str())
+                        .or_else(|| item.get("web_url").and_then(|v| v.as_str()))
+                        .unwrap_or("").to_string();
+                    items.push(crate::v5::adapters::RemoteRepo {
+                        name,
+                        url,
+                        default_branch: item.get("default_branch").and_then(|v| v.as_str()).map(String::from),
+                        description: item.get("description").and_then(|v| v.as_str()).map(String::from),
+                        archived: item.get("archived").and_then(|v| v.as_bool()),
+                        visibility: item.get("visibility").and_then(|v| v.as_str()).map(String::from),
+                    });
+                }
+            }
+            if items.len() - before < 50 { break; }
+            page += 1;
+            if page > 100 { break; }
+        }
+        Ok(items)
+    }
 }

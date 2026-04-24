@@ -131,6 +131,25 @@ pub enum WorkspacesEvent {
         workspace_org: String,
         workspace_repo: String,
     },
+    /// V5PARITY-2: per-dir result during `workspaces.discover`.
+    /// `status` is `matched` (dir's origin resolves to a known repo),
+    /// `orphan` (unknown origin), or `already_member` (a workspace
+    /// already registered this ref).
+    DiscoverMatch {
+        dir: String,
+        status: String,
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+        reference: Option<crate::v5::repos::RepoRefWire>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
+    /// V5PARITY-2: emitted once after a discover pass creates or
+    /// updates a workspace yaml.
+    WorkspaceDiscovered {
+        name: String,
+        path: String,
+        repo_count: u32,
+    },
 }
 
 /// Validate a `WorkspaceName`: ≤64 chars, ASCII, no `/`, no leading `.`.
@@ -1427,6 +1446,167 @@ impl WorkspacesHub {
                 created,
                 skipped,
                 per_repo,
+            };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-2: workspaces.discover — FS scan → workspace yaml.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        path = "Directory to scan for git checkouts",
+        name = "Workspace name (defaults to path basename)",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn discover(
+        &self,
+        path: String,
+        name: Option<String>,
+        dry_run: Option<serde_json::Value>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if path.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'path'".into(),
+                };
+                return;
+            }
+            let dry = dry_run.as_ref().is_some_and(|v| match v {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => matches!(s.as_str(), "true" | "1" | "yes"),
+                _ => false,
+            });
+            let scan_root = std::path::PathBuf::from(&path);
+            if !scan_root.is_dir() {
+                yield WorkspacesEvent::Error {
+                    code: Some("not_a_directory".into()),
+                    message: format!("path is not a directory: {path}"),
+                };
+                return;
+            }
+            // Load every org so we can match origin URLs → <org>/<name>.
+            let orgs_dir = config_dir.join("orgs");
+            let orgs = if orgs_dir.is_dir() {
+                match crate::v5::ops::state::load_orgs(&orgs_dir) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        yield WorkspacesEvent::Error {
+                            code: Some("config_error".into()),
+                            message: e.to_string(),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            // Build URL → (org, repo_name) lookup.
+            let mut url_index: std::collections::BTreeMap<String, (String, String)> =
+                std::collections::BTreeMap::new();
+            for (_, org) in &orgs {
+                for r in &org.repos {
+                    for rem in &r.remotes {
+                        url_index.insert(
+                            rem.url.as_str().to_string(),
+                            (org.name.as_str().to_string(), r.name.as_str().to_string()),
+                        );
+                    }
+                }
+            }
+            // Walk the path.
+            let mut entries: Vec<(String, std::path::PathBuf)> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&scan_root) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if !p.is_dir() { continue; }
+                    let Some(nm) = p.file_name().and_then(|s| s.to_str()) else { continue };
+                    entries.push((nm.to_string(), p));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            // Also load existing workspace yamls to detect already_member.
+            let ws_dir = config_dir.join("workspaces");
+            let existing_ws = if ws_dir.is_dir() {
+                crate::v5::ops::state::load_workspaces(&ws_dir).unwrap_or_default()
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            let mut membership: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            for (_, ws) in &existing_ws {
+                for entry in &ws.repos {
+                    let key = match entry {
+                        crate::v5::config::WorkspaceRepo::Shorthand(s) => s.split_once('/').map(|(o, n)| (o.to_string(), n.to_string())),
+                        crate::v5::config::WorkspaceRepo::Object { reference, .. } => Some((
+                            reference.org.as_str().to_string(),
+                            reference.name.as_str().to_string(),
+                        )),
+                    };
+                    if let Some(k) = key {
+                        membership.insert(k);
+                    }
+                }
+            }
+            // For each dir, resolve origin + classify.
+            let mut matched_refs: Vec<(String, String)> = Vec::new();
+            for (dname, dpath) in &entries {
+                let origin = read_git_origin(dpath);
+                match origin.as_ref().and_then(|u| url_index.get(u)) {
+                    Some((o, n)) => {
+                        let already = membership.contains(&(o.clone(), n.clone()));
+                        yield WorkspacesEvent::DiscoverMatch {
+                            dir: dname.clone(),
+                            status: if already { "already_member".into() } else { "matched".into() },
+                            reference: Some(crate::v5::repos::RepoRefWire {
+                                org: o.clone(),
+                                name: n.clone(),
+                            }),
+                            origin: origin.clone(),
+                        };
+                        if !already { matched_refs.push((o.clone(), n.clone())); }
+                    }
+                    None => {
+                        yield WorkspacesEvent::DiscoverMatch {
+                            dir: dname.clone(),
+                            status: "orphan".into(),
+                            reference: None,
+                            origin,
+                        };
+                    }
+                }
+            }
+            // Build a workspace yaml if anything matched + not dry.
+            let ws_name = name.unwrap_or_else(|| {
+                scan_root.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("discovered")
+                    .to_string()
+            });
+            if !matched_refs.is_empty() && !dry {
+                let repos: Vec<crate::v5::config::WorkspaceRepo> = matched_refs.iter()
+                    .map(|(o, n)| crate::v5::config::WorkspaceRepo::Shorthand(format!("{o}/{n}")))
+                    .collect();
+                let new_cfg = crate::v5::config::WorkspaceConfig {
+                    name: crate::v5::config::WorkspaceName::from(ws_name.as_str()),
+                    path: crate::v5::config::FsPath::from(path.as_str()),
+                    repos,
+                };
+                let ws_dir = config_dir.join("workspaces");
+                if let Err(e) = crate::v5::ops::state::save_workspace(&ws_dir, &new_cfg) {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            }
+            yield WorkspacesEvent::WorkspaceDiscovered {
+                name: ws_name,
+                path: path.clone(),
+                repo_count: u32::try_from(matched_refs.len()).unwrap_or(u32::MAX),
             };
         }
     }

@@ -339,4 +339,89 @@ impl ForgePort for CodebergAdapter {
         let b = resp.text().await.unwrap_or_default();
         Err(Self::map_status_error(status, &b))
     }
+
+    async fn list_repos(
+        &self,
+        org: &crate::v5::config::OrgName,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<Vec<crate::v5::adapters::RemoteRepo>, ForgePortError> {
+        // Gitea: /orgs/{org}/repos with pagination (?page=N&limit=50)
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let mut items = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let url = format!(
+                "https://codeberg.org/api/v1/orgs/{}/repos?page={page}&limit=50",
+                org.as_str()
+            );
+            let resp = client
+                .get(&url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND && page == 1 && items.is_empty() {
+                // try user endpoint
+                let alt = format!(
+                    "https://codeberg.org/api/v1/users/{}/repos?page=1&limit=50",
+                    org.as_str()
+                );
+                let r2 = client
+                    .get(&alt)
+                    .headers(headers.clone())
+                    .send()
+                    .await
+                    .map_err(|e| ForgePortError::network(format!("get {alt}: {e}")))?;
+                if !r2.status().is_success() {
+                    let b = r2.text().await.unwrap_or_default();
+                    return Err(Self::map_status_error(status, &b));
+                }
+                let body: serde_json::Value = r2.json().await
+                    .map_err(|e| ForgePortError::network(format!("parse: {e}")))?;
+                push_gitea_items(&mut items, &body);
+                break;
+            }
+            if !status.is_success() {
+                let b = resp.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, &b));
+            }
+            let body: serde_json::Value = resp.json().await
+                .map_err(|e| ForgePortError::network(format!("parse: {e}")))?;
+            let before = items.len();
+            push_gitea_items(&mut items, &body);
+            if items.len() - before < 50 {
+                break;
+            }
+            page += 1;
+            if page > 100 { break; } // safety cap
+        }
+        Ok(items)
+    }
+}
+
+fn push_gitea_items(items: &mut Vec<crate::v5::adapters::RemoteRepo>, body: &serde_json::Value) {
+    if let Some(arr) = body.as_array() {
+        for item in arr {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if name.is_empty() { continue; }
+            let url = item.get("clone_url").and_then(|v| v.as_str())
+                .or_else(|| item.get("html_url").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string();
+            items.push(crate::v5::adapters::RemoteRepo {
+                name,
+                url,
+                default_branch: item.get("default_branch").and_then(|v| v.as_str()).map(String::from),
+                description: item.get("description").and_then(|v| v.as_str()).map(String::from),
+                archived: item.get("archived").and_then(|v| v.as_bool()),
+                visibility: if item.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    Some("private".into())
+                } else {
+                    Some("public".into())
+                },
+            });
+        }
+    }
 }

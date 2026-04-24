@@ -356,4 +356,76 @@ impl ForgePort for GithubAdapter {
         let b = resp.text().await.unwrap_or_default();
         Err(Self::map_status_error(status, &b))
     }
+
+    async fn list_repos(
+        &self,
+        org: &crate::v5::config::OrgName,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<Vec<crate::v5::adapters::RemoteRepo>, ForgePortError> {
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        // Prefer the org endpoint; fall back to the user endpoint on 404
+        // (GitHub treats user accounts as a distinct endpoint shape).
+        let org_url = format!("https://api.github.com/orgs/{}/repos?per_page=100", org.as_str());
+        let mut items = Vec::new();
+        let mut url_opt = Some(org_url);
+        let mut tried_user = false;
+        while let Some(url) = url_opt.take() {
+            let resp = client
+                .get(&url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND && !tried_user && items.is_empty() {
+                tried_user = true;
+                url_opt = Some(format!("https://api.github.com/users/{}/repos?per_page=100", org.as_str()));
+                continue;
+            }
+            if !status.is_success() {
+                let b = resp.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, &b));
+            }
+            // Pagination via Link header.
+            let next = resp.headers().get(reqwest::header::LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_next_link);
+            let body: serde_json::Value = resp.json().await
+                .map_err(|e| ForgePortError::network(format!("parse repos list: {e}")))?;
+            if let Some(arr) = body.as_array() {
+                for item in arr {
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if name.is_empty() { continue; }
+                    let url = item.get("clone_url").and_then(|v| v.as_str())
+                        .or_else(|| item.get("html_url").and_then(|v| v.as_str()))
+                        .unwrap_or("").to_string();
+                    items.push(crate::v5::adapters::RemoteRepo {
+                        name,
+                        url,
+                        default_branch: item.get("default_branch").and_then(|v| v.as_str()).map(String::from),
+                        description: item.get("description").and_then(|v| v.as_str()).map(String::from),
+                        archived: item.get("archived").and_then(|v| v.as_bool()),
+                        visibility: item.get("visibility").and_then(|v| v.as_str()).map(String::from),
+                    });
+                }
+            }
+            url_opt = next;
+        }
+        Ok(items)
+    }
+}
+
+/// Parse the `rel="next"` URL out of a GitHub Link header.
+fn parse_next_link(header: &str) -> Option<String> {
+    for part in header.split(',') {
+        let part = part.trim();
+        if part.contains(r#"rel="next""#) {
+            let start = part.find('<')? + 1;
+            let end = part.find('>')?;
+            return Some(part[start..end].to_string());
+        }
+    }
+    None
 }

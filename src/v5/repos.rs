@@ -209,6 +209,20 @@ pub enum RepoEvent {
         repo_name: String,
         org: String,
     },
+    /// Emitted by `repos.import` per repo that was registered into the
+    /// org yaml.
+    RepoImported {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        url: String,
+    },
+    /// Emitted at the end of `repos.import`.
+    ImportSummary {
+        org: String,
+        total: u32,
+        added: u32,
+        skipped: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1534,6 +1548,105 @@ impl ReposHub {
                     };
                 }
             }
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-2: repos.import — walk a forge and register missing repos.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        forge = "Optional provider filter (github|codeberg|gitlab); default = org's declared forge",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn import(
+        &self,
+        org: String,
+        forge: Option<String>,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            if org.is_empty() {
+                yield validation_event("missing required parameter 'org'");
+                return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(org_cfg) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found"));
+                return;
+            };
+            // Pick the provider: explicit --forge wins; otherwise the org's declared forge.provider.
+            let provider = if let Some(f) = forge.as_deref().filter(|s| !s.is_empty()) {
+                match f {
+                    "github" => ProviderKind::Github,
+                    "codeberg" => ProviderKind::Codeberg,
+                    "gitlab" => ProviderKind::Gitlab,
+                    other => { yield validation_event(format!("unknown provider: {other}")); return; }
+                }
+            } else {
+                org_cfg.forge.provider
+            };
+            let resolver = YamlSecretStore::new(&config_dir);
+            let token_ref = crate::v5::ops::repo::token_ref_for(org_cfg);
+            let remote_repos = match crate::v5::ops::repo::list_on_forge(
+                provider, &OrgName::from(org.as_str()), &resolver, token_ref,
+            ).await {
+                Ok(v) => v,
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        code: Some(e.class.as_str().into()),
+                        error_class: Some(e.class.as_str().into()),
+                        message: e.message,
+                    };
+                    return;
+                }
+            };
+            let total = u32::try_from(remote_repos.len()).unwrap_or(u32::MAX);
+            let mut added: u32 = 0;
+            let mut skipped: u32 = 0;
+            // Clone the org for mutation.
+            let mut updated = org_cfg.clone();
+            for rr in &remote_repos {
+                // Skip if already registered.
+                let already = updated.repos.iter().any(|r| r.name.as_str() == rr.name);
+                if already { skipped += 1; continue; }
+                // Append.
+                let new_repo = crate::v5::config::OrgRepo {
+                    name: RepoName::from(rr.name.as_str()),
+                    remotes: vec![crate::v5::config::Remote {
+                        url: crate::v5::config::RemoteUrl::from(rr.url.as_str()),
+                        provider: None,
+                    }],
+                    metadata: None,
+                };
+                updated.repos.push(new_repo);
+                added += 1;
+                yield RepoEvent::RepoImported {
+                    reference: RepoRefWire {
+                        org: org.clone(),
+                        name: rr.name.clone(),
+                    },
+                    url: rr.url.clone(),
+                };
+            }
+            if !dry && added > 0 {
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                    yield cfg_error_event(e); return;
+                }
+            }
+            yield RepoEvent::ImportSummary {
+                org: org.clone(),
+                total,
+                added,
+                skipped,
+            };
         }
     }
 }

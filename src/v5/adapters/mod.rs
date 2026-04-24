@@ -58,6 +58,29 @@ impl DriftFieldKind {
     }
 }
 
+/// One remote repo as surfaced by `ForgePort::list_repos` (V5PARITY-2).
+/// Minimal shape — just enough for `repos.import` to register the entry
+/// into an org yaml. Per-repo metadata fields are OPTIONAL because
+/// some adapters' list-repos endpoints don't return everything that a
+/// per-repo `read_metadata` call does. Callers that need the full
+/// `ForgeMetadata` should follow up with `read_metadata` after import.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RemoteRepo {
+    pub name: String,
+    /// Canonical clone URL as advertised by the forge. May be HTTPS or
+    /// SSH depending on adapter preference; the `provider_map` at
+    /// `repos.import` time decides how it's registered locally.
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+}
+
 /// Read-side metadata: all four fields present (per D3 intersection).
 ///
 /// Values are deliberately typed as `serde_json::Value` at this
@@ -289,6 +312,17 @@ pub trait ForgePort: Send + Sync {
         repo_ref: &RepoRef,
         auth: &ForgeAuth<'_>,
     ) -> Result<bool, ForgePortError>;
+
+    /// V5PARITY-2: list every repo under an org on this provider.
+    ///
+    /// The adapter handles pagination internally and returns the full
+    /// concatenated list. Empty vector for an empty org. On API error:
+    /// typed `ForgePortError`.
+    async fn list_repos(
+        &self,
+        org: &crate::v5::config::OrgName,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<Vec<RemoteRepo>, ForgePortError>;
 }
 
 // ---------------------------------------------------------------------
