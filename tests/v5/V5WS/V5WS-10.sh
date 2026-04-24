@@ -71,7 +71,10 @@ for story in U1 U2 U3 U4 U5 U6; do
       ;;
     3)
       STORY_STATUS[$story]="yellow"
-      STORY_DETAIL[$story]="${STORY_LABEL[$story]} — tier-2 gated (set HF_TIER2=1):${skipped_scripts}"
+      # V5WS-9 is the only tier-2 script in the map; while V5REPOS-13
+      # hasn't merged it's also functionally deferred. Classify yellow
+      # with a one-liner that names both reasons.
+      STORY_DETAIL[$story]="${STORY_LABEL[$story]} — yellow: deferred pending V5REPOS-13 merge; tier-2 gated (set HF_TIER2=1):${skipped_scripts}"
       ;;
     1)
       STORY_STATUS[$story]="red"
