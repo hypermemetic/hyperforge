@@ -1,7 +1,7 @@
 ---
 id: V5WS-6
 title: "workspaces.add_repo — append a RepoRef, validated against its org"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-8, V5CORE-9]
 unlocks: [V5WS-10]

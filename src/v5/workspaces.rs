@@ -101,6 +101,39 @@ fn is_valid_fspath(s: &str) -> bool {
     !s.split('/').any(|seg| seg == "..")
 }
 
+/// Parse `<org>/<name>` string form. Returns `None` if the input does
+/// not look like exactly one forward slash separating two non-empty
+/// tokens that individually pass name validation.
+fn parse_repo_ref_string(
+    s: &str,
+) -> Option<(crate::v5::config::OrgName, crate::v5::config::RepoName)> {
+    let (org, name) = s.split_once('/')?;
+    if !is_valid_name(org) || !is_valid_name(name) {
+        return None;
+    }
+    Some((org.into(), name.into()))
+}
+
+/// Parse a `RepoRef` argument: accepts either `<org>/<name>` string
+/// form or a JSON object `{"org":"<o>","name":"<n>"}`.
+fn parse_repo_ref_arg(raw: &str) -> Option<crate::v5::config::RepoRef> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') {
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        let org = parsed.get("org")?.as_str()?;
+        let name = parsed.get("name")?.as_str()?;
+        if is_valid_name(org) && is_valid_name(name) {
+            return Some(crate::v5::config::RepoRef {
+                org: org.into(),
+                name: name.into(),
+            });
+        }
+        return None;
+    }
+    let (org, name) = parse_repo_ref_string(trimmed)?;
+    Some(crate::v5::config::RepoRef { org, name })
+}
+
 /// Ref key for comparing `WorkspaceRepo` entries regardless of shape.
 fn ref_key(entry: &WorkspaceRepo) -> Option<(String, String)> {
     match entry {
@@ -470,6 +503,145 @@ impl WorkspacesHub {
                 }
             }
             yield WorkspacesEvent::WorkspaceDeleted { name };
+        }
+    }
+
+    /// Append one `<org>/<name>` repo ref to a workspace. The ref must
+    /// resolve against `orgs/<org>.yaml`; duplicates (regardless of
+    /// the existing entry's shape) fail without a write. Pinned here:
+    /// the canonical string form `<org>/<name>` — one forward slash
+    /// separating two tokens, each rejecting `/`.
+    #[plexus_macros::method(params(
+        name = "Workspace to extend",
+        repo_ref = "Repo ref in '<org>/<name>' form (or {org,name} object)",
+        dry_run = "Preview without writing; default false",
+    ))]
+    pub async fn add_repo(
+        &self,
+        name: String,
+        repo_ref: String,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        let dry = dry_run.unwrap_or(false);
+        stream! {
+            if !is_valid_name(&name) {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_name".into()),
+                    message: format!("invalid workspace name: {name}"),
+                };
+                return;
+            }
+            let Some(rref) = parse_repo_ref_arg(&repo_ref) else {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_ref".into()),
+                    message: format!("invalid repo_ref: {repo_ref}"),
+                };
+                return;
+            };
+            let ws_dir = config_dir.join("workspaces");
+            let target = ws_dir.join(format!("{name}.yaml"));
+            let raw = match std::fs::read_to_string(&target) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace not found: {name}"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("read {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            let mut cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_yaml".into()),
+                        message: format!("parse {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            // Validate against its org yaml.
+            let orgs_dir = config_dir.join("orgs");
+            let org_file = orgs_dir.join(format!("{}.yaml", rref.org));
+            let org_raw = match std::fs::read_to_string(&org_file) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("org_not_found".into()),
+                        message: format!(
+                            "org not found: {} (ref {}/{})",
+                            rref.org, rref.org, rref.name
+                        ),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("read {}: {e}", org_file.display()),
+                    };
+                    return;
+                }
+            };
+            let org_cfg: crate::v5::config::OrgConfig = match serde_yaml::from_str(&org_raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_yaml".into()),
+                        message: format!("parse {}: {e}", org_file.display()),
+                    };
+                    return;
+                }
+            };
+            if !org_cfg
+                .repos
+                .iter()
+                .any(|r| r.name.as_str() == rref.name.as_str())
+            {
+                yield WorkspacesEvent::Error {
+                    code: Some("repo_not_found".into()),
+                    message: format!("repo not found in org: {}/{}", rref.org, rref.name),
+                };
+                return;
+            }
+            let key = (rref.org.as_str().to_string(), rref.name.as_str().to_string());
+            let already = cfg
+                .repos
+                .iter()
+                .any(|e| ref_key(e).as_ref() == Some(&key));
+            if already {
+                yield WorkspacesEvent::Error {
+                    code: Some("already_member".into()),
+                    message: format!("already a member: {}/{}", rref.org, rref.name),
+                };
+                return;
+            }
+            cfg.repos
+                .push(WorkspaceRepo::Shorthand(format!("{}/{}", rref.org, rref.name)));
+            let count = u32::try_from(cfg.repos.len()).unwrap_or(u32::MAX);
+            let path_str = cfg.path.as_str().to_string();
+            if !dry {
+                if let Err(e) = crate::v5::config::save_workspace(&ws_dir, &cfg) {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            }
+            yield WorkspacesEvent::WorkspaceSummary {
+                name,
+                path: path_str,
+                repo_count: count,
+            };
         }
     }
 }
