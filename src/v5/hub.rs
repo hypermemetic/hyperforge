@@ -1,9 +1,9 @@
 //! `HyperforgeHub` (v5) — root activation for the v5 rewrite.
 //!
-//! V5CORE-2 baseline: minimal scaffold with a `status` method that
-//! returns the daemon version. Later V5CORE tickets refine the event
-//! shape (V5CORE-5), attach child stubs (V5CORE-6/7/8), and add the
-//! `resolve_secret` capability (V5CORE-4).
+//! V5CORE-2 scaffolded the hub with a placeholder `status` returning
+//! only `version`. V5CORE-5 pins the full `StatusEvent` shape
+//! (`version` + `config_dir`). V5CORE-6/7/8 attach child stubs,
+//! V5CORE-4 adds `resolve_secret`.
 //!
 //! plexus-macros 0.5 rejects activations with zero `#[method]`
 //! functions, so `status` ships from V5CORE-2 onwards.
@@ -20,8 +20,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HyperforgeV5Event {
-    /// Daemon self-report. Additional fields land in V5CORE-5.
-    Status { version: String },
+    /// Daemon self-report. `version` is the crate version; `config_dir`
+    /// is the absolute, expanded config directory in use (V5CORE-5).
+    Status {
+        version: String,
+        config_dir: String,
+    },
     /// Generic error event.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,13 +64,13 @@ impl HyperforgeHub {
     crate_path = "plexus_core"
 )]
 impl HyperforgeHub {
-    /// Daemon self-report.
+    /// Return daemon version and config directory.
     #[plexus_macros::method]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
         let version = env!("CARGO_PKG_VERSION").to_string();
-        let _ = &self.state;
+        let config_dir = self.state.config_dir.display().to_string();
         stream! {
-            yield HyperforgeV5Event::Status { version };
+            yield HyperforgeV5Event::Status { version, config_dir };
         }
     }
 }
