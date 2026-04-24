@@ -1,7 +1,7 @@
 ---
 id: V5PROV-6
 title: "repos.add: add create_remote + visibility + description params"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PROV-2, V5PROV-3]
 unlocks: [V5PROV-9]

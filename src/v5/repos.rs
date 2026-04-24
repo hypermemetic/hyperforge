@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use crate::v5::adapters::{
     extract_host, for_provider, DriftFieldKind, ForgeAuth, ForgeMetadata, ForgePortError,
-    MetadataFields,
+    MetadataFields, ProviderVisibility,
 };
 use crate::v5::config::{
     load_all, load_orgs, save_org, ConfigError, CredentialType, DomainName, OrgConfig, OrgName,
@@ -72,6 +72,36 @@ pub enum RepoEvent {
     },
     /// Acknowledgement of a removed repo.
     RepoRemoved { org: String, name: String },
+    /// Acknowledgement of an added repo (V5PROV-6). Emitted after
+    /// the local entry is written (and, when `create_remote=true`,
+    /// after `repo_created`).
+    RepoAdded {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remotes: Vec<RemoteWire>,
+    },
+    /// Emitted by `repos.add --create_remote true` on successful
+    /// `adapter.create_repo` (V5PROV-6). `url` is the first remote.
+    RepoCreated {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        url: String,
+    },
+    /// Emitted by `repos.delete` (V5PROV-7) after the local entry is
+    /// dropped. Distinct from `RepoRemoved` (V5REPOS-6) — both mean
+    /// local success, but `repos.delete` is the V5PROV-flow method
+    /// and callers match on this type.
+    RepoDeleted {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+    },
+    /// Emitted by `repos.delete --delete_remote true` on successful
+    /// `adapter.delete_repo` (V5PROV-7). `url` is the first remote.
+    RemoteDeleted {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        url: String,
+    },
     /// Per-remote forge metadata snapshot.
     ForgeMetadata {
         url: String,
@@ -462,11 +492,24 @@ impl ReposHub {
         }
     }
 
-    /// V5REPOS-5: register a new repo with initial remotes.
+    /// V5REPOS-5 + V5PROV-6: register a new repo with initial remotes.
+    ///
+    /// When `create_remote=true` is set, the adapter's `create_repo`
+    /// is called after the local entry is written. The pinned order
+    /// (per V5PROV-1 R2): validate → write local → call `repo_exists`
+    /// (conflict if present) → call `create_repo` (on failure, roll
+    /// back local entry) → emit `repo_created` + `repo_added`.
+    ///
+    /// When `create_remote=false` (default), the method is backward
+    /// compatible with V5REPOS-5 and emits `repo_detail` + `repo_added`
+    /// after writing the local entry (no forge contact).
     #[plexus_macros::method(params(
         org = "Org name",
         name = "Repo name",
         remotes = "JSON array of remotes",
+        create_remote = "Also create the repo on the remote forge (default false)",
+        visibility = "Visibility for `create_remote`: public | private | internal (default private)",
+        description = "Description passed to `create_remote` (default empty)",
         dry_run = "Preview without writing"
     ))]
     pub async fn add(
@@ -474,6 +517,9 @@ impl ReposHub {
         org: String,
         name: String,
         remotes: Value,
+        create_remote: Option<Value>,
+        visibility: Option<String>,
+        description: Option<String>,
         dry_run: Option<Value>,
     ) -> impl Stream<Item = RepoEvent> + Send + 'static {
         let config_dir: Result<PathBuf, String> = Ok(self.config_dir.clone());
@@ -483,6 +529,7 @@ impl ReposHub {
                 Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
             };
             let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            let forge_create = create_remote.as_ref().is_some_and(|v| to_bool(v, false));
             if org.is_empty() {
                 yield validation_event("missing required parameter 'org'");
                 return;
@@ -499,6 +546,20 @@ impl ReposHub {
                 yield validation_event("remotes must contain at least one entry");
                 return;
             }
+            // Parse visibility. On `create_remote=false` the value is
+            // still parsed for validation — a garbage input fails
+            // fast rather than being silently ignored.
+            let vis_raw = visibility
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("private");
+            let vis = match ProviderVisibility::parse(vis_raw) {
+                Ok(v) => v,
+                Err(e) => { yield validation_event(e); return; }
+            };
+            let desc = description.unwrap_or_default();
+
             let loaded = match load_all(&dir) {
                 Ok(l) => l,
                 Err(e) => { yield cfg_error_event(e); return; }
@@ -524,19 +585,163 @@ impl ReposHub {
             let mut updated = existing.clone();
             updated.repos.push(OrgRepo {
                 name: RepoName::from(name.as_str()),
-                remotes: parsed_remotes,
+                remotes: parsed_remotes.clone(),
                 metadata: None,
             });
+            let orgs_dir = dir.join("orgs");
             if !dry {
-                let orgs_dir = dir.join("orgs");
                 if let Err(e) = save_org(&orgs_dir, &updated) {
                     yield cfg_error_event(e);
                     return;
                 }
             }
+            // ---------- create_remote flow ----------
+            if forge_create {
+                let first = &parsed_remotes[0];
+                let provider = match derive_provider(first, &provider_map) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Unreachable: we already validated above, but
+                        // defend defensively + roll back.
+                        if !dry {
+                            let rolled_back = existing.clone();
+                            let _ = save_org(&orgs_dir, &rolled_back);
+                        }
+                        yield validation_event(e);
+                        return;
+                    }
+                };
+                let repo_ref = RepoRef {
+                    org: OrgName::from(org.as_str()),
+                    name: RepoName::from(name.as_str()),
+                };
+                let repo_ref_wire = RepoRefWire::from(&repo_ref);
+                let url_s = first.url.as_str().to_string();
+
+                if dry {
+                    // Dry run emits the success event stream without
+                    // any forge or disk contact.
+                    yield RepoEvent::RepoCreated {
+                        reference: repo_ref_wire.clone(),
+                        url: url_s,
+                    };
+                    match repo_detail_event(
+                        org.clone(),
+                        name.clone(),
+                        updated.repos.last().unwrap(),
+                        &provider_map,
+                    ) {
+                        Ok(ev) => yield ev,
+                        Err(msg) => { yield validation_event(msg); return; }
+                    }
+                    // And the RepoAdded ack.
+                    let wires: Result<Vec<RemoteWire>, String> = parsed_remotes
+                        .iter()
+                        .map(|r| remote_to_wire(r, &provider_map))
+                        .collect();
+                    match wires {
+                        Ok(ws) => yield RepoEvent::RepoAdded {
+                            reference: repo_ref_wire,
+                            remotes: ws,
+                        },
+                        Err(msg) => yield validation_event(msg),
+                    }
+                    return;
+                }
+
+                let resolver = YamlSecretStore::new(&dir);
+                let token_ref = existing
+                    .forge
+                    .credentials
+                    .iter()
+                    .find(|c| matches!(c.cred_type, CredentialType::Token))
+                    .map(|c| c.key.clone());
+                let auth = ForgeAuth {
+                    token_ref: token_ref.as_deref(),
+                    resolver: &resolver,
+                };
+                let adapter = for_provider(provider);
+                // Check for existence first — if already present,
+                // report conflict + roll back local entry.
+                match adapter.repo_exists(first, &repo_ref, &auth).await {
+                    Ok(true) => {
+                        // Roll back local write.
+                        let rolled_back = existing.clone();
+                        if let Err(e) = save_org(&orgs_dir, &rolled_back) {
+                            yield cfg_error_event(e);
+                        }
+                        yield RepoEvent::Error {
+                            code: Some("conflict".into()),
+                            error_class: Some("conflict".into()),
+                            message: format!(
+                                "repo '{}/{}' already exists on remote",
+                                org, name
+                            ),
+                        };
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // auth or network failure during the probe
+                        // counts as a forge-side error → roll back.
+                        let rolled_back = existing.clone();
+                        if let Err(save_err) = save_org(&orgs_dir, &rolled_back) {
+                            yield cfg_error_event(save_err);
+                        }
+                        yield RepoEvent::Error {
+                            code: Some(e.class.as_str().into()),
+                            error_class: Some(e.class.as_str().into()),
+                            message: format!("repo_exists probe failed: {}", e.message),
+                        };
+                        return;
+                    }
+                }
+                match adapter
+                    .create_repo(first, &repo_ref, vis, &desc, &auth)
+                    .await
+                {
+                    Ok(()) => {
+                        yield RepoEvent::RepoCreated {
+                            reference: repo_ref_wire.clone(),
+                            url: url_s,
+                        };
+                    }
+                    Err(e) => {
+                        // Roll back local write on forge error.
+                        let rolled_back = existing.clone();
+                        if let Err(save_err) = save_org(&orgs_dir, &rolled_back) {
+                            yield cfg_error_event(save_err);
+                        }
+                        yield RepoEvent::Error {
+                            code: Some(e.class.as_str().into()),
+                            error_class: Some(e.class.as_str().into()),
+                            message: e.message,
+                        };
+                        return;
+                    }
+                }
+            }
+
+            // Success: emit RepoDetail (V5REPOS-5 backward compat) +
+            // RepoAdded (V5PROV-6 ack).
             let new_repo = updated.repos.last().unwrap();
+            let repo_ref_wire = RepoRefWire {
+                org: org.clone(),
+                name: name.clone(),
+            };
+            let wires: Result<Vec<RemoteWire>, String> = parsed_remotes
+                .iter()
+                .map(|r| remote_to_wire(r, &provider_map))
+                .collect();
             match repo_detail_event(org, name, new_repo, &provider_map) {
                 Ok(ev) => yield ev,
+                Err(msg) => { yield validation_event(msg); return; }
+            }
+            match wires {
+                Ok(ws) => yield RepoEvent::RepoAdded {
+                    reference: repo_ref_wire,
+                    remotes: ws,
+                },
                 Err(msg) => yield validation_event(msg),
             }
         }
