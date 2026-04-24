@@ -59,6 +59,13 @@ pub enum OrgsEvent {
         entry: CredentialEntry,
         dry_run: bool,
     },
+    /// Successful `remove_credential`: names the affected org and the
+    /// removed key. The secret store entry at that key is untouched.
+    CredentialRemoved {
+        org: OrgName,
+        key: String,
+        dry_run: bool,
+    },
     /// Generic error event. `code` is drawn from a closed set per method.
     Error { code: String, message: String },
 }
@@ -474,6 +481,89 @@ impl OrgsHub {
                 OrgsEvent::CredentialReplaced { org: cfg.name, entry, dry_run: is_dry }
             } else {
                 OrgsEvent::CredentialAdded { org: cfg.name, entry, dry_run: is_dry }
+            };
+        }
+    }
+
+    /// `orgs.remove_credential` — remove exactly the `CredentialEntry`
+    /// whose `key` equals the input. Order of remaining entries is
+    /// preserved. The secret store entry at the removed `key` is
+    /// untouched — that's a separate user action. (V5ORGS-8)
+    #[plexus_macros::method(
+        description = "Remove one credential entry by key",
+        params(
+            org = "Org name",
+            key = "Credential key to remove",
+            dry_run = "Preview without writing (default false)"
+        )
+    )]
+    pub async fn remove_credential(
+        &self,
+        org: Option<String>,
+        key: Option<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
+        let this = self.clone();
+        stream! {
+            let Some(org) = org else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'org'".into(),
+                };
+                return;
+            };
+            let Some(key) = key else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'key'".into(),
+                };
+                return;
+            };
+            if let Err(e) = validate_org_name(&org) {
+                yield OrgsEvent::Error { code: "invalid_name".into(), message: e };
+                return;
+            }
+            let mut cfg = match read_org(&this.config_dir, &org) {
+                Ok(c) => c,
+                Err(ReadOrgError::NotFound) => {
+                    yield OrgsEvent::Error {
+                        code: "org_not_found".into(),
+                        message: format!("org {org:?} not found"),
+                    };
+                    return;
+                }
+                Err(ReadOrgError::Io(m)) => {
+                    yield OrgsEvent::Error { code: "io_error".into(), message: m };
+                    return;
+                }
+                Err(ReadOrgError::Parse(m)) => {
+                    yield OrgsEvent::Error { code: "parse_error".into(), message: m };
+                    return;
+                }
+            };
+            let original_len = cfg.forge.credentials.len();
+            cfg.forge.credentials.retain(|c| c.key != key);
+            if cfg.forge.credentials.len() == original_len {
+                yield OrgsEvent::Error {
+                    code: "key_not_found".into(),
+                    message: format!("credential key {key:?} not found on org {org:?}"),
+                };
+                return;
+            }
+            let is_dry = dry_run.unwrap_or(false);
+            if !is_dry {
+                if let Err(e) = save_org(&this.orgs_dir(), &cfg) {
+                    yield OrgsEvent::Error {
+                        code: "io_error".into(),
+                        message: format!("{e}"),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::CredentialRemoved {
+                org: cfg.name,
+                key,
+                dry_run: is_dry,
             };
         }
     }
