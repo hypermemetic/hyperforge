@@ -25,7 +25,7 @@ hf_cmd repos add --org "$ORG" --name "$B_REPO" \
     --remotes "[{\"url\":\"https://github.com/${ORG}/${B_REPO}.git\"}]" >/dev/null
 
 # Create workspace referencing both.
-hf_cmd workspaces create --name "$WS" --path "/tmp/$WS" \
+hf_cmd workspaces create --name "$WS" --ws_path "/tmp/$WS" \
     --repos "[\"${ORG}/${A_REPO}\",\"${ORG}/${B_REPO}\"]" >/dev/null
 
 # --- first sync: A is in_sync (already remote); B is created ---

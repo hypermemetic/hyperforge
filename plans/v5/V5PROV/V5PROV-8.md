@@ -1,7 +1,7 @@
 ---
 id: V5PROV-8
 title: "workspaces.sync: detect remote-only members, call create_repo"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PROV-2, V5PROV-3]
 unlocks: [V5PROV-9]
