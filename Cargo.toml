@@ -89,6 +89,15 @@ flate2 = "1"
 [dev-dependencies]
 tempfile = "3"
 
+# --- v5 integration test tiers ---
+# Tier 1 (offline) runs by default. Tier 2 (live forge) and Tier 3
+# (orchestrated) are opt-in via crate features so CI can gate live /
+# orchestrated tests.
+[features]
+default = []
+tier2 = []
+tier3 = []
+
 # --- Lint posture ---
 #
 # Established by HF-CLEAN (hyperforge 4.1.2). Goal: fail the build on any new
