@@ -15,13 +15,18 @@ hf_teardown
 hf_spawn
 hf_load_fixture "ws_empty"
 hf_cmd workspaces create name=main ws_path=/tmp/hf-v5-test-dev repos='[]' >/dev/null
-captured_config="$HF_CONFIG"
+# Snapshot the disk state outside $HF_CONFIG so teardown's rm does not
+# clobber it. The invariant under test is "yaml lands on disk and
+# survives a daemon restart", not "hf_teardown preserves files".
+snapshot=$(mktemp -d -t hfv5-snap-XXXXXX)
+cp -a "$HF_CONFIG/." "$snapshot/"
 hf_teardown
 
 # Respawn, pointing at the same config dir
 hf_spawn
 # Copy the disk state we just wrote into the fresh HF_CONFIG
-cp -r "$captured_config/." "$HF_CONFIG/" 2>/dev/null || true
+cp -a "$snapshot/." "$HF_CONFIG/"
+rm -rf "$snapshot"
 out=$(hf_cmd workspaces list)
 echo "$out" | hf_assert_event '.type == "workspace_summary" and .name == "main"'
 hf_teardown

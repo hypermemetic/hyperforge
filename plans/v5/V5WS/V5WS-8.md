@@ -1,7 +1,7 @@
 ---
 id: V5WS-8
 title: "workspaces.reconcile — dir-rename and dir-removal detection via remote URL match"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-8, V5CORE-9]
 unlocks: [V5WS-10]
