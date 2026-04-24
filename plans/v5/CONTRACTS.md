@@ -119,6 +119,8 @@ Helpers provided by `tests/v5/harness/lib.sh`:
 | `hf_assert_count <jq_filter> <n>`     | Asserts exactly `n` events match.                                                             |
 | `hf_teardown`                         | Kills daemon, removes `$HF_CONFIG`. Registered as EXIT trap by `hf_spawn`. Save/respawn patterns must `cp` to an external tempdir before calling. |
 | `hf_add_provider_map <domain> <prov>` | Appends `<domain>: <provider>` to `$HF_CONFIG/config.yaml` under `provider_map:` (creates the block if absent). Pure bash; no yaml parser required. |
+| `hf_require_tier2 [<forge>]`         | SKIP-clean exit when `$HF_V5_TEST_CONFIG_DIR` is unset / missing `tier2.env`. Sources `tier2.env` into the script environment. Optional `<forge>` (e.g. `github`) additionally skips if that forge's `ORG`/`REPO` params are blank. |
+| `hf_use_test_config`                  | Overlays `$HF_V5_TEST_CONFIG_DIR/` (minus `tier2.env`) onto `$HF_CONFIG/`. Preserves subdirs. Call after `hf_spawn`. Gives the daemon the same `config.yaml` / `orgs/*.yaml` / `secrets.yaml` shape the user would have on `~/.config/hyperforge/`. |
 
 ### Rust runner
 

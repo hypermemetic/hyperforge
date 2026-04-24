@@ -3,40 +3,15 @@
 set -euo pipefail
 source "$(dirname "$0")/../harness/lib.sh"
 
-: "${HF_TEST_CODEBERG_ORG:=}"
-: "${HF_TEST_CODEBERG_REPO:=}"
-: "${HF_TEST_CODEBERG_TOKEN:=}"
-
-if [[ -z "$HF_TEST_CODEBERG_ORG" || -z "$HF_TEST_CODEBERG_REPO" || -z "$HF_TEST_CODEBERG_TOKEN" ]]; then
-  echo "SKIP: tier 2 env not set (HF_TEST_CODEBERG_ORG/_REPO/_TOKEN)"
-  exit 0
-fi
-
+hf_require_tier2 codeberg
 TS=$(date +%s)
 STAMP="hyperforge-v5-repos-10 $TS"
 
 hf_spawn
-mkdir -p "$HF_CONFIG/orgs"
-cat > "$HF_CONFIG/config.yaml" <<YAML
-provider_map:
-  codeberg.org: codeberg
-YAML
-cat > "$HF_CONFIG/orgs/${HF_TEST_CODEBERG_ORG}.yaml" <<YAML
-name: $HF_TEST_CODEBERG_ORG
-forge:
-  provider: codeberg
-  credentials:
-    - key: secrets://cb-token
-      type: token
-repos:
-  - name: $HF_TEST_CODEBERG_REPO
-    remotes:
-      - url: https://codeberg.org/${HF_TEST_CODEBERG_ORG}/${HF_TEST_CODEBERG_REPO}.git
-YAML
-hf_put_secret "secrets://cb-token" "$HF_TEST_CODEBERG_TOKEN"
+hf_use_test_config
 
 # --- read: exact four-key shape ---
-out=$(hf_cmd repos sync --org "$HF_TEST_CODEBERG_ORG" --name "$HF_TEST_CODEBERG_REPO")
+out=$(hf_cmd repos sync --org "$HF_TIER2_CODEBERG_ORG" --name "$HF_TIER2_CODEBERG_REPO")
 echo "$out" | hf_assert_event '(.type == "forge_metadata" or .type == "sync_diff")
   and ((.remote // .snapshot // {}) | keys | sort) == ["archived","default_branch","description","visibility"]'
 
@@ -47,15 +22,15 @@ echo "$out" | hf_assert_event '(.type == "forge_metadata" or .type == "sync_diff
 original=$(echo "$out" | jq -r 'select(.type == "forge_metadata" or .type == "sync_diff") | (.remote // .snapshot // {}).description' | head -n1)
 
 # --- write round-trip + restore ---
-hf_cmd repos push --org "$HF_TEST_CODEBERG_ORG" --name "$HF_TEST_CODEBERG_REPO" --fields "{\"description\":\"$STAMP\"}" >/dev/null
-verify=$(hf_cmd repos sync --org "$HF_TEST_CODEBERG_ORG" --name "$HF_TEST_CODEBERG_REPO")
+hf_cmd repos push --org "$HF_TIER2_CODEBERG_ORG" --name "$HF_TIER2_CODEBERG_REPO" --fields "{\"description\":\"$STAMP\"}" >/dev/null
+verify=$(hf_cmd repos sync --org "$HF_TIER2_CODEBERG_ORG" --name "$HF_TIER2_CODEBERG_REPO")
 echo "$verify" | grep -q "$STAMP"
-hf_cmd repos push --org "$HF_TEST_CODEBERG_ORG" --name "$HF_TEST_CODEBERG_REPO" --fields "{\"description\":\"$original\"}" >/dev/null
+hf_cmd repos push --org "$HF_TIER2_CODEBERG_ORG" --name "$HF_TIER2_CODEBERG_REPO" --fields "{\"description\":\"$original\"}" >/dev/null
 
 # --- auth error when token blank ---
 hf_put_secret "secrets://cb-token" ""
 set +e
-err=$(hf_cmd repos sync --org "$HF_TEST_CODEBERG_ORG" --name "$HF_TEST_CODEBERG_REPO" 2>&1)
+err=$(hf_cmd repos sync --org "$HF_TIER2_CODEBERG_ORG" --name "$HF_TIER2_CODEBERG_REPO" 2>&1)
 set -e
 echo "$err" | hf_assert_event '.type == "error" and (.error_class == "auth" or (.message // "" | test("auth"; "i")))' || \
   echo "$err" | hf_assert_event '.type == "sync_diff" and .status == "errored"'
@@ -63,7 +38,7 @@ hf_put_secret "secrets://cb-token" "$HF_TEST_CODEBERG_TOKEN"
 
 # --- not_found for a bogus repo ---
 BOGUS="nonexistent-$TS"
-python3 - "$HF_CONFIG/orgs/${HF_TEST_CODEBERG_ORG}.yaml" "$HF_TEST_CODEBERG_ORG" "$BOGUS" <<'PY'
+python3 - "$HF_CONFIG/orgs/${HF_TIER2_CODEBERG_ORG}.yaml" "$HF_TIER2_CODEBERG_ORG" "$BOGUS" <<'PY'
 import sys, yaml
 p, org, bogus = sys.argv[1], sys.argv[2], sys.argv[3]
 d = yaml.safe_load(open(p))
@@ -71,13 +46,13 @@ d["repos"].append({"name": bogus, "remotes": [{"url": f"https://codeberg.org/{or
 open(p, "w").write(yaml.safe_dump(d))
 PY
 set +e
-err=$(hf_cmd repos sync --org "$HF_TEST_CODEBERG_ORG" --name "$BOGUS" 2>&1)
+err=$(hf_cmd repos sync --org "$HF_TIER2_CODEBERG_ORG" --name "$BOGUS" 2>&1)
 set -e
 echo "$err" | hf_assert_event '.type == "error" and (.error_class == "not_found" or (.message // "" | test("not.?found|404"; "i")))' || \
   echo "$err" | hf_assert_event '.type == "sync_diff" and .status == "errored"'
 
 # --- no token leakage ---
-full=$(hf_cmd repos sync --org "$HF_TEST_CODEBERG_ORG" --name "$HF_TEST_CODEBERG_REPO" 2>&1)
+full=$(hf_cmd repos sync --org "$HF_TIER2_CODEBERG_ORG" --name "$HF_TIER2_CODEBERG_REPO" 2>&1)
 ! echo "$full" | grep -q "$HF_TEST_CODEBERG_TOKEN"
 
 hf_teardown

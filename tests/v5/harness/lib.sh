@@ -159,6 +159,89 @@ __hf_exit_trap() {
     hf_teardown
 }
 
+# Tier-2 test configuration.
+#
+# The tier-2 test suite exercises real forge APIs. Rather than demand a
+# dozen HF_TEST_*_{ORG,REPO,TOKEN} env vars, tier-2 tests read a single
+# env var `HF_V5_TEST_CONFIG_DIR` pointing at a user-owned directory
+# that mirrors the real hyperforge v5 config layout:
+#
+#   $HF_V5_TEST_CONFIG_DIR/
+#   ├── config.yaml              # real provider_map
+#   ├── orgs/<org>.yaml          # real orgs with `secrets://...` cred refs
+#   ├── secrets.yaml             # real secret values
+#   └── tier2.env                # bash-sourceable test-target params:
+#                                #   HF_TIER2_GITHUB_ORG=...
+#                                #   HF_TIER2_GITHUB_REPO=...
+#                                #   HF_TIER2_CODEBERG_ORG=...
+#                                #   HF_TIER2_CODEBERG_REPO=...
+#                                #   HF_TIER2_GITLAB_ORG=...
+#                                #   HF_TIER2_GITLAB_REPO=...
+#
+# The contents are *format-identical to production config* — the daemon
+# reads them the same way it would read ~/.config/hyperforge/. The only
+# non-production file is tier2.env, which pins which org/repo the tests
+# should operate on (tests need a disposable repo; production users do
+# not).
+#
+# hf_require_tier2 [<forge>]
+#   SKIP-clean exit if HF_V5_TEST_CONFIG_DIR is unset or tier2.env is
+#   missing. Optionally also SKIPs if the specified forge's ORG/REPO
+#   vars aren't populated in tier2.env. On success, exports every
+#   HF_TIER2_* variable from tier2.env into the script's environment.
+hf_require_tier2() {
+    local forge="${1:-}"
+    if [[ -z "${HF_V5_TEST_CONFIG_DIR:-}" ]]; then
+        echo "SKIP: HF_V5_TEST_CONFIG_DIR not set"
+        exit 0
+    fi
+    if [[ ! -d "${HF_V5_TEST_CONFIG_DIR}" ]]; then
+        echo "SKIP: HF_V5_TEST_CONFIG_DIR=${HF_V5_TEST_CONFIG_DIR} is not a directory"
+        exit 0
+    fi
+    if [[ ! -f "${HF_V5_TEST_CONFIG_DIR}/tier2.env" ]]; then
+        echo "SKIP: tier2.env not found in ${HF_V5_TEST_CONFIG_DIR}"
+        exit 0
+    fi
+    set -a
+    # shellcheck disable=SC1091
+    source "${HF_V5_TEST_CONFIG_DIR}/tier2.env"
+    set +a
+    if [[ -n "$forge" ]]; then
+        local upper; upper="$(echo "$forge" | tr '[:lower:]' '[:upper:]')"
+        local org_var="HF_TIER2_${upper}_ORG"
+        local repo_var="HF_TIER2_${upper}_REPO"
+        if [[ -z "${!org_var:-}" || -z "${!repo_var:-}" ]]; then
+            echo "SKIP: ${org_var} or ${repo_var} not set in tier2.env"
+            exit 0
+        fi
+    fi
+}
+
+# Copy the user-owned tier-2 config directory (minus tier2.env) into
+# $HF_CONFIG. Call after hf_spawn. Assumes hf_require_tier2 has already
+# validated the layout.
+hf_use_test_config() {
+    if [[ -z "${HF_CONFIG:-}" ]]; then
+        echo "hf_use_test_config: HF_CONFIG not set (call hf_spawn first)" >&2
+        return 1
+    fi
+    if [[ -z "${HF_V5_TEST_CONFIG_DIR:-}" || ! -d "${HF_V5_TEST_CONFIG_DIR}" ]]; then
+        echo "hf_use_test_config: HF_V5_TEST_CONFIG_DIR not a dir (hf_require_tier2 should have skipped)" >&2
+        return 1
+    fi
+    # Copy everything except tier2.env into $HF_CONFIG, preserving dirs.
+    (
+        cd "${HF_V5_TEST_CONFIG_DIR}" || exit 1
+        find . -type f ! -name 'tier2.env' -print0 | while IFS= read -r -d '' f; do
+            local rel="${f#./}"
+            local target="${HF_CONFIG}/${rel}"
+            mkdir -p "$(dirname "$target")"
+            cp "$f" "$target"
+        done
+    )
+}
+
 # Append a domain→provider mapping to $HF_CONFIG/config.yaml's
 # provider_map block. Creates the block if missing. Pure bash, no yaml
 # parser required. For shell-level fixture mutation before hf_cmd runs.

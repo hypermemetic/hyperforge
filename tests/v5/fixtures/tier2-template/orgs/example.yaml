@@ -1,0 +1,13 @@
+# Template org file. Rename to match HF_TIER2_<FORGE>_ORG in tier2.env
+# and replace placeholders with real values. Credentials MUST use
+# secrets:// refs — never inline tokens.
+name: example
+forge:
+  provider: github
+  credentials:
+    - key: secrets://github/example/token
+      type: token
+repos:
+  - name: sandbox-repo
+    remotes:
+      - url: https://github.com/example/sandbox-repo.git
