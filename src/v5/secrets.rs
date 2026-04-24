@@ -67,9 +67,9 @@ pub enum SecretError {
 }
 
 impl SecretError {
-    /// Wire-side error discriminator (snake_case).
+    /// Wire-side error discriminator (`snake_case`).
     #[must_use]
-    pub fn code(&self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidRef(_) => "invalid_ref",
             Self::NotFound(_) => "not_found",

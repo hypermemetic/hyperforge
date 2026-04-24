@@ -81,7 +81,7 @@ impl HyperforgeHub {
         OrgsHub::new()
     }
 
-    /// Repos namespace — CRUD + ForgePort. Methods attached by V5REPOS.
+    /// Repos namespace — CRUD + `ForgePort`. Methods attached by V5REPOS.
     #[plexus_macros::child]
     #[allow(clippy::unused_self)]
     const fn repos(&self) -> ReposHub {

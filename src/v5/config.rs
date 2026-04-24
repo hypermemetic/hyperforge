@@ -290,7 +290,7 @@ pub fn load_orgs(dir: &Path) -> Result<BTreeMap<OrgName, OrgConfig>, ConfigError
         if cfg.name.as_str() != basename {
             return Err(ConfigError::OrgNameMismatch {
                 file: basename,
-                found: cfg.name.0.clone(),
+                found: cfg.name.0,
             });
         }
         out.insert(cfg.name.clone(), cfg);
@@ -330,7 +330,7 @@ pub fn load_workspaces(dir: &Path) -> Result<BTreeMap<WorkspaceName, WorkspaceCo
         if cfg.name.as_str() != basename {
             return Err(ConfigError::WorkspaceNameMismatch {
                 file: basename,
-                found: cfg.name.0.clone(),
+                found: cfg.name.0,
             });
         }
         out.insert(cfg.name.clone(), cfg);
@@ -376,7 +376,6 @@ fn tempfile_in(dir: &Path) -> Result<PathBuf, ConfigError> {
             Ok(_) => return Ok(p),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 rng = rng.wrapping_add(1);
-                continue;
             }
             Err(e) => {
                 return Err(ConfigError::Io {

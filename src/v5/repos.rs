@@ -1,5 +1,5 @@
 //! `ReposHub` — v5 repos namespace. V5CORE-7 ships an empty static
-//! child; V5REPOS attaches CRUD + ForgePort methods.
+//! child; V5REPOS attaches CRUD + `ForgePort` methods.
 
 use async_stream::stream;
 use futures::Stream;
