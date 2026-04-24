@@ -1,7 +1,7 @@
 ---
 id: V5CORE-7
 title: "ReposHub static child stub"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-2]
 unlocks: [V5CORE-10, V5REPOS-1]

@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-8
 title: "repos.remove_remote — drop a Remote by URL from an existing repo"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-15]

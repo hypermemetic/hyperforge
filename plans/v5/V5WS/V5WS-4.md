@@ -1,7 +1,7 @@
 ---
 id: V5WS-4
 title: "workspaces.create — write new workspace yaml with dry_run"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-8, V5CORE-9]
 unlocks: [V5WS-10]

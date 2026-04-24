@@ -1,7 +1,7 @@
 ---
 id: V5CORE-8
 title: "WorkspacesHub static child stub"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-2]
 unlocks: [V5CORE-10, V5WS-1]

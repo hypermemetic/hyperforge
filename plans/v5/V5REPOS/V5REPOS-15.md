@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-15
 title: "REPOS checkpoint — user-story verification + state-of-epic map"
-status: Pending
+status: Ready
 type: checkpoint
 blocked_by: [V5REPOS-2, V5REPOS-3, V5REPOS-4, V5REPOS-5, V5REPOS-6, V5REPOS-7, V5REPOS-8, V5REPOS-9, V5REPOS-10, V5REPOS-11, V5REPOS-12, V5REPOS-13, V5REPOS-14]
 unlocks: []

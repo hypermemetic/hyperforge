@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-13
 title: "repos.sync — pull metadata, emit SyncDiff with DriftField per mismatch"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5REPOS-2, V5REPOS-12]
 unlocks: [V5REPOS-15, V5WS-9]

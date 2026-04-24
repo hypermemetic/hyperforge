@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-5
 title: "repos.add — register a new repo with initial Remote[] in an org"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-15]

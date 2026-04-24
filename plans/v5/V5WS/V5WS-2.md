@@ -1,7 +1,7 @@
 ---
 id: V5WS-2
 title: "workspaces.list — stream WorkspaceSummary per workspace"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-8, V5CORE-9]
 unlocks: [V5WS-10]

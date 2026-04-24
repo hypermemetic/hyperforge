@@ -1,7 +1,7 @@
 ---
 id: V5CORE-10
 title: "CORE checkpoint — scaffolding composes end-to-end"
-status: Pending
+status: Ready
 type: checkpoint
 blocked_by: [V5CORE-2, V5CORE-3, V5CORE-4, V5CORE-5, V5CORE-6, V5CORE-7, V5CORE-8, V5CORE-9]
 unlocks: []

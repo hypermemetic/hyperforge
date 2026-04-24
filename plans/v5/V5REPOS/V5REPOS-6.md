@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-6
 title: "repos.remove — drop repo entry; delete_remote opt-in to forge delete"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-15]

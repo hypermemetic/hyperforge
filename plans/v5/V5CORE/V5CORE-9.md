@@ -1,7 +1,7 @@
 ---
 id: V5CORE-9
 title: "Integration test harness — lib.sh surface and Rust runner"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-2]
 unlocks: [V5CORE-10, V5ORGS-1, V5REPOS-1, V5WS-1]

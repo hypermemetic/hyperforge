@@ -1,7 +1,7 @@
 ---
 id: V5ORGS-9
 title: "ORGS checkpoint — CRUD + credentials composes end-to-end"
-status: Pending
+status: Ready
 type: checkpoint
 blocked_by: [V5ORGS-2, V5ORGS-3, V5ORGS-4, V5ORGS-5, V5ORGS-6, V5ORGS-7, V5ORGS-8]
 unlocks: []

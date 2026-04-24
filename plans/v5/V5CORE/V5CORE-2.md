@@ -1,7 +1,7 @@
 ---
 id: V5CORE-2
 title: "Crate scaffold and bare HyperforgeHub on port 44105"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: []
 unlocks: [V5CORE-3, V5CORE-4, V5CORE-5, V5CORE-6, V5CORE-7, V5CORE-8, V5CORE-9]

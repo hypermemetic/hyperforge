@@ -1,7 +1,7 @@
 ---
 id: V5ORGS-4
 title: "orgs.create — write new org yaml with dry_run"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-6, V5CORE-9]
 unlocks: [V5ORGS-9]
