@@ -212,3 +212,44 @@ fn v5core_9() {
 fn v5core_10() {
     run_one("v5core_10").unwrap();
 }
+
+// One #[test] per V5WS script. V5WS-9 stays wired but is tier-2 and
+// will no-op under the default `cargo test --test v5_integration`
+// invocation (its script carries `# tier: 2` and run_one skips it
+// without the tier2 feature).
+#[test]
+fn v5ws_2() {
+    run_one("v5ws_2").unwrap();
+}
+#[test]
+fn v5ws_3() {
+    run_one("v5ws_3").unwrap();
+}
+#[test]
+fn v5ws_4() {
+    run_one("v5ws_4").unwrap();
+}
+#[test]
+fn v5ws_5() {
+    run_one("v5ws_5").unwrap();
+}
+#[test]
+fn v5ws_6() {
+    run_one("v5ws_6").unwrap();
+}
+#[test]
+fn v5ws_7() {
+    run_one("v5ws_7").unwrap();
+}
+#[test]
+fn v5ws_8() {
+    run_one("v5ws_8").unwrap();
+}
+#[test]
+fn v5ws_9() {
+    run_one("v5ws_9").unwrap();
+}
+#[test]
+fn v5ws_10() {
+    run_one("v5ws_10").unwrap();
+}
