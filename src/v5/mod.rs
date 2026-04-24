@@ -4,6 +4,7 @@
 //! holds the v5 activation tree, config loaders, and secret store. The
 //! v4 activation tree in `crate::hub` / `crate::hubs` is untouched.
 
+pub mod adapters;
 pub mod config;
 pub mod hub;
 pub mod orgs;

@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-2
 title: "ForgePort capability — portable metadata read/write per D3"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-4, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-9, V5REPOS-10, V5REPOS-11, V5REPOS-13, V5REPOS-14, V5REPOS-15]

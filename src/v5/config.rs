@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -21,7 +22,7 @@ use thiserror::Error;
 
 macro_rules! string_newtype {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, JsonSchema)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -60,7 +61,7 @@ string_newtype!(DomainName);
 string_newtype!(FsPath);
 
 /// Forge providers known to v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Github,
@@ -69,7 +70,7 @@ pub enum ProviderKind {
 }
 
 /// Credential kinds known to v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialType {
     Token,
@@ -79,7 +80,7 @@ pub enum CredentialType {
 /// `CredentialEntry { key, type }`. `key` is either a `secrets://…` ref
 /// or an `FsPath`; both serialize as a bare string, so the wire form is
 /// `{key: "...", type: "token"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialEntry {
     pub key: String,
@@ -88,7 +89,7 @@ pub struct CredentialEntry {
 }
 
 /// Remote URL, optionally overriding the domain → provider map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
     pub url: RemoteUrl,
@@ -97,7 +98,7 @@ pub struct Remote {
 }
 
 /// `RepoRef { org, name }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepoRef {
     pub org: OrgName,
@@ -111,6 +112,26 @@ pub struct OrgRepo {
     pub name: RepoName,
     #[serde(default)]
     pub remotes: Vec<Remote>,
+    /// Optional declared-local values for the D3 portable metadata set.
+    /// When absent, `repos.sync` treats the local side as "unknown" for
+    /// that field and reports drift only against the declared keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<RepoMetadataLocal>,
+}
+
+/// Local declaration of portable metadata. Fields are optional; only
+/// declared fields participate in drift comparisons / pushes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepoMetadataLocal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
 }
 
 /// A workspace entry, either a string shorthand `<org>/<name>` or a

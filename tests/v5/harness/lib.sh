@@ -109,6 +109,7 @@ hf_spawn() {
     HF_PORT="$(__hf_pick_port)"
     HF_CONFIG="$(mktemp -d -t hfv5-XXXXXX)"
     export HF_PORT HF_CONFIG
+    __HF_TRACK_TMP="${__HF_TRACK_TMP:-} $HF_CONFIG"
 
     # Pre-load synapse cache by launching and waiting.
     "$bin" --port "$HF_PORT" --config-dir "$HF_CONFIG" \
@@ -116,7 +117,7 @@ hf_spawn() {
     HF_PID=$!
     export HF_PID
 
-    trap hf_teardown EXIT
+    trap __hf_exit_trap EXIT
 
     if ! __hf_wait_ready "$HF_PORT"; then
         echo "hf_spawn: daemon on port $HF_PORT did not become ready within 15s" >&2
@@ -131,6 +132,15 @@ hf_spawn() {
 }
 
 # Kill the daemon and remove $HF_CONFIG. Idempotent; safe to call twice.
+#
+# The EXIT-trap path (invoked when the script exits for any reason) also
+# calls this function; we use `$__HF_TRACK_TMP` — a whitespace-separated
+# list of every config dir this script has ever owned — to clean up all
+# of them on exit, not just the currently-active `$HF_CONFIG`. That way
+# tests that capture a path before teardown (e.g. the V5REPOS restart-
+# parity pattern `saved=$HF_CONFIG; hf_teardown; hf_spawn; cp -r $saved
+# ...`) can still read the captured state mid-run, while still getting
+# guaranteed cleanup by the time the script exits.
 hf_teardown() {
     if [[ -n "${HF_PID:-}" ]]; then
         if kill -0 "$HF_PID" 2>/dev/null; then
@@ -147,9 +157,23 @@ hf_teardown() {
         fi
         unset HF_PID
     fi
-    if [[ -n "${HF_CONFIG:-}" && -d "$HF_CONFIG" ]]; then
-        rm -rf "$HF_CONFIG"
+    # If invoked from the EXIT trap, purge every tracked temp dir.
+    # Otherwise (explicit mid-script call) keep the dir on disk so the
+    # script can still read it after a subsequent `hf_spawn` rotates
+    # `$HF_CONFIG` to a different path. The EXIT trap catches leaks.
+    if [[ "${__HF_FINAL_EXIT:-0}" == "1" ]]; then
+        for d in ${__HF_TRACK_TMP:-}; do
+            if [[ -n "$d" && -d "$d" ]]; then
+                rm -rf "$d"
+            fi
+        done
+        __HF_TRACK_TMP=""
     fi
+}
+
+__hf_exit_trap() {
+    __HF_FINAL_EXIT=1
+    hf_teardown
 }
 
 # Copy a fixture into $HF_CONFIG.
@@ -322,6 +346,38 @@ __hf_emit_schema_for() {
 
 __hf_emit_schema() {
     __hf_emit_schema_for ""
+    # Capability probes: query any child that exposes a *_schema method
+    # surfacing typed capability events (V5REPOS-2's `forge_port_schema`).
+    # Failures are silently ignored so callers on a bare daemon still get
+    # the tree walk.
+    __hf_emit_capability_probe repos forge_port_schema
+}
+
+# Invoke `<child>.<method>` and pass its NDJSON event stream through.
+# Used only from `__hf_emit_schema` to surface capability events that
+# aren't part of the synapse `-s` tree.
+__hf_emit_capability_probe() {
+    local child="$1"
+    local method="$2"
+    if [[ -z "${HF_PORT:-}" ]]; then
+        return 0
+    fi
+    local raw
+    raw="$(synapse -P "$HF_PORT" --json lforge-v5 hyperforge "$child" "$method" 2>&1)"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if printf '%s' "$line" | jq -e . >/dev/null 2>&1; then
+            printf '%s' "$line" | jq -c '
+                if .type == "data" and (.content // null) != null then
+                    .content
+                elif .type == "done" then
+                    empty
+                else
+                    .
+                end
+            '
+        fi
+    done <<<"$raw"
 }
 
 # Store `<value>` under the `<path>` portion of `<secret_ref>` in
