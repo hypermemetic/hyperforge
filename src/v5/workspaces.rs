@@ -64,6 +64,17 @@ pub enum WorkspacesEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// One reconcile observation (V5WS-8). `kind` is one of
+    /// `matched`, `renamed`, `removed`, `new_matched`, `ambiguous`.
+    ReconcileEvent {
+        kind: String,
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+        reference: Option<crate::v5::config::RepoRef>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// Generic error. `code` is a `snake_case` discriminator drawn from
     /// the emitting method's closed error set.
     Error {
@@ -757,4 +768,358 @@ impl WorkspacesHub {
             };
         }
     }
+
+    /// Reconcile the workspace yaml with disk.
+    ///
+    /// Scans `path` in ASCII-ascending dir order, reads each git
+    /// clone's `origin` URL out of `.git/config`, and matches against
+    /// org-yaml remotes. Emits one `reconcile_event` per observation.
+    /// Kinds: `matched`, `renamed`, `removed`, `new_matched`,
+    /// `ambiguous` (CONTRACTS §types). Under D5, when multiple dirs
+    /// share a URL the alphabetically-first wins; other candidates
+    /// emit `ambiguous`. Non-dry runs rewrite the workspace yaml
+    /// atomically (D8) to reflect `renamed` + `removed`; the scan is
+    /// strictly read-only — no filesystem mutation under the
+    /// workspace path and no forge contact.
+    #[plexus_macros::method(params(
+        name = "Workspace to reconcile",
+        dry_run = "Preview without writing; default false",
+    ))]
+    pub async fn reconcile(
+        &self,
+        name: String,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        let dry = dry_run.unwrap_or(false);
+        stream! {
+            if !is_valid_name(&name) {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_name".into()),
+                    message: format!("invalid workspace name: {name}"),
+                };
+                return;
+            }
+            let ws_dir = config_dir.join("workspaces");
+            let target = ws_dir.join(format!("{name}.yaml"));
+            let raw = match std::fs::read_to_string(&target) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace not found: {name}"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("read {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            let mut cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_yaml".into()),
+                        message: format!("parse {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            // Load orgs for URL → ref lookup.
+            let orgs_dir = config_dir.join("orgs");
+            let orgs = match crate::v5::config::load_orgs(&orgs_dir) {
+                Ok(m) => m,
+                Err(_) if !orgs_dir.exists() => std::collections::BTreeMap::new(),
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_config".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            // URL → sorted (org, name) candidates. Multiple refs may
+            // share a URL (mirror repos); tiebreaker is alphabetical
+            // `<org>/<name>`.
+            let mut url_to_refs: std::collections::BTreeMap<
+                String,
+                Vec<(String, String)>,
+            > = std::collections::BTreeMap::new();
+            for (org_name, org_cfg) in &orgs {
+                for repo in &org_cfg.repos {
+                    for remote in &repo.remotes {
+                        url_to_refs
+                            .entry(remote.url.as_str().to_string())
+                            .or_default()
+                            .push((
+                                org_name.as_str().to_string(),
+                                repo.name.as_str().to_string(),
+                            ));
+                    }
+                }
+            }
+            for v in url_to_refs.values_mut() {
+                v.sort();
+                v.dedup();
+            }
+            // Per-member info: reference, declared dir, known remotes.
+            struct Member {
+                reference: crate::v5::config::RepoRef,
+                declared_dir: String,
+                remote_urls: Vec<String>,
+            }
+            let mut members: Vec<Member> = Vec::new();
+            for entry in &cfg.repos {
+                let Some((org_s, name_s)) = ref_key(entry) else { continue };
+                let reference = crate::v5::config::RepoRef {
+                    org: org_s.clone().into(),
+                    name: name_s.clone().into(),
+                };
+                let declared_dir = match entry {
+                    WorkspaceRepo::Shorthand(_) => name_s.clone(),
+                    WorkspaceRepo::Object { dir, .. } => dir.clone(),
+                };
+                let remote_urls = orgs
+                    .get(&org_s.clone().into())
+                    .and_then(|o| o.repos.iter().find(|r| r.name.as_str() == name_s))
+                    .map(|r| {
+                        r.remotes
+                            .iter()
+                            .map(|rem| rem.url.as_str().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                members.push(Member {
+                    reference,
+                    declared_dir,
+                    remote_urls,
+                });
+            }
+            // Scan the workspace path in ASCII-ascending dir order.
+            let scan_root = std::path::PathBuf::from(cfg.path.as_str());
+            let mut entries: Vec<(String, std::path::PathBuf)> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&scan_root) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let Some(nm) = p.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    entries.push((nm.to_string(), p));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            // For each dir, resolve its origin URL.
+            let mut dir_origin: Vec<(String, Option<String>)> = Vec::new();
+            for (dname, dpath) in &entries {
+                let origin = read_git_origin(dpath);
+                dir_origin.push((dname.clone(), origin));
+            }
+            // Decisions in alphabetical-by-ref order satisfy D5's
+            // "first scanned wins" when multiple dirs match one ref.
+            #[derive(Clone)]
+            struct MemberDecision {
+                idx: usize,
+                kind: String,
+                dir: Option<String>,
+            }
+            let mut decisions: Vec<MemberDecision> = Vec::new();
+            let mut consumed_dirs: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut order: Vec<usize> = (0..members.len()).collect();
+            order.sort_by(|&a, &b| {
+                let ka = (
+                    members[a].reference.org.as_str(),
+                    members[a].reference.name.as_str(),
+                );
+                let kb = (
+                    members[b].reference.org.as_str(),
+                    members[b].reference.name.as_str(),
+                );
+                ka.cmp(&kb)
+            });
+            for &mi in &order {
+                let m = &members[mi];
+                let mut candidates: Vec<String> = Vec::new();
+                for (dname, origin) in &dir_origin {
+                    if consumed_dirs.contains(dname) {
+                        continue;
+                    }
+                    let Some(url) = origin else { continue };
+                    if m.remote_urls.iter().any(|u| u == url) {
+                        candidates.push(dname.clone());
+                    }
+                }
+                if candidates.is_empty() {
+                    decisions.push(MemberDecision {
+                        idx: mi,
+                        kind: "removed".into(),
+                        dir: None,
+                    });
+                    continue;
+                }
+                // Prefer declared dir if it's among candidates.
+                let (winner, rest): (String, Vec<String>) =
+                    if let Some(pos) =
+                        candidates.iter().position(|d| *d == m.declared_dir)
+                    {
+                        let w = candidates.remove(pos);
+                        (w, candidates)
+                    } else {
+                        let mut it = candidates.into_iter();
+                        (it.next().unwrap(), it.collect())
+                    };
+                consumed_dirs.insert(winner.clone());
+                let kind = if winner == m.declared_dir {
+                    "matched"
+                } else {
+                    "renamed"
+                };
+                decisions.push(MemberDecision {
+                    idx: mi,
+                    kind: kind.into(),
+                    dir: Some(winner),
+                });
+                for other in rest {
+                    decisions.push(MemberDecision {
+                        idx: mi,
+                        kind: "ambiguous".into(),
+                        dir: Some(other),
+                    });
+                }
+            }
+            // `new_matched`: leftover dirs whose origin matches a
+            // known org repo that isn't a current member.
+            let declared_keys: std::collections::BTreeSet<(String, String)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.reference.org.as_str().to_string(),
+                        m.reference.name.as_str().to_string(),
+                    )
+                })
+                .collect();
+            let mut new_matched: Vec<(String, crate::v5::config::RepoRef)> = Vec::new();
+            for (dname, origin) in &dir_origin {
+                if consumed_dirs.contains(dname) {
+                    continue;
+                }
+                let Some(url) = origin else { continue };
+                let Some(refs) = url_to_refs.get(url) else { continue };
+                for (o, n) in refs {
+                    if !declared_keys.contains(&(o.clone(), n.clone())) {
+                        new_matched.push((
+                            dname.clone(),
+                            crate::v5::config::RepoRef {
+                                org: o.clone().into(),
+                                name: n.clone().into(),
+                            },
+                        ));
+                        break;
+                    }
+                }
+            }
+            for d in &decisions {
+                let reference = Some(members[d.idx].reference.clone());
+                yield WorkspacesEvent::ReconcileEvent {
+                    kind: d.kind.clone(),
+                    reference,
+                    dir: d.dir.clone(),
+                    detail: None,
+                };
+            }
+            for (dname, rref) in &new_matched {
+                yield WorkspacesEvent::ReconcileEvent {
+                    kind: "new_matched".into(),
+                    reference: Some(rref.clone()),
+                    dir: Some(dname.clone()),
+                    detail: None,
+                };
+            }
+            if !dry {
+                let mut changed = false;
+                let mut primary: std::collections::BTreeMap<usize, &MemberDecision> =
+                    std::collections::BTreeMap::new();
+                for d in &decisions {
+                    if d.kind == "ambiguous" {
+                        continue;
+                    }
+                    primary.entry(d.idx).or_insert(d);
+                }
+                let mut new_repos: Vec<WorkspaceRepo> = Vec::with_capacity(cfg.repos.len());
+                for (mi, entry) in cfg.repos.iter().enumerate() {
+                    let Some(d) = primary.get(&mi) else {
+                        new_repos.push(entry.clone());
+                        continue;
+                    };
+                    match d.kind.as_str() {
+                        "matched" => new_repos.push(entry.clone()),
+                        "renamed" => {
+                            let reference = members[mi].reference.clone();
+                            let dir = d.dir.clone().unwrap_or_default();
+                            new_repos.push(WorkspaceRepo::Object { reference, dir });
+                            changed = true;
+                        }
+                        "removed" => {
+                            changed = true;
+                        }
+                        _ => new_repos.push(entry.clone()),
+                    }
+                }
+                if changed {
+                    cfg.repos = new_repos;
+                    if let Err(e) = crate::v5::config::save_workspace(&ws_dir, &cfg) {
+                        yield WorkspacesEvent::Error {
+                            code: Some("io_error".into()),
+                            message: e.to_string(),
+                        };
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read `origin` URL out of a dir's `.git/config` without shelling
+/// out. Returns `None` if the dir is not a git working tree or the
+/// config does not declare `remote "origin"`.
+fn read_git_origin(dir: &std::path::Path) -> Option<String> {
+    let git_dir = dir.join(".git");
+    // `.git` may be a dir (classic) or a file containing `gitdir: <path>`
+    // (worktree / submodule). Resolve it.
+    let cfg_path = if git_dir.is_file() {
+        let txt = std::fs::read_to_string(&git_dir).ok()?;
+        let rest = txt.trim().strip_prefix("gitdir:")?.trim();
+        std::path::PathBuf::from(rest).join("config")
+    } else if git_dir.is_dir() {
+        git_dir.join("config")
+    } else {
+        return None;
+    };
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    // Minimal INI parse: look for `[remote "origin"]` section, then
+    // its `url = …` entry until the next `[…]` header.
+    let mut in_origin = false;
+    for line in raw.lines() {
+        let l = line.trim();
+        if l.starts_with('[') && l.ends_with(']') {
+            in_origin = l == "[remote \"origin\"]";
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix("url") {
+            let rest = rest.trim_start().strip_prefix('=')?.trim();
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
