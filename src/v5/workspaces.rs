@@ -52,6 +52,18 @@ pub enum WorkspacesEvent {
         path: String,
         repos: Vec<WorkspaceRepo>,
     },
+    /// Delete acknowledgement (V5WS-5 `delete`).
+    WorkspaceDeleted { name: String },
+    /// Per-member cascade event for `delete_remote: true` flows.
+    /// `status` is `forge_deleted` or `forge_delete_failed`; `message`
+    /// is a free-text diagnostic on failure.
+    ForgeDeleteResult {
+        #[serde(rename = "ref")]
+        reference: crate::v5::config::RepoRef,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// Generic error. `code` is a `snake_case` discriminator drawn from
     /// the emitting method's closed error set.
     Error {
@@ -87,6 +99,20 @@ fn is_valid_fspath(s: &str) -> bool {
         return false;
     }
     !s.split('/').any(|seg| seg == "..")
+}
+
+/// Ref key for comparing `WorkspaceRepo` entries regardless of shape.
+fn ref_key(entry: &WorkspaceRepo) -> Option<(String, String)> {
+    match entry {
+        WorkspaceRepo::Shorthand(s) => {
+            let (o, n) = s.split_once('/')?;
+            Some((o.to_string(), n.to_string()))
+        }
+        WorkspaceRepo::Object { reference, .. } => Some((
+            reference.org.as_str().to_string(),
+            reference.name.as_str().to_string(),
+        )),
+    }
 }
 
 /// Parse the `repos` parameter as a JSON array string. Missing or
@@ -347,6 +373,103 @@ impl WorkspacesHub {
                 path: ws_path,
                 repo_count: count,
             };
+        }
+    }
+
+    /// Delete a workspace yaml, optionally cascading to forge-side
+    /// repo deletion for each member.
+    ///
+    /// Cascade mode (`delete_remote: true`) emits one
+    /// `forge_delete_result` event per member before the yaml is
+    /// removed; the batch continues past per-member failures. v1 has
+    /// no adapter path — cascade events report
+    /// `forge_delete_failed` on real runs (or `forge_deleted` on
+    /// `dry_run: true` so the preview shape is stable). V5REPOS-13
+    /// wires the real adapter path; post-V5REPOS this method picks it
+    /// up without signature changes.
+    #[plexus_macros::method(params(
+        name = "Workspace to delete",
+        delete_remote = "Cascade forge-side deletion for each member; default false",
+        dry_run = "Preview without writing; default false",
+    ))]
+    pub async fn delete(
+        &self,
+        name: String,
+        delete_remote: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        let dry = dry_run.unwrap_or(false);
+        let cascade = delete_remote.unwrap_or(false);
+        stream! {
+            if !is_valid_name(&name) {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_name".into()),
+                    message: format!("invalid workspace name: {name}"),
+                };
+                return;
+            }
+            let ws_dir = config_dir.join("workspaces");
+            let target = ws_dir.join(format!("{name}.yaml"));
+            let raw = match std::fs::read_to_string(&target) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace not found: {name}"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("read {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            let cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_yaml".into()),
+                        message: format!("parse {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            if cascade {
+                for entry in &cfg.repos {
+                    let Some((org, rname)) = ref_key(entry) else { continue };
+                    let rref = crate::v5::config::RepoRef {
+                        org: org.into(),
+                        name: rname.into(),
+                    };
+                    let (status, msg) = if dry {
+                        ("forge_deleted".to_string(), None)
+                    } else {
+                        (
+                            "forge_delete_failed".to_string(),
+                            Some("no forge adapter registered (V5REPOS-13 pending)".into()),
+                        )
+                    };
+                    yield WorkspacesEvent::ForgeDeleteResult {
+                        reference: rref,
+                        status,
+                        message: msg,
+                    };
+                }
+            }
+            if !dry {
+                if let Err(e) = std::fs::remove_file(&target) {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("remove {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            }
+            yield WorkspacesEvent::WorkspaceDeleted { name };
         }
     }
 }

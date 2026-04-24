@@ -1,7 +1,7 @@
 ---
 id: V5WS-5
 title: "workspaces.delete — remove workspace yaml with dry_run and delete_remote cascade"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-8, V5CORE-9]
 unlocks: [V5WS-10]
