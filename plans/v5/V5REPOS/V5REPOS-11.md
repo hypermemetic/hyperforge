@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-11
 title: "GitLab ForgePort adapter"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5REPOS-2]
 unlocks: [V5REPOS-13, V5REPOS-14, V5REPOS-15]

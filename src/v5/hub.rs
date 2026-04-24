@@ -82,9 +82,8 @@ impl HyperforgeHub {
 
     /// Repos namespace — CRUD + `ForgePort`. Methods attached by V5REPOS.
     #[plexus_macros::child]
-    #[allow(clippy::unused_self)]
-    const fn repos(&self) -> ReposHub {
-        ReposHub::new()
+    fn repos(&self) -> ReposHub {
+        ReposHub::with_config_dir(self.state.config_dir.clone())
     }
 
     /// Workspaces namespace — CRUD + reconcile + sync. Methods attached by V5WS.

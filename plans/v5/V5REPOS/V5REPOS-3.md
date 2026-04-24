@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-3
 title: "repos.list — stream RepoSummary per repo in an org"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-15]

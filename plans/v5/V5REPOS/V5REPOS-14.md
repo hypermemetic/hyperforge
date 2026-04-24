@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-14
 title: "repos.push — sequential per-remote metadata write per D4"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5REPOS-2, V5REPOS-12]
 unlocks: [V5REPOS-15]

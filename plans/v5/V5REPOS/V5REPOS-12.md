@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-12
 title: "URL → ProviderKind derivation via domain map + per-remote override"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-13, V5REPOS-14, V5REPOS-15]
