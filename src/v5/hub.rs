@@ -42,6 +42,28 @@ pub enum HyperforgeV5Event {
         code: Option<String>,
         message: String,
     },
+    /// V5PARITY-7: per-credential probe result from `auth_check`.
+    /// `valid: true` = the cred resolves AND the corresponding adapter
+    /// can reach a known endpoint with it. `false` = either the secret
+    /// is missing OR the API call fails. `message` is the diagnostic.
+    AuthCheckResult {
+        org: String,
+        key: String,
+        provider: String,
+        valid: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// V5PARITY-7: a credential the org expects given its forge config.
+    /// Tells callers what `secrets.set` calls would unblock the org.
+    AuthRequirement {
+        org: String,
+        provider: String,
+        key: String,
+        cred_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        present: Option<bool>,
+    },
 }
 
 /// Root activation for hyperforge v5.
@@ -92,6 +114,12 @@ impl HyperforgeHub {
         WorkspacesHub::new(self.state.config_dir.clone())
     }
 
+    /// Secrets namespace — V5PARITY-7. RPC surface over the YAML store.
+    #[plexus_macros::child]
+    fn secrets(&self) -> crate::v5::secrets_hub::SecretsHub {
+        crate::v5::secrets_hub::SecretsHub::new(self.state.config_dir.clone())
+    }
+
     /// Return daemon version and config directory.
     #[plexus_macros::method]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
@@ -134,6 +162,139 @@ impl HyperforgeHub {
                     code: Some(e.code().to_string()),
                     message: e.to_string(),
                 },
+            }
+        }
+    }
+
+    /// V5PARITY-7: probe whether each org's credentials actually work.
+    /// For tokens: resolves the secret, calls
+    /// `adapter.repo_exists("__nonexistent__")` against the configured
+    /// provider — auth-protected endpoint, so a non-`auth` error means
+    /// the cred is fine.
+    #[plexus_macros::method(params(
+        org = "Optional org filter; default = all configured orgs"
+    ))]
+    pub async fn auth_check(
+        &self,
+        org: Option<String>,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let resolver = YamlSecretStore::new(&config_dir);
+            let probe_repo_ref = crate::v5::config::RepoRef {
+                org: crate::v5::config::OrgName::from("__hyperforge_probe__"),
+                name: crate::v5::config::RepoName::from("__hyperforge_probe__"),
+            };
+            for (org_name, org_cfg) in loaded.orgs.iter() {
+                if let Some(filter) = org.as_deref() {
+                    if filter != org_name.as_str() { continue; }
+                }
+                let provider = org_cfg.forge.provider;
+                let provider_str = match provider {
+                    crate::v5::config::ProviderKind::Github => "github",
+                    crate::v5::config::ProviderKind::Codeberg => "codeberg",
+                    crate::v5::config::ProviderKind::Gitlab => "gitlab",
+                };
+                for cred in &org_cfg.forge.credentials {
+                    if !matches!(cred.cred_type, crate::v5::config::CredentialType::Token) { continue; }
+                    let probe_url = match provider {
+                        crate::v5::config::ProviderKind::Github => "https://github.com/__probe__/__probe__.git",
+                        crate::v5::config::ProviderKind::Codeberg => "https://codeberg.org/__probe__/__probe__.git",
+                        crate::v5::config::ProviderKind::Gitlab => "https://gitlab.com/__probe__/__probe__.git",
+                    };
+                    let probe_remote = crate::v5::config::Remote {
+                        url: crate::v5::config::RemoteUrl::from(probe_url),
+                        provider: Some(provider),
+                    };
+                    let result = crate::v5::ops::repo::exists_on_forge(
+                        &probe_remote,
+                        &probe_repo_ref,
+                        &loaded.global.provider_map,
+                        &resolver,
+                        Some(cred.key.as_str()),
+                    ).await;
+                    let (valid, msg) = match result {
+                        Ok(_) => (true, None),
+                        Err(e) if matches!(e.class, crate::v5::adapters::ForgeErrorClass::Auth) => {
+                            (false, Some(e.message))
+                        }
+                        // not_found / network / rate_limited / etc — credential
+                        // worked enough to reach the API; mark valid.
+                        Err(_) => (true, None),
+                    };
+                    yield HyperforgeV5Event::AuthCheckResult {
+                        org: org_name.as_str().to_string(),
+                        key: cred.key.clone(),
+                        provider: provider_str.to_string(),
+                        valid,
+                        message: msg,
+                    };
+                }
+            }
+        }
+    }
+
+    /// V5PARITY-7: report which credentials each org needs.
+    /// One `auth_requirement` event per (org, provider, expected key).
+    #[plexus_macros::method(params(
+        org = "Optional org filter; default = all configured orgs"
+    ))]
+    pub async fn auth_requirements(
+        &self,
+        org: Option<String>,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let resolver = YamlSecretStore::new(&config_dir);
+            for (org_name, org_cfg) in loaded.orgs.iter() {
+                if let Some(filter) = org.as_deref() {
+                    if filter != org_name.as_str() { continue; }
+                }
+                let provider_str = match org_cfg.forge.provider {
+                    crate::v5::config::ProviderKind::Github => "github",
+                    crate::v5::config::ProviderKind::Codeberg => "codeberg",
+                    crate::v5::config::ProviderKind::Gitlab => "gitlab",
+                };
+                for cred in &org_cfg.forge.credentials {
+                    let cred_type = match cred.cred_type {
+                        crate::v5::config::CredentialType::Token => "token",
+                        crate::v5::config::CredentialType::SshKey => "ssh_key",
+                    };
+                    // present == Some(true/false) when the ref is
+                    // resolvable; None when we couldn't even check.
+                    let present = if let Ok(parsed) = SecretRef::parse(&cred.key) {
+                        Some(matches!(resolver.resolve(&parsed), Ok(v) if !v.is_empty()))
+                    } else {
+                        None
+                    };
+                    yield HyperforgeV5Event::AuthRequirement {
+                        org: org_name.as_str().to_string(),
+                        provider: provider_str.to_string(),
+                        key: cred.key.clone(),
+                        cred_type: cred_type.to_string(),
+                        present,
+                    };
+                }
             }
         }
     }

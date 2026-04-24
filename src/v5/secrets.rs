@@ -116,6 +116,93 @@ impl YamlSecretStore {
     }
 }
 
+impl YamlSecretStore {
+    /// V5PARITY-7: write a secret. Atomic via tempfile + rename.
+    pub fn put_secret(&self, reference: &SecretRef, value: &str) -> Result<(), SecretError> {
+        let mut map = self.load_map()?;
+        map.insert(
+            serde_yaml::Value::String(reference.path().to_string()),
+            serde_yaml::Value::String(value.to_string()),
+        );
+        self.save_map(map)
+    }
+
+    /// V5PARITY-7: delete a secret. Idempotent on missing.
+    pub fn delete_secret(&self, reference: &SecretRef) -> Result<bool, SecretError> {
+        let mut map = self.load_map()?;
+        let existed = map
+            .remove(&serde_yaml::Value::String(reference.path().to_string()))
+            .is_some();
+        self.save_map(map)?;
+        Ok(existed)
+    }
+
+    /// V5PARITY-7: list every reference key. Values are NEVER returned.
+    pub fn list_refs(&self) -> Result<Vec<SecretRef>, SecretError> {
+        let map = self.load_map()?;
+        let mut out = Vec::new();
+        for (k, _) in map {
+            if let serde_yaml::Value::String(s) = k {
+                let full = format!("secrets://{s}");
+                if let Ok(r) = SecretRef::parse(&full) {
+                    out.push(r);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(out)
+    }
+
+    fn load_map(&self) -> Result<serde_yaml::Mapping, SecretError> {
+        let contents = match fs::read_to_string(&self.file) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(serde_yaml::Mapping::new()),
+            Err(e) => return Err(SecretError::Io { file: self.file_display(), source: e }),
+        };
+        if contents.trim().is_empty() {
+            return Ok(serde_yaml::Mapping::new());
+        }
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&contents).map_err(|e| {
+            SecretError::Corrupt {
+                file: format!("secrets.yaml ({})", self.file_display()),
+                reason: e.to_string(),
+            }
+        })?;
+        match parsed {
+            serde_yaml::Value::Mapping(m) => Ok(m),
+            serde_yaml::Value::Null => Ok(serde_yaml::Mapping::new()),
+            _ => Err(SecretError::Corrupt {
+                file: format!("secrets.yaml ({})", self.file_display()),
+                reason: "top-level value is not a mapping".to_string(),
+            }),
+        }
+    }
+
+    fn save_map(&self, map: serde_yaml::Mapping) -> Result<(), SecretError> {
+        let body = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
+            .map_err(|e| SecretError::Corrupt {
+                file: self.file_display(),
+                reason: e.to_string(),
+            })?;
+        if let Some(parent) = self.file.parent() {
+            fs::create_dir_all(parent).map_err(|e| SecretError::Io {
+                file: parent.display().to_string(),
+                source: e,
+            })?;
+        }
+        let tmp = self.file.with_extension("yaml.tmp");
+        fs::write(&tmp, body).map_err(|e| SecretError::Io {
+            file: tmp.display().to_string(),
+            source: e,
+        })?;
+        fs::rename(&tmp, &self.file).map_err(|e| SecretError::Io {
+            file: self.file.display().to_string(),
+            source: e,
+        })?;
+        Ok(())
+    }
+}
+
 impl SecretResolver for YamlSecretStore {
     fn resolve(&self, reference: &SecretRef) -> Result<String, SecretError> {
         // Load the file. Missing → empty store (all lookups not-found).

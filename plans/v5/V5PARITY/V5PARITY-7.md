@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-7
 title: "AUTH — secrets.{set, list_refs, delete} + auth_check + auth_requirements"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PARITY-2]
 unlocks: [V5PARITY-12]

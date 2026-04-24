@@ -11,4 +11,5 @@ pub mod ops;
 pub mod orgs;
 pub mod repos;
 pub mod secrets;
+pub mod secrets_hub;
 pub mod workspaces;
