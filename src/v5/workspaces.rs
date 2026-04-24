@@ -644,4 +644,117 @@ impl WorkspacesHub {
             };
         }
     }
+
+    /// Drop a member ref from a workspace, optionally cascading to
+    /// forge-side deletion. An object-form entry `{ref, dir}` is
+    /// matched by ref (the `dir` is not material); duplicate entries
+    /// drop the first match. Cascade events follow the same v1
+    /// skeletal shape as `delete` — real adapter path lands in
+    /// V5REPOS-13.
+    #[plexus_macros::method(params(
+        name = "Workspace to modify",
+        repo_ref = "Repo ref in '<org>/<name>' form (or {org,name} object)",
+        delete_remote = "Cascade forge-side deletion of the ref; default false",
+        dry_run = "Preview without writing; default false",
+    ))]
+    pub async fn remove_repo(
+        &self,
+        name: String,
+        repo_ref: String,
+        delete_remote: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        let dry = dry_run.unwrap_or(false);
+        let cascade = delete_remote.unwrap_or(false);
+        stream! {
+            if !is_valid_name(&name) {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_name".into()),
+                    message: format!("invalid workspace name: {name}"),
+                };
+                return;
+            }
+            let Some(rref) = parse_repo_ref_arg(&repo_ref) else {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_ref".into()),
+                    message: format!("invalid repo_ref: {repo_ref}"),
+                };
+                return;
+            };
+            let ws_dir = config_dir.join("workspaces");
+            let target = ws_dir.join(format!("{name}.yaml"));
+            let raw = match std::fs::read_to_string(&target) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace not found: {name}"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("read {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            let mut cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_yaml".into()),
+                        message: format!("parse {}: {e}", target.display()),
+                    };
+                    return;
+                }
+            };
+            let key = (rref.org.as_str().to_string(), rref.name.as_str().to_string());
+            let idx = cfg
+                .repos
+                .iter()
+                .position(|e| ref_key(e).as_ref() == Some(&key));
+            let Some(idx) = idx else {
+                yield WorkspacesEvent::Error {
+                    code: Some("not_a_member".into()),
+                    message: format!("not a member: {}/{}", rref.org, rref.name),
+                };
+                return;
+            };
+            if cascade {
+                let (status, msg) = if dry {
+                    ("forge_deleted".to_string(), None)
+                } else {
+                    (
+                        "forge_delete_failed".to_string(),
+                        Some("no forge adapter registered (V5REPOS-13 pending)".into()),
+                    )
+                };
+                yield WorkspacesEvent::ForgeDeleteResult {
+                    reference: rref.clone(),
+                    status,
+                    message: msg,
+                };
+            }
+            cfg.repos.remove(idx);
+            let count = u32::try_from(cfg.repos.len()).unwrap_or(u32::MAX);
+            let path_str = cfg.path.as_str().to_string();
+            if !dry {
+                if let Err(e) = crate::v5::config::save_workspace(&ws_dir, &cfg) {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            }
+            yield WorkspacesEvent::WorkspaceSummary {
+                name,
+                path: path_str,
+                repo_count: count,
+            };
+        }
+    }
 }
