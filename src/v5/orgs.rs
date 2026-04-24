@@ -15,7 +15,9 @@ use futures::Stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v5::config::{load_orgs, CredentialEntry, OrgConfig, OrgName, ProviderKind, RepoName};
+use crate::v5::config::{
+    load_orgs, save_org, CredentialEntry, ForgeBlock, OrgConfig, OrgName, ProviderKind, RepoName,
+};
 
 // ---------------------------------------------------------------------
 // Event envelope (D9).
@@ -62,6 +64,10 @@ impl OrgsHub {
 
     fn orgs_dir(&self) -> PathBuf {
         self.config_dir.join("orgs")
+    }
+
+    fn org_path(&self, name: &str) -> PathBuf {
+        self.orgs_dir().join(format!("{name}.yaml"))
     }
 }
 
@@ -150,6 +156,76 @@ impl OrgsHub {
                     yield OrgsEvent::Error { code: "parse_error".into(), message: msg };
                 }
             }
+        }
+    }
+
+    /// `orgs.create` — write a new `orgs/<name>.yaml` atomically. The
+    /// org is created empty (no credentials, no repos); adding those is
+    /// the job of V5ORGS-7 / V5REPOS. (V5ORGS-4)
+    #[plexus_macros::method(
+        description = "Create a new org yaml",
+        params(
+            name = "Org name (filename-safe)",
+            provider = "Forge provider (github, codeberg, gitlab)",
+            dry_run = "Preview without writing (default false)"
+        )
+    )]
+    pub async fn create(
+        &self,
+        name: Option<String>,
+        provider: Option<ProviderKind>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
+        let this = self.clone();
+        stream! {
+            let Some(name) = name else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            };
+            let Some(provider) = provider else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'provider'".into(),
+                };
+                return;
+            };
+            if let Err(e) = validate_org_name(&name) {
+                yield OrgsEvent::Error { code: "invalid_name".into(), message: e };
+                return;
+            }
+            if this.org_path(&name).exists() {
+                yield OrgsEvent::Error {
+                    code: "already_exists".into(),
+                    message: format!("org {name:?} already exists"),
+                };
+                return;
+            }
+            let cfg = OrgConfig {
+                name: OrgName(name),
+                forge: ForgeBlock {
+                    provider,
+                    credentials: Vec::new(),
+                },
+                repos: Vec::new(),
+            };
+            let is_dry = dry_run.unwrap_or(false);
+            if !is_dry {
+                if let Err(e) = save_org(&this.orgs_dir(), &cfg) {
+                    yield OrgsEvent::Error {
+                        code: "io_error".into(),
+                        message: format!("{e}"),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::OrgSummary {
+                name: cfg.name,
+                provider: cfg.forge.provider,
+                repo_count: 0,
+            };
         }
     }
 }
