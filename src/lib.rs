@@ -18,6 +18,7 @@ pub mod registry;
 pub mod remote;
 pub mod services;
 pub mod types;
+pub mod v5;
 
 // Re-export serde_helpers from plexus_core (required by plexus_macros generated code)
 pub use plexus_core::serde_helpers;

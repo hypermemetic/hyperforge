@@ -1,7 +1,7 @@
 ---
 id: V5CORE-5
 title: "hyperforge status method returns version and config_dir"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-2]
 unlocks: [V5CORE-10]
