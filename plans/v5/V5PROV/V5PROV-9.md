@@ -1,7 +1,7 @@
 ---
 id: V5PROV-9
 title: "V5PROV checkpoint — end-to-end workflow on real forge"
-status: Ready
+status: Complete
 type: checkpoint
 blocked_by: [V5PROV-2, V5PROV-3, V5PROV-4, V5PROV-5, V5PROV-6, V5PROV-7, V5PROV-8]
 unlocks: []
