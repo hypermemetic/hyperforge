@@ -213,6 +213,99 @@ fn v5core_10() {
     run_one("v5core_10").unwrap();
 }
 
+// One #[test] per V5ORGS script.
+#[test]
+fn v5orgs_2() {
+    run_one("v5orgs_2").unwrap();
+}
+#[test]
+fn v5orgs_3() {
+    run_one("v5orgs_3").unwrap();
+}
+#[test]
+fn v5orgs_4() {
+    run_one("v5orgs_4").unwrap();
+}
+#[test]
+fn v5orgs_5() {
+    run_one("v5orgs_5").unwrap();
+}
+#[test]
+fn v5orgs_6() {
+    run_one("v5orgs_6").unwrap();
+}
+#[test]
+fn v5orgs_7() {
+    run_one("v5orgs_7").unwrap();
+}
+#[test]
+fn v5orgs_8() {
+    run_one("v5orgs_8").unwrap();
+}
+#[test]
+fn v5orgs_9() {
+    run_one("v5orgs_9").unwrap();
+}
+
+// One #[test] per V5REPOS script. Tier-2 scripts (adapters, sync, push)
+// skip cleanly when HF_TEST_*_TOKEN env vars are unset.
+#[test]
+fn v5repos_2() {
+    run_one("v5repos_2").unwrap();
+}
+#[test]
+fn v5repos_3() {
+    run_one("v5repos_3").unwrap();
+}
+#[test]
+fn v5repos_4() {
+    run_one("v5repos_4").unwrap();
+}
+#[test]
+fn v5repos_5() {
+    run_one("v5repos_5").unwrap();
+}
+#[test]
+fn v5repos_6() {
+    run_one("v5repos_6").unwrap();
+}
+#[test]
+fn v5repos_7() {
+    run_one("v5repos_7").unwrap();
+}
+#[test]
+fn v5repos_8() {
+    run_one("v5repos_8").unwrap();
+}
+#[test]
+fn v5repos_9() {
+    run_one("v5repos_9").unwrap();
+}
+#[test]
+fn v5repos_10() {
+    run_one("v5repos_10").unwrap();
+}
+#[test]
+fn v5repos_11() {
+    run_one("v5repos_11").unwrap();
+}
+#[test]
+fn v5repos_12() {
+    run_one("v5repos_12").unwrap();
+}
+#[test]
+fn v5repos_13() {
+    run_one("v5repos_13").unwrap();
+}
+#[test]
+fn v5repos_14() {
+    run_one("v5repos_14").unwrap();
+}
+#[test]
+fn v5repos_15() {
+    run_one("v5repos_15").unwrap();
+}
+
 // One #[test] per V5WS script. V5WS-9 stays wired but is tier-2 and
 // will no-op under the default `cargo test --test v5_integration`
 // invocation (its script carries `# tier: 2` and run_one skips it
