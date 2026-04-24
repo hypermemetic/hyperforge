@@ -21,6 +21,12 @@ path = "src/bin/hyperforge-auth.rs"
 name = "hyperforge-ssh"
 path = "src/bin/hyperforge-ssh.rs"
 
+# --- v5 rewrite binary (lives alongside v4; separate port, separate registry
+# name; does not share code with v4 activations). See plans/v5/.
+[[bin]]
+name = "hyperforge-v5"
+path = "src/bin/hyperforge-v5.rs"
+
 [dependencies]
 # Hub framework integration
 plexus-core = "0.5"
