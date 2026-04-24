@@ -179,41 +179,152 @@ impl ForgePort for GitlabAdapter {
     }
 
     // -----------------------------------------------------------------
-    // V5PROV-2 trait stubs; real impl lands in V5PROV-5.
+    // V5PROV-5 lifecycle methods.
     // -----------------------------------------------------------------
 
     async fn create_repo(
         &self,
-        _remote: &Remote,
-        _repo_ref: &RepoRef,
-        _visibility: ProviderVisibility,
-        _description: &str,
-        _auth: &ForgeAuth<'_>,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        visibility: ProviderVisibility,
+        description: &str,
+        auth: &ForgeAuth<'_>,
     ) -> Result<(), ForgePortError> {
-        Err(ForgePortError::unsupported_field(
-            "gitlab create_repo: not yet implemented (V5PROV-5)",
-        ))
+        // GitLab supports all three visibility variants.
+        let token = Self::token(auth).await?;
+        let host = Self::host_for(remote)?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+
+        // Resolve namespace_id from the org name via `/groups/<org>`.
+        // If missing, create under the authenticated user (no
+        // namespace_id).
+        let group_url = format!("https://{host}/api/v4/groups/{}", repo_ref.org);
+        let group_resp = client
+            .get(&group_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("get {group_url}: {e}")))?;
+        let mut namespace_id: Option<i64> = None;
+        let gstatus = group_resp.status();
+        if gstatus.is_success() {
+            let v: Value = group_resp
+                .json()
+                .await
+                .map_err(|e| ForgePortError::network(format!("parse gitlab group: {e}")))?;
+            namespace_id = v.get("id").and_then(Value::as_i64);
+        } else if !matches!(gstatus, StatusCode::NOT_FOUND) {
+            let b = group_resp.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(gstatus, &b));
+        }
+
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "name".to_string(),
+            Value::String(repo_ref.name.as_str().to_string()),
+        );
+        body.insert(
+            "path".to_string(),
+            Value::String(repo_ref.name.as_str().to_string()),
+        );
+        body.insert(
+            "visibility".to_string(),
+            Value::String(visibility.as_str().to_string()),
+        );
+        if !description.is_empty() {
+            body.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+        if let Some(ns) = namespace_id {
+            body.insert(
+                "namespace_id".to_string(),
+                Value::Number(serde_json::Number::from(ns)),
+            );
+        }
+
+        let create_url = format!("https://{host}/api/v4/projects");
+        let resp = client
+            .post(&create_url)
+            .headers(headers)
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("post {create_url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == StatusCode::BAD_REQUEST || status == StatusCode::CONFLICT {
+            let b = resp.text().await.unwrap_or_default();
+            if b.contains("has already been taken") || b.contains("already exists") {
+                return Err(ForgePortError::conflict(format!(
+                    "gitlab project '{}/{}' already exists",
+                    repo_ref.org, repo_ref.name
+                )));
+            }
+            return Err(ForgePortError::network(format!("gitlab {status}: {b}")));
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
     }
 
     async fn delete_repo(
         &self,
-        _remote: &Remote,
-        _repo_ref: &RepoRef,
-        _auth: &ForgeAuth<'_>,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        auth: &ForgeAuth<'_>,
     ) -> Result<(), ForgePortError> {
-        Err(ForgePortError::unsupported_field(
-            "gitlab delete_repo: not yet implemented (V5PROV-5)",
-        ))
+        let token = Self::token(auth).await?;
+        let host = Self::host_for(remote)?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = Self::project_url(&host, repo_ref);
+
+        let resp = client
+            .delete(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("delete {url}: {e}")))?;
+        let status = resp.status();
+        // GitLab returns 202 Accepted for async deletion; both 2xx and
+        // 202 mean the request was honored.
+        if status.is_success() || status == StatusCode::ACCEPTED {
+            return Ok(());
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
     }
 
     async fn repo_exists(
         &self,
-        _remote: &Remote,
-        _repo_ref: &RepoRef,
-        _auth: &ForgeAuth<'_>,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        auth: &ForgeAuth<'_>,
     ) -> Result<bool, ForgePortError> {
-        Err(ForgePortError::unsupported_field(
-            "gitlab repo_exists: not yet implemented (V5PROV-5)",
-        ))
+        let token = Self::token(auth).await?;
+        let host = Self::host_for(remote)?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = Self::project_url(&host, repo_ref);
+
+        let resp = client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
     }
 }
