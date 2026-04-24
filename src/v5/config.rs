@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -21,7 +22,18 @@ use thiserror::Error;
 
 macro_rules! string_newtype {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            Hash,
+            Serialize,
+            Deserialize,
+            PartialOrd,
+            Ord,
+            JsonSchema,
+        )]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -60,7 +72,7 @@ string_newtype!(DomainName);
 string_newtype!(FsPath);
 
 /// Forge providers known to v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Github,
@@ -69,7 +81,7 @@ pub enum ProviderKind {
 }
 
 /// Credential kinds known to v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialType {
     Token,
@@ -79,7 +91,7 @@ pub enum CredentialType {
 /// `CredentialEntry { key, type }`. `key` is either a `secrets://…` ref
 /// or an `FsPath`; both serialize as a bare string, so the wire form is
 /// `{key: "...", type: "token"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialEntry {
     pub key: String,
