@@ -35,7 +35,7 @@ pub enum DriftFieldKind {
 }
 
 impl DriftFieldKind {
-    /// Wire-surface name for this field (snake_case).
+    /// Wire-surface name for this field (`snake_case`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -248,7 +248,7 @@ fn host_segment(rest: &str) -> String {
     // Strip any `user@` prefix, then cut at first `/` or `:`.
     let after_userinfo = rest.rsplit_once('@').map_or(rest, |(_u, h)| h);
     let end = after_userinfo
-        .find(|c: char| c == '/' || c == ':')
+        .find([':', '/'])
         .unwrap_or(after_userinfo.len());
     after_userinfo[..end].to_lowercase()
 }

@@ -34,8 +34,8 @@ use crate::v5::secrets::{SecretResolver, YamlSecretStore};
 // Events.
 // ---------------------------------------------------------------------
 
-/// Event surface for the repos namespace. All events are flat snake_case
-/// to match the harness's jq assertions.
+/// Event surface for the repos namespace. All events are flat
+/// `snake_case` to match the harness's jq assertions.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RepoEvent {
@@ -166,14 +166,14 @@ pub struct ReposHub {
 
 impl ReposHub {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             config_dir: PathBuf::new(),
         }
     }
 
     #[must_use]
-    pub fn with_config_dir(config_dir: PathBuf) -> Self {
+    pub const fn with_config_dir(config_dir: PathBuf) -> Self {
         Self { config_dir }
     }
 }
@@ -336,7 +336,7 @@ fn validation_event(msg: impl Into<String>) -> RepoEvent {
 // Activation.
 // ---------------------------------------------------------------------
 
-/// Repos CRUD + ForgePort surface.
+/// Repos CRUD + `ForgePort` surface.
 #[plexus_macros::activation(
     namespace = "repos",
     description = "Repos CRUD + ForgePort",
@@ -463,7 +463,7 @@ impl ReposHub {
                 Ok(d) => d,
                 Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
             };
-            let dry = dry_run.as_ref().map(|v| to_bool(v, false)).unwrap_or(false);
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
             if org.is_empty() {
                 yield validation_event("missing required parameter 'org'");
                 return;
@@ -544,8 +544,8 @@ impl ReposHub {
                 Ok(d) => d,
                 Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
             };
-            let dry = dry_run.as_ref().map(|v| to_bool(v, false)).unwrap_or(false);
-            let forge_delete = delete_remote.as_ref().map(|v| to_bool(v, false)).unwrap_or(false);
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            let forge_delete = delete_remote.as_ref().is_some_and(|v| to_bool(v, false));
 
             if org.is_empty() || name.is_empty() {
                 yield validation_event("missing required parameter 'org' or 'name'");
@@ -617,7 +617,7 @@ impl ReposHub {
                 Ok(d) => d,
                 Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
             };
-            let dry = dry_run.as_ref().map(|v| to_bool(v, false)).unwrap_or(false);
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
             if org.is_empty() || name.is_empty() {
                 yield validation_event("missing required parameter 'org' or 'name'");
                 return;
@@ -686,7 +686,7 @@ impl ReposHub {
                 Ok(d) => d,
                 Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
             };
-            let dry = dry_run.as_ref().map(|v| to_bool(v, false)).unwrap_or(false);
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
             if org.is_empty() || name.is_empty() || url.is_empty() {
                 yield validation_event("missing required parameter 'org', 'name', or 'url'");
                 return;
@@ -859,7 +859,7 @@ impl ReposHub {
                 Ok(d) => d,
                 Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
             };
-            let dry = dry_run.as_ref().map(|v| to_bool(v, false)).unwrap_or(false);
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
             if org.is_empty() || name.is_empty() {
                 yield validation_event("missing required parameter 'org' or 'name'");
                 return;
