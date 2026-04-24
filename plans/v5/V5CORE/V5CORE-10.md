@@ -1,7 +1,7 @@
 ---
 id: V5CORE-10
 title: "CORE checkpoint — scaffolding composes end-to-end"
-status: Ready
+status: Complete
 type: checkpoint
 blocked_by: [V5CORE-2, V5CORE-3, V5CORE-4, V5CORE-5, V5CORE-6, V5CORE-7, V5CORE-8, V5CORE-9]
 unlocks: []
@@ -30,12 +30,12 @@ Filled at checkpoint evaluation time. Target terminal state: all green.
 
 | Story | Status | One-liner |
 |---|---|---|
-| U1 daemon starts | red/yellow/green | _filled by checkpoint run_ |
-| U2 status | red/yellow/green | _filled by checkpoint run_ |
-| U3 three stubs | red/yellow/green | _filled by checkpoint run_ |
-| U4 round-trip | red/yellow/green | _filled by checkpoint run_ |
-| U5 secret resolve | red/yellow/green | _filled by checkpoint run_ |
-| U6 harness | red/yellow/green | _filled by checkpoint run_ |
+| U1 daemon starts | green | `hyperforge-v5` binds 44105, registers as `lforge-v5`, v4 on 44104 unaffected |
+| U2 status | green | `hf_cmd status` emits `{type:"status", version, config_dir}` |
+| U3 three stubs | green | `orgs`, `repos`, `workspaces` static children present, zero wire methods each |
+| U4 round-trip | green | `empty/` and `minimal_org/` fixtures load and round-trip |
+| U5 secret resolve | green | `secrets://<path>` resolves through the embedded YAML store |
+| U6 harness | green | `hf_spawn`/`hf_cmd`/`hf_teardown` cycle cleanly, tiers honoured |
 
 ## Required behavior
 
