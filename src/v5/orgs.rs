@@ -16,7 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::v5::config::{
-    load_orgs, save_org, CredentialEntry, ForgeBlock, OrgConfig, OrgName, ProviderKind, RepoName,
+    load_orgs, save_org, CredentialEntry, CredentialType, ForgeBlock, OrgConfig, OrgName,
+    ProviderKind, RepoName,
 };
 
 // ---------------------------------------------------------------------
@@ -43,6 +44,21 @@ pub enum OrgsEvent {
     /// Successful `delete`: names the removed org. `dry_run` echoes the
     /// request so callers can distinguish preview from real deletion.
     OrgDeleted { name: OrgName, dry_run: bool },
+    /// Successful `set_credential` when the key was not previously on
+    /// the org. A distinct event `type` (not a sub-field) so callers can
+    /// assert on the discriminator alone.
+    CredentialAdded {
+        org: OrgName,
+        entry: CredentialEntry,
+        dry_run: bool,
+    },
+    /// Successful `set_credential` when the key already existed on the
+    /// org — the entry at that index is swapped in place.
+    CredentialReplaced {
+        org: OrgName,
+        entry: CredentialEntry,
+        dry_run: bool,
+    },
     /// Generic error event. `code` is drawn from a closed set per method.
     Error { code: String, message: String },
 }
@@ -361,11 +377,129 @@ impl OrgsHub {
             };
         }
     }
+
+    /// `orgs.set_credential` — add or replace one credential entry by
+    /// key. If no existing entry matches `key`, append; otherwise
+    /// replace in place preserving index. Keys MUST be `secrets://…`
+    /// refs or absolute filesystem paths — plaintext secrets are
+    /// rejected at the wire boundary. (V5ORGS-7)
+    #[plexus_macros::method(
+        description = "Add or replace one credential entry by key",
+        params(
+            org = "Org name",
+            key = "Credential key (secrets:// ref or absolute path)",
+            credential_type = "Credential kind (token, ssh_key)",
+            dry_run = "Preview without writing (default false)"
+        )
+    )]
+    pub async fn set_credential(
+        &self,
+        org: Option<String>,
+        key: Option<String>,
+        credential_type: Option<CredentialType>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
+        let this = self.clone();
+        stream! {
+            let Some(org) = org else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'org'".into(),
+                };
+                return;
+            };
+            let Some(key) = key else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'key'".into(),
+                };
+                return;
+            };
+            let Some(cred_type) = credential_type else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'credential_type'".into(),
+                };
+                return;
+            };
+            if let Err(e) = validate_org_name(&org) {
+                yield OrgsEvent::Error { code: "invalid_name".into(), message: e };
+                return;
+            }
+            if let Err(e) = validate_credential_key(&key) {
+                yield OrgsEvent::Error { code: "invalid_key".into(), message: e };
+                return;
+            }
+            let mut cfg = match read_org(&this.config_dir, &org) {
+                Ok(c) => c,
+                Err(ReadOrgError::NotFound) => {
+                    yield OrgsEvent::Error {
+                        code: "org_not_found".into(),
+                        message: format!("org {org:?} not found"),
+                    };
+                    return;
+                }
+                Err(ReadOrgError::Io(m)) => {
+                    yield OrgsEvent::Error { code: "io_error".into(), message: m };
+                    return;
+                }
+                Err(ReadOrgError::Parse(m)) => {
+                    yield OrgsEvent::Error { code: "parse_error".into(), message: m };
+                    return;
+                }
+            };
+
+            let entry = CredentialEntry { key: key.clone(), cred_type };
+            let replaced = if let Some(existing) =
+                cfg.forge.credentials.iter_mut().find(|c| c.key == key)
+            {
+                *existing = entry.clone();
+                true
+            } else {
+                cfg.forge.credentials.push(entry.clone());
+                false
+            };
+
+            let is_dry = dry_run.unwrap_or(false);
+            if !is_dry {
+                if let Err(e) = save_org(&this.orgs_dir(), &cfg) {
+                    yield OrgsEvent::Error {
+                        code: "io_error".into(),
+                        message: format!("{e}"),
+                    };
+                    return;
+                }
+            }
+            yield if replaced {
+                OrgsEvent::CredentialReplaced { org: cfg.name, entry, dry_run: is_dry }
+            } else {
+                OrgsEvent::CredentialAdded { org: cfg.name, entry, dry_run: is_dry }
+            };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
 // Disk + validation helpers.
 // ---------------------------------------------------------------------
+
+/// Validate a credential key: either `secrets://<non-empty>` (`SecretRef`)
+/// or an absolute filesystem path (`FsPath`). Rejects bare plaintext so
+/// org yaml cannot accidentally hold a token.
+fn validate_credential_key(key: &str) -> Result<(), String> {
+    if let Some(rest) = key.strip_prefix("secrets://") {
+        if rest.is_empty() {
+            return Err(format!("secret reference {key:?} has empty path"));
+        }
+        return Ok(());
+    }
+    if key.starts_with('/') && !key.contains("..") && !key.ends_with('/') {
+        return Ok(());
+    }
+    Err(format!(
+        "credential key {key:?} is not a 'secrets://…' reference or an absolute filesystem path"
+    ))
+}
 
 /// Validate an `OrgName` per §types: filename-safe (no `/`, no leading
 /// `.`, ≤64 chars, ASCII), non-empty.
