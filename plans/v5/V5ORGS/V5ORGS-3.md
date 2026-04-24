@@ -1,7 +1,7 @@
 ---
 id: V5ORGS-3
 title: "orgs.get — OrgDetail for one org, never leaks secret values"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-6, V5CORE-9]
 unlocks: [V5ORGS-9]
