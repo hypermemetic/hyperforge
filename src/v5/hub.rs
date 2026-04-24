@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::v5::orgs::OrgsHub;
 use crate::v5::repos::ReposHub;
+use crate::v5::workspaces::WorkspacesHub;
 
 /// Events emitted by the v5 root hub.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -79,6 +80,13 @@ impl HyperforgeHub {
     #[allow(clippy::unused_self)]
     const fn repos(&self) -> ReposHub {
         ReposHub::new()
+    }
+
+    /// Workspaces namespace — CRUD + reconcile + sync. Methods attached by V5WS.
+    #[plexus_macros::child]
+    #[allow(clippy::unused_self)]
+    const fn workspaces(&self) -> WorkspacesHub {
+        WorkspacesHub::new()
     }
 
     /// Return daemon version and config directory.
