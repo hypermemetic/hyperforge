@@ -24,10 +24,10 @@ cd "$(dirname "$0")/../../.."
 #   - ops/*  (the state layer's own home)
 #   - secrets.rs (separate secret store module)
 #   - config.rs (the types + loader module — the state impl detail)
-#   - workspaces.rs (known residual; multi-site migration deferred)
 #   - ///  doc comments (textual mentions aren't violations)
 violations=$(grep -RnE 'serde_yaml::(from_str|to_string|from_reader)' src/v5/ 2>/dev/null \
-    | grep -vE '(^src/v5/(ops|secrets|config\.rs|workspaces\.rs))|///\|//' || true)
+    | grep -vE '^src/v5/(ops|secrets|config\.rs)' \
+    | grep -vE '^[^:]+:[0-9]+:\s*///' || true)
 
 if [[ -n "$violations" ]]; then
     echo "D13 violation — direct state I/O outside ops/, secrets/, or config.rs:"

@@ -287,7 +287,8 @@ impl WorkspacesHub {
         &self,
         name: String,
     ) -> impl Stream<Item = WorkspacesEvent> + Send + 'static {
-        let ws_dir = self.config_dir.join("workspaces");
+        let config_dir = self.config_dir.clone();
+        let ws_dir = config_dir.join("workspaces");
         stream! {
             if name.is_empty() {
                 yield WorkspacesEvent::Error {
@@ -303,10 +304,9 @@ impl WorkspacesHub {
                 };
                 return;
             }
-            let path = ws_dir.join(format!("{name}.yaml"));
-            let raw = match std::fs::read_to_string(&path) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let cfg = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     yield WorkspacesEvent::Error {
                         code: Some("not_found".into()),
                         message: format!("workspace not found: {name}"),
@@ -315,22 +315,13 @@ impl WorkspacesHub {
                 }
                 Err(e) => {
                     yield WorkspacesEvent::Error {
-                        code: Some("io_error".into()),
-                        message: format!("read {}: {e}", path.display()),
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
                     };
                     return;
                 }
             };
-            let cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
-                Ok(c) => c,
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("invalid_yaml".into()),
-                        message: format!("parse {}: {e}", path.display()),
-                    };
-                    return;
-                }
-            };
+            let _ = ws_dir; // not needed after ops::state migration
             yield WorkspacesEvent::WorkspaceDetail {
                 name: cfg.name.as_str().to_string(),
                 path: cfg.path.as_str().to_string(),
@@ -504,9 +495,9 @@ impl WorkspacesHub {
             }
             let ws_dir = config_dir.join("workspaces");
             let target = ws_dir.join(format!("{name}.yaml"));
-            let raw = match std::fs::read_to_string(&target) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let cfg = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     yield WorkspacesEvent::Error {
                         code: Some("not_found".into()),
                         message: format!("workspace not found: {name}"),
@@ -515,22 +506,13 @@ impl WorkspacesHub {
                 }
                 Err(e) => {
                     yield WorkspacesEvent::Error {
-                        code: Some("io_error".into()),
-                        message: format!("read {}: {e}", target.display()),
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
                     };
                     return;
                 }
             };
-            let cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
-                Ok(c) => c,
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("invalid_yaml".into()),
-                        message: format!("parse {}: {e}", target.display()),
-                    };
-                    return;
-                }
-            };
+            let _ = &target; // target path retained for downstream error messages if needed
             if cascade {
                 for entry in &cfg.repos {
                     let Some((org, rname)) = ref_key(entry) else { continue };
@@ -600,10 +582,9 @@ impl WorkspacesHub {
                 return;
             };
             let ws_dir = config_dir.join("workspaces");
-            let target = ws_dir.join(format!("{name}.yaml"));
-            let raw = match std::fs::read_to_string(&target) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut cfg = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     yield WorkspacesEvent::Error {
                         code: Some("not_found".into()),
                         message: format!("workspace not found: {name}"),
@@ -612,51 +593,32 @@ impl WorkspacesHub {
                 }
                 Err(e) => {
                     yield WorkspacesEvent::Error {
-                        code: Some("io_error".into()),
-                        message: format!("read {}: {e}", target.display()),
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
                     };
                     return;
                 }
             };
-            let mut cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
-                Ok(c) => c,
+            // Validate against its org yaml via ops::state.
+            let orgs = match crate::v5::ops::state::load_orgs(&config_dir.join("orgs")) {
+                Ok(o) => o,
                 Err(e) => {
                     yield WorkspacesEvent::Error {
-                        code: Some("invalid_yaml".into()),
-                        message: format!("parse {}: {e}", target.display()),
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
                     };
                     return;
                 }
             };
-            // Validate against its org yaml.
-            let orgs_dir = config_dir.join("orgs");
-            let org_file = orgs_dir.join(format!("{}.yaml", rref.org));
-            let org_raw = match std::fs::read_to_string(&org_file) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let org_cfg = match orgs.get(&rref.org) {
+                Some(o) => o.clone(),
+                None => {
                     yield WorkspacesEvent::Error {
                         code: Some("org_not_found".into()),
                         message: format!(
                             "org not found: {} (ref {}/{})",
                             rref.org, rref.org, rref.name
                         ),
-                    };
-                    return;
-                }
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("io_error".into()),
-                        message: format!("read {}: {e}", org_file.display()),
-                    };
-                    return;
-                }
-            };
-            let org_cfg: crate::v5::config::OrgConfig = match serde_yaml::from_str(&org_raw) {
-                Ok(c) => c,
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("invalid_yaml".into()),
-                        message: format!("parse {}: {e}", org_file.display()),
                     };
                     return;
                 }
@@ -744,9 +706,9 @@ impl WorkspacesHub {
             };
             let ws_dir = config_dir.join("workspaces");
             let target = ws_dir.join(format!("{name}.yaml"));
-            let raw = match std::fs::read_to_string(&target) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut cfg = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     yield WorkspacesEvent::Error {
                         code: Some("not_found".into()),
                         message: format!("workspace not found: {name}"),
@@ -755,22 +717,13 @@ impl WorkspacesHub {
                 }
                 Err(e) => {
                     yield WorkspacesEvent::Error {
-                        code: Some("io_error".into()),
-                        message: format!("read {}: {e}", target.display()),
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
                     };
                     return;
                 }
             };
-            let mut cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
-                Ok(c) => c,
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("invalid_yaml".into()),
-                        message: format!("parse {}: {e}", target.display()),
-                    };
-                    return;
-                }
-            };
+            let _ = &target;
             let key = (rref.org.as_str().to_string(), rref.name.as_str().to_string());
             let idx = cfg
                 .repos
@@ -851,9 +804,9 @@ impl WorkspacesHub {
             }
             let ws_dir = config_dir.join("workspaces");
             let target = ws_dir.join(format!("{name}.yaml"));
-            let raw = match std::fs::read_to_string(&target) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut cfg = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     yield WorkspacesEvent::Error {
                         code: Some("not_found".into()),
                         message: format!("workspace not found: {name}"),
@@ -862,22 +815,13 @@ impl WorkspacesHub {
                 }
                 Err(e) => {
                     yield WorkspacesEvent::Error {
-                        code: Some("io_error".into()),
-                        message: format!("read {}: {e}", target.display()),
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
                     };
                     return;
                 }
             };
-            let mut cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
-                Ok(c) => c,
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("invalid_yaml".into()),
-                        message: format!("parse {}: {e}", target.display()),
-                    };
-                    return;
-                }
-            };
+            let _ = &target;
             // Load orgs for URL → ref lookup.
             let orgs_dir = config_dir.join("orgs");
             let orgs = match crate::v5::config::load_orgs(&orgs_dir) {

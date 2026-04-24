@@ -39,7 +39,7 @@ grep_violation() {
 #   config.rs owns the yaml type defs + loader impls.
 #   secrets.rs is the YAML-backed secret store (separate from orgs/ws state).
 #   /// doc comments can mention adapter methods without it being a call.
-grep_violation "yaml-io"      'serde_yaml::(from_str|to_string|from_reader)' '^src/v5/(ops|secrets|config\.rs|workspaces\.rs)'
+grep_violation "yaml-io"      'serde_yaml::(from_str|to_string|from_reader)' '^src/v5/(ops|secrets|config\.rs)'
 grep_violation "adapter-meta" '[^/]adapter\.(read_metadata|write_metadata)' '^src/v5/ops/'
 grep_violation "adapter-life" '[^/]adapter\.(create_repo|delete_repo|repo_exists|update_repo)' '^src/v5/ops/'
 grep_violation "for_provider" '[^a-z:]for_provider\(' '^src/v5/(ops|adapters)/'
