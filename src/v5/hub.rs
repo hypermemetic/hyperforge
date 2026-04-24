@@ -90,9 +90,8 @@ impl HyperforgeHub {
 
     /// Workspaces namespace — CRUD + reconcile + sync. Methods attached by V5WS.
     #[plexus_macros::child]
-    #[allow(clippy::unused_self)]
-    const fn workspaces(&self) -> WorkspacesHub {
-        WorkspacesHub::new()
+    fn workspaces(&self) -> WorkspacesHub {
+        WorkspacesHub::new(self.state.config_dir.clone())
     }
 
     /// Return daemon version and config directory.
