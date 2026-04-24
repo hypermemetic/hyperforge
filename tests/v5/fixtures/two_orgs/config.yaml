@@ -1,0 +1,3 @@
+provider_map:
+  github.com: github
+  codeberg.org: codeberg

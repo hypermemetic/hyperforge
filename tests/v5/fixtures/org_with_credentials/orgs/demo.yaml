@@ -1,0 +1,7 @@
+name: demo
+forge:
+  provider: github
+  credentials:
+    - key: secrets://gh-token
+      type: token
+repos: []

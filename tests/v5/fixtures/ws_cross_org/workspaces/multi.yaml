@@ -1,0 +1,5 @@
+name: multi
+path: /tmp/hf-v5-ws-cross-org
+repos:
+  - demo/widget
+  - acme/tool

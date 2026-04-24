@@ -1,0 +1,4 @@
+name: main
+path: /tmp/ws-main
+repos:
+  - demo/foo

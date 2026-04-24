@@ -1,0 +1,4 @@
+name: main
+path: /tmp/hf-v5-ws-with-one-repo
+repos:
+  - demo/widget

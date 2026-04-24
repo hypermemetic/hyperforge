@@ -1,0 +1,9 @@
+name: demo
+forge:
+  provider: github
+  credentials: []
+repos:
+  - name: widget
+    remotes:
+      - url: https://git.internal.acme/demo/widget.git
+        provider: gitlab

@@ -1,0 +1,8 @@
+name: acme
+forge:
+  provider: codeberg
+  credentials: []
+repos:
+  - name: tool
+    remotes:
+      - url: https://codeberg.org/acme/tool.git

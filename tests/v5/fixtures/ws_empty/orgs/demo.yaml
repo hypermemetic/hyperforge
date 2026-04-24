@@ -1,0 +1,8 @@
+name: demo
+forge:
+  provider: github
+  credentials: []
+repos:
+  - name: widget
+    remotes:
+      - url: https://github.com/demo/widget.git
