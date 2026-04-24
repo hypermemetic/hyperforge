@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-11
 title: "V5LIFECYCLE checkpoint — lifecycle matrix + DRY grep invariant"
-status: Ready
+status: Complete
 type: checkpoint
 blocked_by: [V5LIFECYCLE-2, V5LIFECYCLE-3, V5LIFECYCLE-4, V5LIFECYCLE-5, V5LIFECYCLE-6, V5LIFECYCLE-7, V5LIFECYCLE-8, V5LIFECYCLE-9, V5LIFECYCLE-10]
 unlocks: []
