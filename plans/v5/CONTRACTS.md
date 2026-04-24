@@ -33,6 +33,7 @@ public field set are the contract.
 | `ReconcileEventKind` | `renamed`, `removed`, `matched`, `new_matched`, `ambiguous`  |
 | `SyncStatus`         | `in_sync`, `drifted`, `errored`                              |
 | `DriftFieldKind`     | `default_branch`, `description`, `archived`, `visibility`    |
+| `ProviderVisibility` | `public`, `private`, `internal` (adapter rejects variants its provider lacks) |
 
 Unknown variants MUST be rejected at the wire boundary, not accepted and
 dropped.
@@ -79,13 +80,15 @@ as open.
 |---|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | D1 | v5 daemon default port is **44105** (v4 keeps 44104). v5 registers in the Plexus registry as `lforge-v5`.                                                                                              |
 | D2 | No `hyperforge-auth` sidecar. Secret store is embedded; YAML backend only in v1.                                                                                                                       |
-| D3 | `ForgePort` trait pinned as **the intersection of portable metadata**: `default_branch`, `description`, `archived`, `visibility`. Provider-specific fields are per-adapter extensions, not on the trait. |
+| D3 | **Superseded by D10.** (Original scoping was "intersection of portable metadata only"; tightened too narrowly — see D10 for the revised trait surface.) |
 | D4 | `repos.push` **pushes to every remote in sequence**, provider-dispatched per remote. First failure aborts; already-succeeded remotes are reported in the result. Caller may pass `--remote <url>` to target one. |
 | D5 | `workspaces.reconcile` ambiguity resolution: when two local dirs share a remote URL, the **first scanned wins** (alphabetical), other candidates emit `ReconcileEventKind::ambiguous` events. No auto-fix. |
 | D6 | `workspaces.sync` continues past per-repo failures. Aggregate `WorkspaceSyncReport.errored` counts them; overall exit is success; the caller inspects the report for per-repo status.                 |
 | D7 | `dry_run: bool = false` is a **standard parameter** on every mutating method (`create`, `delete`, `update`, `add`, `remove`, `set_*`, `push`, `delete_remote` flows). Default false.                    |
 | D8 | Atomic writes. Every yaml write is "write tempfile + rename". Concurrent writers are serialized by a per-file lock inside the daemon. Tickets inherit this contract.                                    |
 | D9 | Event envelope. Every event emitted by an RPC method has a top-level `type` field (snake_case string) as the discriminator. Error events have `type: "error"` with additional `code` (snake_case, drawn from the emitting ticket's closed error-class set) and `message` (free text). Non-error events use a `type` matching the category (`org_summary`, `sync_diff`, `reconcile_event`, `schema`, etc.). Test scripts match on `.type == "<category>"`; payload field names are fixed per ticket. |
+| D10 | **`ForgePort` (revised; supersedes D3).** The trait exposes the portable metadata intersection (`default_branch`, `description`, `archived`, `visibility`) **plus lifecycle methods**: `create_repo`, `delete_repo`, `repo_exists`. Non-portable provider fields remain per-adapter extensions. `visibility` on create is one of `public`, `private`, `internal` (adapters reject their own non-supported variants). |
+| D11 | **Lifecycle parameter conventions.** `repos.add` accepts optional `create_remote: bool = false`, `visibility: ProviderVisibility = private`, `description: String = ""`; when `create_remote` is true, the adapter's `create_repo` is called after the local entry is written (local registration is rolled back on forge error). `repos.delete` accepts optional `delete_remote: bool = false`; when true, `delete_repo` is called; the local entry is dropped only after forge success. `workspaces.sync` detects members registered locally but absent on remote (via `repo_exists`) and calls `create_repo`; creation failures are reported as `sync_diff { status: errored, error_class: adapter_error }` and do NOT abort the batch (per D6). |
 
 ---
 
