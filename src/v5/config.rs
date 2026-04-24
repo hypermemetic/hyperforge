@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -21,7 +22,9 @@ use thiserror::Error;
 
 macro_rules! string_newtype {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+        #[derive(
+            Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, JsonSchema,
+        )]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -97,11 +100,52 @@ pub struct Remote {
 }
 
 /// `RepoRef { org, name }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serialized canonically as a JSON object `{org, name}`. For YAML
+/// convenience, `Deserialize` also accepts the human-friendly string
+/// form `<org>/<name>` — used inside workspace yaml `ref:` fields and
+/// on-the-wire wherever callers find the object form redundant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepoRef {
     pub org: OrgName,
     pub name: RepoName,
+}
+
+impl<'de> Deserialize<'de> for RepoRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept either the canonical object `{org, name}` or the
+        // shorthand string `<org>/<name>`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Object { org: OrgName, name: RepoName },
+            String(String),
+        }
+        let v = Either::deserialize(deserializer)?;
+        match v {
+            Either::Object { org, name } => Ok(Self { org, name }),
+            Either::String(s) => {
+                let (org, name) = s.split_once('/').ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "invalid RepoRef shorthand (expected '<org>/<name>'): {s}"
+                    ))
+                })?;
+                if org.is_empty() || name.is_empty() {
+                    return Err(serde::de::Error::custom(format!(
+                        "invalid RepoRef shorthand (empty segment): {s}"
+                    )));
+                }
+                Ok(Self {
+                    org: org.into(),
+                    name: name.into(),
+                })
+            }
+        }
+    }
 }
 
 /// A repo declared on an org.
@@ -115,7 +159,7 @@ pub struct OrgRepo {
 
 /// A workspace entry, either a string shorthand `<org>/<name>` or a
 /// `{ref, dir}` object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum WorkspaceRepo {
     Shorthand(String),

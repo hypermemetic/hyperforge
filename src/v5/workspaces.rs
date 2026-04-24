@@ -15,7 +15,7 @@ use futures::Stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v5::config::load_workspaces;
+use crate::v5::config::{load_workspaces, WorkspaceRepo};
 
 /// Workspaces namespace. Each method reads/writes `workspaces/*.yaml`
 /// under the daemon's config directory.
@@ -44,6 +44,14 @@ pub enum WorkspacesEvent {
         path: String,
         repo_count: u32,
     },
+    /// Full workspace detail (V5WS-3 `get`). `repos` preserves each
+    /// entry's original on-disk shape (string shorthand or `{ref,dir}`
+    /// object) and source order.
+    WorkspaceDetail {
+        name: String,
+        path: String,
+        repos: Vec<WorkspaceRepo>,
+    },
     /// Generic error. `code` is a `snake_case` discriminator drawn from
     /// the emitting method's closed error set.
     Error {
@@ -51,6 +59,20 @@ pub enum WorkspacesEvent {
         code: Option<String>,
         message: String,
     },
+}
+
+/// Validate a `WorkspaceName`: ≤64 chars, ASCII, no `/`, no leading `.`.
+fn is_valid_name(s: &str) -> bool {
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    if s.starts_with('.') {
+        return false;
+    }
+    if !s.is_ascii() {
+        return false;
+    }
+    !s.contains('/')
 }
 
 /// Workspaces CRUD + reconcile + sync.
@@ -91,6 +113,68 @@ impl WorkspacesHub {
                     };
                 }
             }
+        }
+    }
+
+    /// Return one workspace's full detail.
+    ///
+    /// Emits a single `workspace_detail` event whose `repos` preserves
+    /// the on-disk mix of string-form and object-form entries in
+    /// source order. Missing workspace → typed not-found.
+    #[plexus_macros::method(params(name = "Workspace name to fetch"))]
+    pub async fn get(
+        &self,
+        name: String,
+    ) -> impl Stream<Item = WorkspacesEvent> + Send + 'static {
+        let ws_dir = self.config_dir.join("workspaces");
+        stream! {
+            if name.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("missing_param".into()),
+                    message: "required parameter 'name' is missing".into(),
+                };
+                return;
+            }
+            if !is_valid_name(&name) {
+                yield WorkspacesEvent::Error {
+                    code: Some("invalid_name".into()),
+                    message: format!("invalid workspace name: {name}"),
+                };
+                return;
+            }
+            let path = ws_dir.join(format!("{name}.yaml"));
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace not found: {name}"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("io_error".into()),
+                        message: format!("read {}: {e}", path.display()),
+                    };
+                    return;
+                }
+            };
+            let cfg: crate::v5::config::WorkspaceConfig = match serde_yaml::from_str(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("invalid_yaml".into()),
+                        message: format!("parse {}: {e}", path.display()),
+                    };
+                    return;
+                }
+            };
+            yield WorkspacesEvent::WorkspaceDetail {
+                name: cfg.name.as_str().to_string(),
+                path: cfg.path.as_str().to_string(),
+                repos: cfg.repos,
+            };
         }
     }
 }
