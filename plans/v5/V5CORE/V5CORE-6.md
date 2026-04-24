@@ -1,7 +1,7 @@
 ---
 id: V5CORE-6
 title: "OrgsHub static child stub"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-2]
 unlocks: [V5CORE-10, V5ORGS-1]

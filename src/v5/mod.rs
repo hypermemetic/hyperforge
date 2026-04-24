@@ -5,3 +5,4 @@
 //! v4 activation tree in `crate::hub` / `crate::hubs` is untouched.
 
 pub mod hub;
+pub mod orgs;

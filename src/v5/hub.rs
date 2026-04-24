@@ -16,6 +16,8 @@ use futures::Stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::v5::orgs::OrgsHub;
+
 /// Events emitted by the v5 root hub.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -64,6 +66,13 @@ impl HyperforgeHub {
     crate_path = "plexus_core"
 )]
 impl HyperforgeHub {
+    /// Orgs namespace — CRUD + credentials. Methods attached by V5ORGS.
+    #[plexus_macros::child]
+    #[allow(clippy::unused_self)]
+    const fn orgs(&self) -> OrgsHub {
+        OrgsHub::new()
+    }
+
     /// Return daemon version and config directory.
     #[plexus_macros::method]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
