@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::v5::adapters::{
-    for_provider, DriftFieldKind, ForgeAuth, ForgeMetadata, ForgePortError,
+    DriftFieldKind, ForgeMetadata, ForgePortError,
     MetadataFields, ProviderVisibility,
 };
 use crate::v5::config::{
@@ -694,23 +694,14 @@ impl ReposHub {
                     return;
                 }
 
+                // V5LIFECYCLE-4: route through ops::repo wrappers.
                 let resolver = YamlSecretStore::new(&dir);
-                let token_ref = existing
-                    .forge
-                    .credentials
-                    .iter()
-                    .find(|c| matches!(c.cred_type, CredentialType::Token))
-                    .map(|c| c.key.clone());
-                let auth = ForgeAuth {
-                    token_ref: token_ref.as_deref(),
-                    resolver: &resolver,
-                };
-                let adapter = for_provider(provider);
-                // Check for existence first — if already present,
-                // report conflict + roll back local entry.
-                match adapter.repo_exists(first, &repo_ref, &auth).await {
+                let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+                let _ = provider; // provider is still derived for logging but we no longer need the adapter handle here
+                match crate::v5::ops::repo::exists_on_forge(
+                    first, &repo_ref, &loaded.global.provider_map, &resolver, token_ref,
+                ).await {
                     Ok(true) => {
-                        // Roll back local write.
                         let rolled_back = existing.clone();
                         if let Err(e) = save_org(&orgs_dir, &rolled_back) {
                             yield cfg_error_event(e);
@@ -718,17 +709,12 @@ impl ReposHub {
                         yield RepoEvent::Error {
                             code: Some("conflict".into()),
                             error_class: Some("conflict".into()),
-                            message: format!(
-                                "repo '{}/{}' already exists on remote",
-                                org, name
-                            ),
+                            message: format!("repo '{}/{}' already exists on remote", org, name),
                         };
                         return;
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        // auth or network failure during the probe
-                        // counts as a forge-side error → roll back.
                         let rolled_back = existing.clone();
                         if let Err(save_err) = save_org(&orgs_dir, &rolled_back) {
                             yield cfg_error_event(save_err);
@@ -741,10 +727,9 @@ impl ReposHub {
                         return;
                     }
                 }
-                match adapter
-                    .create_repo(first, &repo_ref, vis, &desc, &auth)
-                    .await
-                {
+                match crate::v5::ops::repo::create_on_forge(
+                    first, &repo_ref, vis, &desc, &loaded.global.provider_map, &resolver, token_ref,
+                ).await {
                     Ok(()) => {
                         yield RepoEvent::RepoCreated {
                             reference: repo_ref_wire.clone(),
@@ -1038,70 +1023,39 @@ impl ReposHub {
                 yield not_found_event(format!("repo '{name}' not found under org '{org}'"));
                 return;
             };
-            let filtered: Vec<&Remote> = if let Some(filter_url) = remote.as_ref().filter(|s| !s.is_empty()) {
-                let matches: Vec<&Remote> = repo.remotes.iter().filter(|r| r.url.as_str() == filter_url).collect();
-                if matches.is_empty() {
+            // Remote filter validation (ops::repo::sync_one handles
+            // the filter internally; we only validate-for-error here).
+            if let Some(filter_url) = remote.as_ref().filter(|s| !s.is_empty()) {
+                if !repo.remotes.iter().any(|r| r.url.as_str() == filter_url) {
                     yield not_found_event(format!("remote url '{filter_url}' not present on repo"));
                     return;
                 }
-                matches
-            } else {
-                repo.remotes.iter().collect()
-            };
+            }
             let resolver = YamlSecretStore::new(&dir);
-            let token_ref = org_cfg
-                .forge
-                .credentials
-                .iter()
-                .find(|c| matches!(c.cred_type, CredentialType::Token))
-                .map(|c| c.key.clone());
             let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
-            let local = repo.metadata.clone();
-            for r in filtered {
-                let provider = match derive_provider(r, &loaded.global.provider_map) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        yield RepoEvent::SyncDiff {
-                            reference: (&repo_ref).into(),
-                            url: r.url.as_str().to_string(),
-                            status: "errored".into(),
-                            drift: vec![],
-                            error_class: Some("network".into()),
-                            remote: None,
-                        };
-                        yield validation_event(e);
-                        continue;
-                    }
+            // V5LIFECYCLE-3: delegate to the single sync primitive.
+            let outcomes = crate::v5::ops::repo::sync_one(
+                repo,
+                org_cfg,
+                &loaded.global.provider_map,
+                &resolver,
+                remote.as_deref(),
+            ).await;
+            for o in outcomes {
+                // Translate per-remote outcome into the RepoEvent::SyncDiff
+                // wire shape (per-remote event for `repos.sync` per V5REPOS-13).
+                yield RepoEvent::SyncDiff {
+                    reference: (&repo_ref).into(),
+                    url: o.remote.url.as_str().to_string(),
+                    status: o.status.as_str().to_string(),
+                    drift: o.drift.into_iter().map(|d| DriftField {
+                        field: d.field,
+                        local: d.local,
+                        remote: d.remote,
+                    }).collect(),
+                    error_class: o.error_class.map(|e| e.as_str().to_string()),
+                    remote: o.metadata,
                 };
-                let adapter = for_provider(provider);
-                let auth = ForgeAuth {
-                    token_ref: token_ref.as_deref(),
-                    resolver: &resolver,
-                };
-                match adapter.read_metadata(r, &repo_ref, &auth).await {
-                    Ok(meta) => {
-                        let drift = compute_drift(&local, &meta);
-                        let status = if drift.is_empty() { "in_sync" } else { "drifted" };
-                        yield RepoEvent::SyncDiff {
-                            reference: (&repo_ref).into(),
-                            url: r.url.as_str().to_string(),
-                            status: status.into(),
-                            drift,
-                            error_class: None,
-                            remote: Some(meta),
-                        };
-                    }
-                    Err(e) => {
-                        yield RepoEvent::SyncDiff {
-                            reference: (&repo_ref).into(),
-                            url: r.url.as_str().to_string(),
-                            status: "errored".into(),
-                            drift: vec![],
-                            error_class: Some(e.class.as_str().to_string()),
-                            remote: None,
-                        };
-                    }
-                }
             }
         }
     }
@@ -1208,15 +1162,11 @@ impl ReposHub {
                     succeeded.push(url_s);
                     continue;
                 }
-                let adapter = for_provider(provider);
-                let auth = ForgeAuth {
-                    token_ref: token_ref.as_deref(),
-                    resolver: &resolver,
-                };
-                match adapter
-                    .write_metadata(r, &repo_ref, &to_apply, &auth)
-                    .await
-                {
+                // V5LIFECYCLE-4: write via ops::repo helper.
+                let _ = provider; // logging placeholder; provider is re-derived inside the helper
+                match crate::v5::ops::repo::write_metadata_on_forge(
+                    r, &repo_ref, &to_apply, &loaded.global.provider_map, &resolver, token_ref.as_deref(),
+                ).await {
                     Ok(applied) => {
                         let names: Vec<String> = applied
                             .keys()
@@ -1631,23 +1581,7 @@ fn metadata_from_local(local: &Option<RepoMetadataLocal>) -> MetadataFields {
 }
 
 // V5LIFECYCLE-3: `compute_drift` relocated to `crate::v5::ops::repo`.
-// The local `DriftField` wire type and `ops::repo::DriftField` are
-// structurally identical; we bridge via a thin helper so existing
-// callsites keep the short name + the wire shape this module already
-// serialized.
-pub(crate) fn compute_drift(
-    local: &Option<RepoMetadataLocal>,
-    remote: &ForgeMetadata,
-) -> Vec<DriftField> {
-    crate::v5::ops::repo::compute_drift(local, remote)
-        .into_iter()
-        .map(|d| DriftField {
-            field: d.field,
-            local: d.local,
-            remote: d.remote,
-        })
-        .collect()
-}
+// No in-module callers remain after the migration.
 
 // Silence unused-import lint if adapters are only used indirectly.
 #[allow(dead_code)]

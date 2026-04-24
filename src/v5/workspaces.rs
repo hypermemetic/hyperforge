@@ -1356,22 +1356,18 @@ impl WorkspacesHub {
                     .iter()
                     .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::Token))
                     .map(|c| c.key.clone());
-                let adapter = crate::v5::adapters::for_provider(provider);
-                let auth = crate::v5::adapters::ForgeAuth {
-                    token_ref: token_ref.as_deref(),
-                    resolver: &resolver,
-                };
+                let token_ref_str = token_ref.as_deref();
+                let _ = provider; // provider derivation happens inside ops::repo::*
                 let repo_ref = crate::v5::config::RepoRef {
                     org: crate::v5::config::OrgName::from(org_s.as_str()),
                     name: crate::v5::config::RepoName::from(name_s.as_str()),
                 };
-                // V5PROV-8: before reading metadata, check if the
-                // remote exists. Absent remotes get created first.
-                match adapter.repo_exists(remote, &repo_ref, &auth).await {
+                // V5LIFECYCLE-4: probe for existence via ops::repo.
+                match crate::v5::ops::repo::exists_on_forge(
+                    remote, &repo_ref, &loaded.global.provider_map, &resolver, token_ref_str,
+                ).await {
                     Ok(false) => {
-                        // Remote doesn't exist — create it, then emit
-                        // a sync_diff with status=created and skip the
-                        // read-metadata/drift step for this pass.
+                        // Absent → create via ops::repo::create_on_forge.
                         let vis = repo
                             .metadata
                             .as_ref()
@@ -1387,10 +1383,9 @@ impl WorkspacesHub {
                             .as_ref()
                             .and_then(|m| m.description.clone())
                             .unwrap_or_default();
-                        let diff = match adapter
-                            .create_repo(remote, &repo_ref, vis, &desc, &auth)
-                            .await
-                        {
+                        let diff = match crate::v5::ops::repo::create_on_forge(
+                            remote, &repo_ref, vis, &desc, &loaded.global.provider_map, &resolver, token_ref_str,
+                        ).await {
                             Ok(()) => {
                                 created += 1;
                                 WorkspacesEvent::SyncDiff {
@@ -1419,9 +1414,6 @@ impl WorkspacesHub {
                         continue;
                     }
                     Err(e) => {
-                        // Can't even determine existence (auth fail,
-                        // network). Treat as errored, do not attempt
-                        // read_metadata.
                         errored += 1;
                         let diff = WorkspacesEvent::SyncDiff {
                             reference: wire.clone(),
@@ -1435,33 +1427,47 @@ impl WorkspacesHub {
                         yield diff;
                         continue;
                     }
-                    Ok(true) => {} // proceed to read_metadata
+                    Ok(true) => {} // proceed to sync
                 }
 
-                let diff = match adapter.read_metadata(remote, &repo_ref, &auth).await {
-                    Ok(meta) => {
-                        let drift = crate::v5::repos::compute_drift(&repo.metadata, &meta);
-                        let status = if drift.is_empty() { "in_sync" } else { "drifted" };
-                        if status == "in_sync" { in_sync += 1; } else { drifted += 1; }
-                        WorkspacesEvent::SyncDiff {
-                            reference: wire.clone(),
-                            url: Some(remote.url.as_str().to_string()),
-                            status: status.into(),
-                            drift,
-                            error_class: None,
-                            remote: Some(meta),
-                        }
+                // V5LIFECYCLE-3: delegate the per-remote sync to the
+                // single primitive. We filter to just this member's
+                // first remote (V5WS-9's "one SyncDiff per member"
+                // contract) by passing its url as the filter.
+                let outcomes = crate::v5::ops::repo::sync_one(
+                    repo,
+                    org_cfg,
+                    &loaded.global.provider_map,
+                    &resolver,
+                    Some(remote.url.as_str()),
+                ).await;
+                let diff = if let Some(o) = outcomes.into_iter().next() {
+                    match o.status {
+                        crate::v5::ops::repo::SyncStatus::InSync => { in_sync += 1; }
+                        crate::v5::ops::repo::SyncStatus::Drifted => { drifted += 1; }
+                        crate::v5::ops::repo::SyncStatus::Errored => { errored += 1; }
                     }
-                    Err(e) => {
-                        errored += 1;
-                        WorkspacesEvent::SyncDiff {
-                            reference: wire.clone(),
-                            url: Some(remote.url.as_str().to_string()),
-                            status: "errored".into(),
-                            drift: vec![],
-                            error_class: Some(e.class.as_str().to_string()),
-                            remote: None,
-                        }
+                    WorkspacesEvent::SyncDiff {
+                        reference: wire.clone(),
+                        url: Some(o.remote.url.as_str().to_string()),
+                        status: o.status.as_str().to_string(),
+                        drift: o.drift.into_iter().map(|d| crate::v5::repos::DriftField {
+                            field: d.field,
+                            local: d.local,
+                            remote: d.remote,
+                        }).collect(),
+                        error_class: o.error_class.map(|e| e.as_str().to_string()),
+                        remote: o.metadata,
+                    }
+                } else {
+                    errored += 1;
+                    WorkspacesEvent::SyncDiff {
+                        reference: wire.clone(),
+                        url: Some(remote.url.as_str().to_string()),
+                        status: "errored".into(),
+                        drift: vec![],
+                        error_class: Some("network".into()),
+                        remote: None,
                     }
                 };
                 per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));

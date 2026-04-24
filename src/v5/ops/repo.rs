@@ -184,6 +184,26 @@ pub async fn delete_on_forge(
     adapter.delete_repo(remote, repo_ref, &auth).await
 }
 
+/// Generic metadata write on the forge. Used by `repos.push`.
+pub async fn write_metadata_on_forge(
+    remote: &Remote,
+    repo_ref: &RepoRef,
+    fields: &MetadataFields,
+    provider_map: &BTreeMap<DomainName, ProviderKind>,
+    resolver: &dyn SecretResolver,
+    token_ref: Option<&str>,
+) -> Result<MetadataFields, ForgePortError> {
+    let provider = derive_provider(remote, provider_map).map_err(|e| {
+        ForgePortError::new(ForgeErrorClass::Network, e)
+    })?;
+    let adapter = for_provider(provider);
+    let auth = ForgeAuth {
+        token_ref,
+        resolver,
+    };
+    adapter.write_metadata(remote, repo_ref, fields, &auth).await
+}
+
 /// Privatize a repo on its forge via `write_metadata` with only the
 /// `visibility` field set to `private`. Used by soft-delete
 /// (V5LIFECYCLE-6). Does not touch any other metadata field.

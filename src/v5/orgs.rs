@@ -614,17 +614,21 @@ fn validate_org_name(name: &str) -> Result<(), String> {
 
 enum ReadOrgError {
     NotFound,
+    #[allow(dead_code)]
     Io(String),
     Parse(String),
 }
 
 fn read_org(config_dir: &Path, name: &str) -> Result<OrgConfig, ReadOrgError> {
-    let path = config_dir.join("orgs").join(format!("{name}.yaml"));
-    if !path.is_file() {
+    // V5LIFECYCLE-2: route through ops::state instead of inline yaml.
+    let orgs_dir = config_dir.join("orgs");
+    if !config_dir.join("orgs").join(format!("{name}.yaml")).is_file() {
         return Err(ReadOrgError::NotFound);
     }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| ReadOrgError::Io(format!("failed to read {}: {e}", path.display())))?;
-    serde_yaml::from_str::<OrgConfig>(&raw)
-        .map_err(|e| ReadOrgError::Parse(format!("failed to parse {}: {e}", path.display())))
+    let all = crate::v5::ops::state::load_orgs(&orgs_dir)
+        .map_err(|e| ReadOrgError::Parse(e.to_string()))?;
+    all.into_iter()
+        .find(|(_, v)| v.name.as_str() == name)
+        .map(|(_, v)| v)
+        .ok_or(ReadOrgError::NotFound)
 }

@@ -11,8 +11,11 @@ source "$(dirname "$0")/../harness/lib.sh"
 
 # (a) structural grep
 cd "$(dirname "$0")/../../.."
-violations=$(grep -RE 'adapter\.(create_repo|delete_repo|repo_exists)|for_provider\(' src/v5/ 2>/dev/null \
-    | grep -vE '^src/v5/(ops|adapters)/' || true)
+# Catches direct adapter lifecycle calls and dispatch calls outside
+# the ops/ and adapters/ subtrees. Excludes doc comments.
+violations=$(grep -RnE '[^/]adapter\.(create_repo|delete_repo|repo_exists)|[^a-z:]for_provider\(' src/v5/ 2>/dev/null \
+    | grep -vE '^src/v5/(ops|adapters)/' \
+    | grep -vE '^[^:]+:[^:]+:\s*///' || true)
 if [[ -n "$violations" ]]; then
     echo "DRY violation — direct adapter lifecycle calls or for_provider outside ops/:"
     echo "$violations"
