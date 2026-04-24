@@ -1,7 +1,7 @@
 ---
 id: V5ORGS-9
 title: "ORGS checkpoint — CRUD + credentials composes end-to-end"
-status: Ready
+status: Complete
 type: checkpoint
 blocked_by: [V5ORGS-2, V5ORGS-3, V5ORGS-4, V5ORGS-5, V5ORGS-6, V5ORGS-7, V5ORGS-8]
 unlocks: []
@@ -31,13 +31,13 @@ Filled at checkpoint evaluation time. Target terminal state: all green.
 
 | Story | Status | One-liner |
 |---|---|---|
-| U1 onboard | red/yellow/green | _filled by checkpoint run_ |
-| U2 inspect | red/yellow/green | _filled by checkpoint run_ |
-| U3 rotate | red/yellow/green | _filled by checkpoint run_ |
-| U4 delete | red/yellow/green | _filled by checkpoint run_ |
-| U5 restart | red/yellow/green | _filled by checkpoint run_ |
-| U6 patch | red/yellow/green | _filled by checkpoint run_ |
-| U7 remove_credential | red/yellow/green | _filled by checkpoint run_ |
+| U1 onboard | green | create + set_credential compose from an empty fixture |
+| U2 inspect | green | orgs.get returns OrgDetail refs only; plaintext never on wire |
+| U3 rotate | green | set_credential replaces same-key entry in place |
+| U4 delete | green | delete removes only the target file; dry_run leaves disk intact |
+| U5 restart | green | state lives on disk — list/get equal pre/post daemon respawn |
+| U6 patch | green | update swaps provider; credentials + repos byte-equivalent |
+| U7 remove_credential | green | remove_credential leaves secrets.yaml untouched |
 
 ## Required behavior
 
