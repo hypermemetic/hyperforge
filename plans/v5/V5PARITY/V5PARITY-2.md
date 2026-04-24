@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-2
 title: "IMPORT — list_repos + repos.import + workspaces.discover"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: []
 unlocks: [V5PARITY-3, V5PARITY-4, V5PARITY-6, V5PARITY-7, V5PARITY-8, V5PARITY-9, V5PARITY-12]

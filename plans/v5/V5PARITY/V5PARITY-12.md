@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-12
 title: "CLEANUP — data-structure tightenings + parallel-test harness + residuals"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-2, V5PARITY-3, V5PARITY-4, V5PARITY-5, V5PARITY-6, V5PARITY-7, V5PARITY-8, V5PARITY-9, V5PARITY-10, V5PARITY-11]
 unlocks: [V5PARITY-13]
@@ -32,6 +32,26 @@ The data-structure audit surfaced several tightenings worth doing before V5PARIT
 - `V5PROV-6/7` doc comments in `src/v5/repos.rs` that grep-flag-false-positive even with V5LIFECYCLE-11's `///` exclusion — audit the surviving cases and either rephrase the comments or tighten the grep regex.
 - Verify V5LIFECYCLE-10's `config_drift` shape agrees with V5PARITY-2's `discover_match` — both read `.hyperforge/config.toml`; align their event fields (one emits `declared_org/declared_repo` fields; the other should too).
 - `src/v5/orgs.rs` `ReadOrgError::Io` carries `#[allow(dead_code)]` — at V5PARITY-12 time, verify the variant is actually needed (if not, remove; if yes, plumb through to callers).
+
+### Documented divergence from v4 (intentional — NOT a migration task)
+
+v5's config-file formats deviate from v4's. The user's call: no
+backward-compat layer, no migration tool. This ticket records the
+divergence for the record so future readers know it's deliberate:
+
+| File | v4 | v5 |
+|---|---|---|
+| Global config | — | `~/.config/hyperforge/config.yaml` (v5-only) |
+| Org config | `orgs/<org>.toml` | `orgs/<org>.yaml` (different format AND shape — includes the repo registry inline) |
+| Repo registry | `orgs/<org>/repos.yaml` (separate LocalForge file) | merged into the org yaml above |
+| Workspaces | implicit (via `OrgConfig.workspace_path` + filesystem scan) | `workspaces/<ws>.yaml` (v5-only, first-class) |
+| Secrets | `secrets.yaml` (accessed via `hyperforge-auth` sidecar) | `secrets.yaml` (accessed via embedded `YamlSecretStore`) — FILE-COMPATIBLE but access path differs |
+| Per-repo | `<repo>/.hyperforge/config.toml` | `<repo>/.hyperforge/config.toml` — same file, SAME format (TOML), but NARROWER schema (v5 drops `ci`, `large_file_threshold_kb`, `dist`, `ssh`, `forge_config` — those are deferred to V5PARITY-{5,9,10,11}). v4-written files will fail v5's `#[serde(deny_unknown_fields)]` parse if they carry the dropped fields. |
+
+**No user action required by this ticket.** Existing v4 configs stay
+on v4; v5 configs are authored fresh (the user is adding orgs one
+by one per their explicit instruction). A future V5MIGRATE epic
+(if ever needed) would be ticketed separately.
 
 ## What must NOT change
 

@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-3
 title: "GIT — ops::git + transport methods on repos + workspace-parallel variants"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-2]
 unlocks: [V5PARITY-5, V5PARITY-12]

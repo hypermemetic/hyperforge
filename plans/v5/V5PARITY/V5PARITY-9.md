@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-9
 title: "BUILD-MANIFEST — unify, analyze, validate, detect_name_mismatches, package_diff"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-2]
 unlocks: [V5PARITY-10, V5PARITY-11, V5PARITY-12]

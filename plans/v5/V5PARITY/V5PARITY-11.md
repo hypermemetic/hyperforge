@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-11
 title: "BUILD-DIST-EXEC — distribution channels + run/exec"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-9]
 unlocks: [V5PARITY-12]

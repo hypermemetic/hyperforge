@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-4
 title: "ANALYTICS — size, loc, large_files, dirty + workspace aggregates"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-2]
 unlocks: [V5PARITY-12]

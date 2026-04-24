@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-5
 title: "SSH — per-repo core.sshCommand wiring + repos.set_ssh_key + org fallback"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-3]
 unlocks: [V5PARITY-12]

@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-8
 title: "CLI — reload, config_show, config_set_ssh_key, config_show_ssh_key, begin"
-status: Pending
+status: Ready
 type: implementation
 blocked_by: [V5PARITY-2]
 unlocks: [V5PARITY-12]
