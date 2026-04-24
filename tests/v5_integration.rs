@@ -382,3 +382,25 @@ fn v5prov_8() {
 fn v5prov_9() {
     run_one("v5prov_9").unwrap();
 }
+
+// One #[test] per V5LIFECYCLE script.
+#[test]
+fn v5lifecycle_2() { run_one("v5lifecycle_2").unwrap(); }
+#[test]
+fn v5lifecycle_3() { run_one("v5lifecycle_3").unwrap(); }
+#[test]
+fn v5lifecycle_4() { run_one("v5lifecycle_4").unwrap(); }
+#[test]
+fn v5lifecycle_5() { run_one("v5lifecycle_5").unwrap(); }
+#[test]
+fn v5lifecycle_6() { run_one("v5lifecycle_6").unwrap(); }
+#[test]
+fn v5lifecycle_7() { run_one("v5lifecycle_7").unwrap(); }
+#[test]
+fn v5lifecycle_8() { run_one("v5lifecycle_8").unwrap(); }
+#[test]
+fn v5lifecycle_9() { run_one("v5lifecycle_9").unwrap(); }
+#[test]
+fn v5lifecycle_10() { run_one("v5lifecycle_10").unwrap(); }
+#[test]
+fn v5lifecycle_11() { run_one("v5lifecycle_11").unwrap(); }
