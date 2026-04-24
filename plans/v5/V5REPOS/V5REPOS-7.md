@@ -1,7 +1,7 @@
 ---
 id: V5REPOS-7
 title: "repos.add_remote — append a Remote to an existing repo (local only)"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-7, V5CORE-9]
 unlocks: [V5REPOS-15]
