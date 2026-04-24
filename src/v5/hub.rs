@@ -17,6 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::v5::orgs::OrgsHub;
+use crate::v5::repos::ReposHub;
 
 /// Events emitted by the v5 root hub.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -71,6 +72,13 @@ impl HyperforgeHub {
     #[allow(clippy::unused_self)]
     const fn orgs(&self) -> OrgsHub {
         OrgsHub::new()
+    }
+
+    /// Repos namespace — CRUD + ForgePort. Methods attached by V5REPOS.
+    #[plexus_macros::child]
+    #[allow(clippy::unused_self)]
+    const fn repos(&self) -> ReposHub {
+        ReposHub::new()
     }
 
     /// Return daemon version and config directory.

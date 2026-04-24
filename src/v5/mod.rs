@@ -6,3 +6,4 @@
 
 pub mod hub;
 pub mod orgs;
+pub mod repos;
