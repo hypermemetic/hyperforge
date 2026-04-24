@@ -92,7 +92,9 @@ synapse substrate hyperforge repo import --forge github --org <org>
 
 # Single-repo git
 synapse substrate hyperforge repo init   --path /path/to/repo --org <org> --forges "github,codeberg"
-synapse substrate hyperforge repo status --path /path/to/repo
+synapse substrate hyperforge repo init   --path /path/to/repo --org <org> --forges "github" --transport https   # HTTPS remotes instead of SSH
+synapse substrate hyperforge repo set_transport --path /path/to/repo --transport https      # flip existing remotes to HTTPS (idempotent)
+synapse substrate hyperforge repo status --path /path/to/repo                                # emits RepoTransport events per forge
 synapse substrate hyperforge repo push   --path /path/to/repo
 synapse substrate hyperforge repo clone  --org <org> --name my-tool --dest /path/to/checkout
 synapse substrate hyperforge repo sync   --path /path/to/repo   # pull from origin, push to mirrors

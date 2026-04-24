@@ -94,6 +94,22 @@ pub enum OrgAddFailureReason {
     IoError,
 }
 
+/// Machine-readable discriminator for why `repo set_transport` refused a request.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportChangeFailureReason {
+    /// The target path is not a hyperforge-registered repo (no `.hyperforge/config.toml`).
+    NotInitialized,
+    /// The target path exists but is not a git repo.
+    NotAGitRepo,
+    /// The target path does not exist or is not readable.
+    PathNotFound,
+    /// A git command (list remotes, set-url) failed.
+    GitError,
+    /// The `.hyperforge/config.toml` could not be loaded.
+    ConfigError,
+}
+
 /// Machine-readable discriminator for why `orgs_update` refused a request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -412,6 +428,47 @@ pub enum HyperforgeEvent {
     OrgUpdateFailed {
         org: String,
         reason: OrgUpdateFailureReason,
+        message: String,
+    },
+    /// Reports the current transport of a configured forge remote, read
+    /// live from `git remote`. Emitted by `repo status` (once per forge)
+    /// and by `repo set_transport` after a change. The value reflects
+    /// actual on-disk state, not a cached field — this ensures repos
+    /// initialized before the TRANSPORT epic still report correctly.
+    RepoTransport {
+        /// Repository path the caller passed in.
+        path: String,
+        /// Git remote name, e.g. `origin` or `codeberg`.
+        remote: String,
+        /// Forge string, e.g. `github`.
+        forge: String,
+        /// Detected transport. `ssh` or `https`. `None` when the remote's
+        /// URL shape is not recognized (e.g. a custom mirror URL).
+        transport: Option<crate::git::Transport>,
+        /// The remote URL as stored in `git remote`, for debugging.
+        url: Option<String>,
+    },
+    /// `repo set_transport` rewrote the URL of one or more remotes.
+    TransportChanged {
+        /// Repository path the caller passed in.
+        path: String,
+        /// Requested transport.
+        transport: crate::git::Transport,
+        /// Remote names that were updated (e.g. `["origin", "codeberg"]`).
+        remotes_changed: Vec<String>,
+    },
+    /// `repo set_transport` was a no-op: every configured forge's remote
+    /// already matched the requested transport. No `git remote` command
+    /// was invoked.
+    TransportUnchanged {
+        path: String,
+        transport: crate::git::Transport,
+    },
+    /// `repo set_transport` refused the request. `reason` is a
+    /// machine-readable discriminator.
+    TransportChangeFailed {
+        path: String,
+        reason: TransportChangeFailureReason,
         message: String,
     },
     /// Progress step during build release orchestration

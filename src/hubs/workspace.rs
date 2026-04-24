@@ -264,6 +264,7 @@ impl WorkspaceHub {
                     if is_dry_run { Some(true) } else { None },
                     if is_no_hooks { Some(true) } else { None },
                     if is_no_ssh_wrapper { Some(true) } else { None },
+                    None,  // transport — preserve today's default (ssh)
                 ).await;
                 tokio::pin!(stream);
                 let events: Vec<HyperforgeEvent> = stream.collect().await;
@@ -2009,6 +2010,7 @@ impl WorkspaceHub {
                     ssh_wrapper: false,
                     dry_run: is_dry_run,
                     auto_commit: true,
+                    transport: None,
                 };
 
                 match crate::commands::materialize::materialize(&target_org, &record, &repo_path, materialize_opts) {

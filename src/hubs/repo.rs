@@ -11,7 +11,8 @@ use crate::auth::YamlAuthProvider;
 use crate::commands::materialize::{materialize, MaterializeOpts, MaterializeReport};
 use crate::commands::{push, status};
 use crate::config::HyperforgeConfig;
-use crate::hub::HyperforgeEvent;
+use crate::git::{build_remote_url_with, Git, Transport};
+use crate::hub::{HyperforgeEvent, TransportChangeFailureReason};
 use crate::hubs::images::ImagesHub;
 use crate::hubs::releases::ReleasesHub;
 use crate::hubs::HyperforgeState;
@@ -1065,7 +1066,8 @@ impl RepoHub {
             force = "Force reinitialize even if config exists (optional, default: false)",
             dry_run = "Preview changes without applying (optional, default: false)",
             no_hooks = "Skip installing pre-push hook (optional, default: false)",
-            no_ssh_wrapper = "Skip configuring SSH wrapper (optional, default: false)"
+            no_ssh_wrapper = "Skip configuring SSH wrapper (optional, default: false)",
+            transport = "Remote URL transport: ssh or https (optional, default: ssh). Controls the shape of `git remote` URLs written during init."
         )
     )]
     pub async fn init(
@@ -1081,6 +1083,7 @@ impl RepoHub {
         dry_run: Option<bool>,
         no_hooks: Option<bool>,
         no_ssh_wrapper: Option<bool>,
+        transport: Option<Transport>,
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         let state = self.state.clone();
 
@@ -1218,6 +1221,7 @@ impl RepoHub {
                 ssh_wrapper: !no_ssh_wrapper.unwrap_or(false),
                 dry_run: is_dry_run,
                 auto_commit: true,
+                transport,
             };
 
             match materialize(&org, &record, &repo_path, opts) {
@@ -1284,6 +1288,176 @@ impl RepoHub {
         }
     }
 
+    /// Switch the remote URL transport of a hyperforge-registered repo.
+    ///
+    /// Idempotent: running the same call twice in a row is a no-op on the
+    /// second call — no `git remote set-url` is invoked and no failure is
+    /// emitted. Current transport is read live from `git remote`, so repos
+    /// that were initialized before this method existed also work.
+    #[plexus_macros::method(
+        description = "Switch the remote URL transport (ssh<->https) of a hyperforge-registered repo. Idempotent: a second call with the same transport is a success no-op.",
+        params(
+            path = "Repository path (absolute)",
+            transport = "Target transport: ssh or https"
+        )
+    )]
+    pub async fn set_transport(
+        &self,
+        path: String,
+        transport: Transport,
+    ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
+        stream! {
+            let repo_path = std::path::Path::new(&path);
+
+            // 1. The path must exist and be a directory.
+            if !repo_path.exists() {
+                yield HyperforgeEvent::TransportChangeFailed {
+                    path: path.clone(),
+                    reason: TransportChangeFailureReason::PathNotFound,
+                    message: format!("Path does not exist: {path}"),
+                };
+                return;
+            }
+
+            // 2. The path must be a hyperforge-registered repo — same
+            //    class of rejection as `repo status` when it errors with
+            //    `NotInitialized`. Callers who haven't run `repo init`
+            //    yet get this failure, matching the acceptance criterion
+            //    for "target repo is not hyperforge-registered".
+            if !HyperforgeConfig::exists(repo_path) {
+                yield HyperforgeEvent::TransportChangeFailed {
+                    path: path.clone(),
+                    reason: TransportChangeFailureReason::NotInitialized,
+                    message: format!(
+                        "Not a hyperforge repository at {path}. Run `repo init` first.",
+                    ),
+                };
+                return;
+            }
+
+            // 3. Must be a git repo so we can read and rewrite remotes.
+            if !Git::is_repo(repo_path) {
+                yield HyperforgeEvent::TransportChangeFailed {
+                    path: path.clone(),
+                    reason: TransportChangeFailureReason::NotAGitRepo,
+                    message: format!("Not a git repository at {path}"),
+                };
+                return;
+            }
+
+            // 4. Load the config to know which forges to touch. Each
+            //    forge maps to a named remote (`origin` for the first,
+            //    forge-name for the others), respecting any
+            //    `forge_config.remote` override.
+            let config = match HyperforgeConfig::load(repo_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield HyperforgeEvent::TransportChangeFailed {
+                        path: path.clone(),
+                        reason: TransportChangeFailureReason::ConfigError,
+                        message: format!("Failed to load .hyperforge/config.toml: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            let current_remotes = match Git::list_remotes(repo_path) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    yield HyperforgeEvent::TransportChangeFailed {
+                        path: path.clone(),
+                        reason: TransportChangeFailureReason::GitError,
+                        message: format!("Failed to list git remotes: {e}"),
+                    };
+                    return;
+                }
+            };
+
+            // 5. For each configured forge, compute the desired URL at
+            //    the requested transport and compare to what's on disk.
+            //    Record the remotes whose URL actually changes. Remotes
+            //    that the config declares but `git remote` doesn't have
+            //    yet are silently skipped — those never got through
+            //    `repo init`'s add-remote step, so there's nothing to
+            //    rewrite; the next init or manual add picks up the
+            //    transport from whatever is requested then.
+            let mut changed: Vec<String> = Vec::new();
+
+            for forge_str in &config.forges {
+                let remote_name = config.remote_for_forge(forge_str);
+                let org_for_forge = config
+                    .forge_config
+                    .get(forge_str)
+                    .and_then(|fc| fc.org.as_deref())
+                    .or(config.org.as_deref())
+                    .unwrap_or("");
+                let repo_name = config.get_repo_name(repo_path);
+
+                if org_for_forge.is_empty() {
+                    // Without an org we cannot compute a valid URL.
+                    // Treat this as a config error.
+                    yield HyperforgeEvent::TransportChangeFailed {
+                        path: path.clone(),
+                        reason: TransportChangeFailureReason::ConfigError,
+                        message: format!(
+                            "No org configured for forge '{forge_str}' in {path}",
+                        ),
+                    };
+                    return;
+                }
+
+                let desired_url = build_remote_url_with(
+                    forge_str,
+                    org_for_forge,
+                    &repo_name,
+                    transport,
+                );
+
+                // Remotes declared in config but absent from `git remote`
+                // are left alone — `repo init`'s add-remote step never
+                // got them up, and the next init or manual add picks up
+                // whichever transport is requested then.
+                if let Some(existing) = current_remotes.iter().find(|r| r.name == remote_name) {
+                    if existing.fetch_url == desired_url {
+                        // Already at requested transport (and URL) — idempotent no-op path.
+                        continue;
+                    }
+                    if let Err(e) = Git::set_remote_url(repo_path, &remote_name, &desired_url) {
+                        yield HyperforgeEvent::TransportChangeFailed {
+                            path: path.clone(),
+                            reason: TransportChangeFailureReason::GitError,
+                            message: format!(
+                                "Failed to set remote '{remote_name}' URL: {e}",
+                            ),
+                        };
+                        return;
+                    }
+                    changed.push(remote_name.clone());
+                }
+            }
+
+            // 6. Report outcome. If nothing actually changed on disk the
+            //    call is a pure no-op — emit TransportUnchanged without
+            //    ever invoking `git remote set-url`. (If every configured
+            //    remote was missing from `git remote` that's still a
+            //    no-op for transport purposes — the caller hasn't set
+            //    those remotes up yet; the next `repo init` or manual
+            //    add will use whatever transport is passed to it.)
+            if changed.is_empty() {
+                yield HyperforgeEvent::TransportUnchanged {
+                    path: path.clone(),
+                    transport,
+                };
+            } else {
+                yield HyperforgeEvent::TransportChanged {
+                    path: path.clone(),
+                    transport,
+                    remotes_changed: changed,
+                };
+            }
+        }
+    }
+
     /// Show git repository status
     #[plexus_macros::method(
         description = "Show git repository sync status across all configured forges",
@@ -1297,9 +1471,27 @@ impl RepoHub {
     ) -> impl Stream<Item = HyperforgeEvent> + Send + 'static {
         stream! {
             let repo_path = std::path::Path::new(&path);
+            let path_str = path.clone();
 
             match status::status(repo_path) {
                 Ok(report) => {
+                    // Emit one RepoTransport per forge so callers can read
+                    // the current transport without parsing `git remote -v`.
+                    // Transport is detected live from the stored URL, so
+                    // pre-TRANSPORT repos report correctly.
+                    for forge_status in &report.forges {
+                        let transport = forge_status
+                            .remote_url
+                            .as_deref()
+                            .and_then(Transport::detect);
+                        yield HyperforgeEvent::RepoTransport {
+                            path: path_str.clone(),
+                            remote: forge_status.remote_name.clone(),
+                            forge: forge_status.forge.clone(),
+                            transport,
+                            url: forge_status.remote_url.clone(),
+                        };
+                    }
                     // Current branch
                     yield HyperforgeEvent::Info {
                         message: format!("On branch: {}", report.branch),

@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use crate::config::{HyperforgeConfig, OrgConfig};
-use crate::git::{build_remote_url, Git};
+use crate::git::{build_remote_url, build_remote_url_with, Git, Transport};
 use crate::types::RepoRecord;
 
 /// Options controlling which parts of materialization to perform.
@@ -23,6 +23,9 @@ pub struct MaterializeOpts {
     pub dry_run: bool,
     /// Auto-commit .hyperforge/ after materialization (default true)
     pub auto_commit: bool,
+    /// Transport to use when writing new remote URLs. `None` means
+    /// fall back to `Transport::from_env()` (default Ssh).
+    pub transport: Option<Transport>,
 }
 
 impl Default for MaterializeOpts {
@@ -34,6 +37,7 @@ impl Default for MaterializeOpts {
             ssh_wrapper: false,
             dry_run: false,
             auto_commit: true,
+            transport: None,
         }
     }
 }
@@ -135,7 +139,11 @@ pub fn materialize(
                 .and_then(|fc| fc.org.as_deref())
                 .unwrap_or(org);
 
-            let url = build_remote_url(forge_str, org_for_forge, &record.name);
+            let url = if let Some(t) = opts.transport {
+                build_remote_url_with(forge_str, org_for_forge, &record.name, t)
+            } else {
+                build_remote_url(forge_str, org_for_forge, &record.name)
+            };
 
             // Use config.remote_for_forge to respect forge_config.remote overrides
             let remote_name = config.remote_for_forge(forge_str);

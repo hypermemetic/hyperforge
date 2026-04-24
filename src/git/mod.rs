@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors that can occur during git operations
@@ -861,7 +863,14 @@ pub fn force_push_with_retry(path: &Path, remote: &str, branch: &str) -> GitResu
 }
 
 /// Git transport for remote URLs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Deserialize` + `JsonSchema` are present so Synapse can accept
+/// `--transport ssh|https` as a closed-set enum flag: unknown values are
+/// rejected at CLI parse time, before the call reaches the hub.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Transport {
     Ssh,
     Https,
@@ -871,8 +880,30 @@ impl Transport {
     /// Default transport: reads `HYPERFORGE_TRANSPORT=https|ssh`, falls back to Ssh.
     pub fn from_env() -> Self {
         match std::env::var("HYPERFORGE_TRANSPORT").ok().as_deref() {
-            Some(v) if v.eq_ignore_ascii_case("https") => Transport::Https,
-            _ => Transport::Ssh,
+            Some(v) if v.eq_ignore_ascii_case("https") => Self::Https,
+            _ => Self::Ssh,
+        }
+    }
+
+    /// Lowercase string form used in events and logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::Https => "https",
+        }
+    }
+
+    /// Classify a git remote URL by transport shape. Returns `None` for
+    /// URLs that don't look like either SSH (`git@host:org/repo`) or
+    /// HTTPS (`https://host/org/repo`). Callers that still need to
+    /// compare treat `None` as "unrecognized — not equal to anything".
+    pub fn detect(url: &str) -> Option<Self> {
+        if url.starts_with("git@") {
+            Some(Self::Ssh)
+        } else if url.starts_with("https://") || url.starts_with("http://") {
+            Some(Self::Https)
+        } else {
+            None
         }
     }
 }

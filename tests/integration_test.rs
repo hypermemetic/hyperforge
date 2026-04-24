@@ -4,7 +4,9 @@ use futures::StreamExt;
 use plexus_core::plexus::{DynamicHub, PlexusStreamItem};
 use hyperforge::{
     HyperforgeEvent, HyperforgeHub, OrgAddFailureReason, OrgUpdateFailureReason, OrgUpdateOp,
+    Transport, TransportChangeFailureReason,
 };
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -541,4 +543,476 @@ async fn test_orgs_update_round_trip_through_orgs_list() {
     assert!(line.contains("/tmp/upd_ws"), "workspace_path missing from list: {}", line);
     assert!(line.contains("github"), "github forge missing from list: {}", line);
     assert!(line.contains("codeberg"), "codeberg forge missing from list: {}", line);
+}
+
+// ---------------------------------------------------------------------------
+// repo init / repo set_transport (TRANSPORT-2)
+// ---------------------------------------------------------------------------
+
+/// Build a scratch git repo dir inside `tmp` and return its path. The dir
+/// is initialised as a git repo so `repo init` has something to wire remotes
+/// against.
+fn fresh_repo_dir(tmp: &TempDir, name: &str) -> std::path::PathBuf {
+    let repo_path = tmp.path().join(name);
+    std::fs::create_dir_all(&repo_path).expect("create repo dir");
+    let out = Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("git init");
+    assert!(out.status.success(), "git init failed: {:?}", out);
+    repo_path
+}
+
+/// Return the fetch URL of a named git remote inside `repo_path`, or None
+/// if the remote doesn't exist. Uses raw `git remote -v` output so we're
+/// reading the same source of truth TRANSPORT-2 asserts on.
+fn remote_fetch_url(repo_path: &std::path::Path, name: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(repo_path)
+        .output()
+        .expect("git remote -v");
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == name && parts[2].contains("fetch") {
+            return Some(parts[1].to_string());
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn test_repo_init_default_transport_is_ssh() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "default-ssh");
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "default-ssh",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, HyperforgeEvent::Error { .. })),
+        "init with no transport flag should not error, got {:?}",
+        events,
+    );
+
+    let url = remote_fetch_url(&repo_path, "origin").expect("origin should exist");
+    assert_eq!(url, "git@github.com:alice/default-ssh.git",
+        "omitting transport must preserve today's SSH default");
+}
+
+#[tokio::test]
+async fn test_repo_init_transport_ssh_produces_ssh_url() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "explicit-ssh");
+
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "explicit-ssh",
+        "transport": "ssh",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+
+    let url = remote_fetch_url(&repo_path, "origin").expect("origin should exist");
+    assert_eq!(url, "git@github.com:alice/explicit-ssh.git");
+}
+
+#[tokio::test]
+async fn test_repo_init_transport_https_produces_https_url() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "explicit-https");
+
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "explicit-https",
+        "transport": "https",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+
+    let url = remote_fetch_url(&repo_path, "origin").expect("origin should exist");
+    assert_eq!(url, "https://github.com/alice/explicit-https.git",
+        "transport=https must write the plain HTTPS URL (no credentials, no auth prefix)");
+    assert!(!url.contains('@'),
+        "HTTPS URL must not embed credentials via user@ prefix");
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_ssh_to_https() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "switch");
+
+    // Initialize as SSH (today's default).
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "switch",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+    assert_eq!(
+        remote_fetch_url(&repo_path, "origin").unwrap(),
+        "git@github.com:alice/switch.git",
+    );
+
+    // Switch to HTTPS.
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "https",
+    })).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            HyperforgeEvent::TransportChanged { transport: Transport::Https, remotes_changed, .. }
+            if remotes_changed.contains(&"origin".to_string())
+        )),
+        "switching should emit TransportChanged with origin in the list, got {:?}",
+        events,
+    );
+
+    // Origin is now HTTPS, and there is no stray SSH URL hanging around.
+    let url = remote_fetch_url(&repo_path, "origin").unwrap();
+    assert_eq!(url, "https://github.com/alice/switch.git");
+    assert!(!url.contains("git@"));
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_idempotent_second_call_is_noop() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "idem");
+
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "idem",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+
+    // First switch to https — actually changes something.
+    let first = drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "https",
+    })).await;
+    assert!(
+        first.iter().any(|e| matches!(e, HyperforgeEvent::TransportChanged { .. })),
+        "first switch should emit TransportChanged, got {:?}",
+        first,
+    );
+
+    // Capture mtime of origin's URL storage (via config file under .git/config)
+    let git_config_path = repo_path.join(".git").join("config");
+    let first_mtime = std::fs::metadata(&git_config_path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // Second switch with the same target — must be idempotent.
+    let second = drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "https",
+    })).await;
+    assert!(
+        second.iter().any(|e| matches!(
+            e,
+            HyperforgeEvent::TransportUnchanged { transport: Transport::Https, .. }
+        )),
+        "second switch to the same transport must emit TransportUnchanged, got {:?}",
+        second,
+    );
+    assert!(
+        !second.iter().any(|e| matches!(
+            e,
+            HyperforgeEvent::TransportChanged { .. } | HyperforgeEvent::Error { .. }
+                | HyperforgeEvent::TransportChangeFailed { .. }
+        )),
+        "idempotent no-op must not emit any change/failure events, got {:?}",
+        second,
+    );
+
+    // Stronger idempotency signal: .git/config mtime must not change.
+    let second_mtime = std::fs::metadata(&git_config_path).unwrap().modified().unwrap();
+    assert_eq!(first_mtime, second_mtime,
+        "idempotent set_transport must not invoke `git remote set-url`, which rewrites .git/config");
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_https_to_ssh() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "back-to-ssh");
+
+    // Initialize as HTTPS.
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "back-to-ssh",
+        "transport": "https",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+    assert_eq!(
+        remote_fetch_url(&repo_path, "origin").unwrap(),
+        "https://github.com/alice/back-to-ssh.git",
+    );
+
+    // Switch to SSH.
+    drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "ssh",
+    })).await;
+
+    assert_eq!(
+        remote_fetch_url(&repo_path, "origin").unwrap(),
+        "git@github.com:alice/back-to-ssh.git",
+    );
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_on_not_initialized_fails_distinguishably() {
+    let (hub, tmp) = test_hub();
+    // A bare git repo with no .hyperforge/config.toml.
+    let repo_path = fresh_repo_dir(&tmp, "bare");
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "https",
+    })).await;
+
+    let failure = events.iter().find_map(|e| match e {
+        HyperforgeEvent::TransportChangeFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    }).expect("set_transport on unregistered repo must fail");
+    assert_eq!(failure, TransportChangeFailureReason::NotInitialized);
+
+    // No remote was created as a side effect.
+    assert!(remote_fetch_url(&repo_path, "origin").is_none());
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_on_missing_path_fails_distinguishably() {
+    let (hub, tmp) = test_hub();
+    let missing = tmp.path().join("does-not-exist");
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": missing.display().to_string(),
+        "transport": "https",
+    })).await;
+
+    let failure = events.iter().find_map(|e| match e {
+        HyperforgeEvent::TransportChangeFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    }).expect("set_transport on missing path must fail");
+    assert_eq!(failure, TransportChangeFailureReason::PathNotFound);
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_unsupported_value_rejected_at_parse() {
+    // Synapse's CLI parser would refuse unknown transports before they
+    // reach the hub, because Transport is a closed-set enum (serde
+    // rename_all = "lowercase"). From Rust we exercise that by feeding
+    // an unknown value through DynamicHub::route — the router should
+    // refuse to deserialize it into the typed parameter.
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "parse-reject");
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "parse-reject",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+
+    // Baseline: origin is the standard SSH URL.
+    let pre = remote_fetch_url(&repo_path, "origin").unwrap();
+
+    let result = hub
+        .route(
+            "hyperforge.repo.set_transport",
+            serde_json::json!({
+                "path": repo_path.display().to_string(),
+                "transport": "ftp",
+            }),
+            None,
+        )
+        .await;
+
+    // The route call MUST fail; alternatively, if it succeeds it MUST
+    // NOT produce any TransportChanged event and the remote must be
+    // untouched. Either shape proves the unknown variant was rejected
+    // at a layer above the actual rewrite.
+    match result {
+        Err(_) => {
+            // Parse rejection — exactly the expected path.
+        }
+        Ok(mut stream) => {
+            let mut events = Vec::new();
+            while let Some(item) = stream.next().await {
+                if let PlexusStreamItem::Data { content, .. } = item {
+                    if let Ok(ev) = serde_json::from_value::<HyperforgeEvent>(content) {
+                        events.push(ev);
+                    }
+                }
+            }
+            assert!(
+                !events.iter().any(|e| matches!(e, HyperforgeEvent::TransportChanged { .. })),
+                "unknown transport must not reach the change path, got {:?}",
+                events,
+            );
+        }
+    }
+
+    // Post-state: the remote is unchanged.
+    let post = remote_fetch_url(&repo_path, "origin").unwrap();
+    assert_eq!(pre, post, "unsupported transport value must not mutate remotes");
+}
+
+#[tokio::test]
+async fn test_repo_status_reports_transport_via_event_stream() {
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "status-tx");
+
+    // Initialise as HTTPS so the assertion below is specific.
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github",
+        "org": "alice",
+        "repo_name": "status-tx",
+        "transport": "https",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.status", serde_json::json!({
+        "path": repo_path.display().to_string(),
+    })).await;
+
+    let reported = events.iter().find_map(|e| match e {
+        HyperforgeEvent::RepoTransport { forge, transport, .. } if forge == "github" => {
+            Some(transport.clone())
+        }
+        _ => None,
+    }).expect("repo status must emit a RepoTransport event for each configured forge");
+    assert_eq!(reported, Some(Transport::Https));
+
+    // Flip transport via the new method and re-read status.
+    drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "ssh",
+    })).await;
+
+    let events2 = drain_hyperforge_events(&hub, "hyperforge.repo.status", serde_json::json!({
+        "path": repo_path.display().to_string(),
+    })).await;
+    let reported2 = events2.iter().find_map(|e| match e {
+        HyperforgeEvent::RepoTransport { forge, transport, .. } if forge == "github" => {
+            Some(transport.clone())
+        }
+        _ => None,
+    }).expect("repo status must re-report transport after a switch");
+    assert_eq!(reported2, Some(Transport::Ssh),
+        "switching transport must be reflected in repo status on the next call");
+}
+
+#[tokio::test]
+async fn test_repo_status_transport_on_pre_existing_repo() {
+    // Simulates a repo that predates the TRANSPORT epic: a
+    // `.hyperforge/config.toml` exists but was written without any
+    // awareness of transport, and `git remote -v` was set up in a
+    // previous era. `repo status` must still report the transport
+    // correctly — read from live `git remote` state, not a cached field.
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "legacy");
+
+    // Hand-craft the .hyperforge/config.toml just like an older init
+    // would have written.
+    let cfg_dir = repo_path.join(".hyperforge");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        r#"org = "alice"
+repo_name = "legacy"
+forges = ["github"]
+visibility = "public"
+"#,
+    ).unwrap();
+
+    // Manually wire origin to an SSH URL (the pre-TRANSPORT default).
+    Command::new("git")
+        .args(["remote", "add", "origin", "git@github.com:alice/legacy.git"])
+        .current_dir(&repo_path)
+        .output()
+        .expect("git remote add");
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.status", serde_json::json!({
+        "path": repo_path.display().to_string(),
+    })).await;
+
+    let reported = events.iter().find_map(|e| match e {
+        HyperforgeEvent::RepoTransport { forge, transport, .. } if forge == "github" => {
+            Some(transport.clone())
+        }
+        _ => None,
+    }).expect("repo status on a pre-TRANSPORT repo must still surface RepoTransport");
+    assert_eq!(reported, Some(Transport::Ssh));
+
+    // And switching works without requiring re-init.
+    drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "https",
+    })).await;
+    assert_eq!(
+        remote_fetch_url(&repo_path, "origin").unwrap(),
+        "https://github.com/alice/legacy.git",
+    );
+}
+
+#[tokio::test]
+async fn test_repo_set_transport_multi_forge_updates_every_remote() {
+    // An init with multiple forges creates `origin` for the first and a
+    // named remote per additional forge. A single set_transport call
+    // must bring *every* managed remote to the requested transport.
+    let (hub, tmp) = test_hub();
+    let repo_path = fresh_repo_dir(&tmp, "multi");
+
+    drain_hyperforge_events(&hub, "hyperforge.repo.init", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "forges": "github,codeberg",
+        "org": "alice",
+        "repo_name": "multi",
+        "no_hooks": true,
+        "no_ssh_wrapper": true,
+    })).await;
+
+    assert!(remote_fetch_url(&repo_path, "origin").unwrap().starts_with("git@"));
+    assert!(remote_fetch_url(&repo_path, "codeberg").unwrap().starts_with("git@"));
+
+    let events = drain_hyperforge_events(&hub, "hyperforge.repo.set_transport", serde_json::json!({
+        "path": repo_path.display().to_string(),
+        "transport": "https",
+    })).await;
+    let changed = events.iter().find_map(|e| match e {
+        HyperforgeEvent::TransportChanged { remotes_changed, .. } => Some(remotes_changed.clone()),
+        _ => None,
+    }).expect("multi-forge switch should emit TransportChanged");
+    assert!(changed.contains(&"origin".to_string()));
+    assert!(changed.contains(&"codeberg".to_string()));
+
+    assert!(remote_fetch_url(&repo_path, "origin").unwrap().starts_with("https://"));
+    assert!(remote_fetch_url(&repo_path, "codeberg").unwrap().starts_with("https://"));
 }
