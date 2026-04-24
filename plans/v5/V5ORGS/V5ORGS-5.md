@@ -1,7 +1,7 @@
 ---
 id: V5ORGS-5
 title: "orgs.delete — remove org yaml with dry_run"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-6, V5CORE-9]
 unlocks: [V5ORGS-9]

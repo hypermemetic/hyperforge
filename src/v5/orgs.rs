@@ -40,6 +40,9 @@ pub enum OrgsEvent {
         credentials: Vec<CredentialEntry>,
         repos: Vec<RepoName>,
     },
+    /// Successful `delete`: names the removed org. `dry_run` echoes the
+    /// request so callers can distinguish preview from real deletion.
+    OrgDeleted { name: OrgName, dry_run: bool },
     /// Generic error event. `code` is drawn from a closed set per method.
     Error { code: String, message: String },
 }
@@ -225,6 +228,58 @@ impl OrgsHub {
                 name: cfg.name,
                 provider: cfg.forge.provider,
                 repo_count: 0,
+            };
+        }
+    }
+
+    /// `orgs.delete` — remove an `orgs/<name>.yaml` from local disk.
+    /// No forge-side deletion (README invariant 4). (V5ORGS-5)
+    #[plexus_macros::method(
+        description = "Delete an org yaml (local filesystem only)",
+        params(
+            org = "Org name",
+            dry_run = "Preview without writing (default false)"
+        )
+    )]
+    pub async fn delete(
+        &self,
+        org: Option<String>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
+        let this = self.clone();
+        stream! {
+            let Some(org) = org else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'org'".into(),
+                };
+                return;
+            };
+            if let Err(e) = validate_org_name(&org) {
+                yield OrgsEvent::Error { code: "invalid_name".into(), message: e };
+                return;
+            }
+            let path = this.org_path(&org);
+            if !path.is_file() {
+                yield OrgsEvent::Error {
+                    code: "not_found".into(),
+                    message: format!("org {org:?} not found"),
+                };
+                return;
+            }
+            let is_dry = dry_run.unwrap_or(false);
+            if !is_dry {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    yield OrgsEvent::Error {
+                        code: "io_error".into(),
+                        message: format!("failed to delete {}: {e}", path.display()),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::OrgDeleted {
+                name: OrgName(org),
+                dry_run: is_dry,
             };
         }
     }
