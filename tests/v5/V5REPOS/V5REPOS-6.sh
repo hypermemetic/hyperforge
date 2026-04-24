@@ -51,10 +51,11 @@ hf_teardown
 hf_spawn
 hf_load_fixture org_with_repo
 hf_cmd repos remove --org demo --name widget >/dev/null
-saved="$HF_CONFIG"
+saved="$(mktemp -d -t hfv5-save-XXXXXX)"
+cp -r "$HF_CONFIG"/. "$saved"/
 hf_teardown
 hf_spawn
-cp -r "$saved"/* "$HF_CONFIG"/
+cp -r "$saved"/. "$HF_CONFIG"/
 listed=$(hf_cmd repos list --org demo)
 echo "$listed" | hf_assert_count '.type == "repo_summary"' 0
 rm -rf "$saved"

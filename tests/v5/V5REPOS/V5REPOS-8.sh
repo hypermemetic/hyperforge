@@ -58,10 +58,11 @@ hf_teardown
 hf_spawn
 hf_load_fixture org_with_mirror_repo
 hf_cmd repos remove_remote --org demo --name widget --url "https://codeberg.org/demo/widget.git" >/dev/null
-saved="$HF_CONFIG"
+saved="$(mktemp -d -t hfv5-save-XXXXXX)"
+cp -r "$HF_CONFIG"/. "$saved"/
 hf_teardown
 hf_spawn
-cp -r "$saved"/* "$HF_CONFIG"/
+cp -r "$saved"/. "$HF_CONFIG"/
 got=$(hf_cmd repos get --org demo --name widget)
 echo "$got" | hf_assert_event '.type == "repo_detail" and (.remotes | length) == 1'
 rm -rf "$saved"

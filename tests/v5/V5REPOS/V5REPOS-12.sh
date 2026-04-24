@@ -38,26 +38,15 @@ hf_teardown
 # --- provider_map hot-swap: remove entry → error; add back → success (no restart) ---
 hf_spawn
 hf_load_fixture org_with_repo
-# Remove github.com entry.
-python3 - "$HF_CONFIG/config.yaml" <<'PY'
-import sys, yaml
-p = sys.argv[1]
-c = yaml.safe_load(open(p)) or {}
-c["provider_map"] = {k: v for k, v in (c.get("provider_map") or {}).items() if k != "github.com"}
-open(p, "w").write(yaml.safe_dump(c))
-PY
+# Remove github.com entry. Fixture shape is known; a targeted sed line
+# removal is sufficient and avoids a yaml-parser dep.
+sed -i '/^[[:space:]]*github\.com:[[:space:]]*github[[:space:]]*$/d' "$HF_CONFIG/config.yaml"
 set +e
 out=$(hf_cmd repos get --org demo --name widget 2>&1)
 set -e
 echo "$out" | hf_assert_event '.type == "error"'
 # Restore and expect success without a respawn.
-python3 - "$HF_CONFIG/config.yaml" <<'PY'
-import sys, yaml
-p = sys.argv[1]
-c = yaml.safe_load(open(p)) or {}
-c.setdefault("provider_map", {})["github.com"] = "github"
-open(p, "w").write(yaml.safe_dump(c))
-PY
+hf_add_provider_map github.com github
 out=$(hf_cmd repos get --org demo --name widget)
 echo "$out" | hf_assert_event '.type == "repo_detail" and .remotes[0].provider == "github"'
 hf_teardown

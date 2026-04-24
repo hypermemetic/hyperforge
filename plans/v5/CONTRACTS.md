@@ -117,7 +117,8 @@ Helpers provided by `tests/v5/harness/lib.sh`:
 | `hf_assert_event <jq_filter>`         | Reads stdin (event stream), asserts at least one event matches the jq filter. Else exit 1.   |
 | `hf_assert_no_event <jq_filter>`      | Same, but asserts NO event matches.                                                           |
 | `hf_assert_count <jq_filter> <n>`     | Asserts exactly `n` events match.                                                             |
-| `hf_teardown`                         | Kills daemon, removes `$HF_CONFIG`. Registered as EXIT trap by `hf_spawn`.                    |
+| `hf_teardown`                         | Kills daemon, removes `$HF_CONFIG`. Registered as EXIT trap by `hf_spawn`. Save/respawn patterns must `cp` to an external tempdir before calling. |
+| `hf_add_provider_map <domain> <prov>` | Appends `<domain>: <provider>` to `$HF_CONFIG/config.yaml` under `provider_map:` (creates the block if absent). Pure bash; no yaml parser required. |
 
 ### Rust runner
 

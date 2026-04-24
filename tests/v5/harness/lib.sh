@@ -132,20 +132,12 @@ hf_spawn() {
 }
 
 # Kill the daemon and remove $HF_CONFIG. Idempotent; safe to call twice.
-#
-# The EXIT-trap path (invoked when the script exits for any reason) also
-# calls this function; we use `$__HF_TRACK_TMP` — a whitespace-separated
-# list of every config dir this script has ever owned — to clean up all
-# of them on exit, not just the currently-active `$HF_CONFIG`. That way
-# tests that capture a path before teardown (e.g. the V5REPOS restart-
-# parity pattern `saved=$HF_CONFIG; hf_teardown; hf_spawn; cp -r $saved
-# ...`) can still read the captured state mid-run, while still getting
-# guaranteed cleanup by the time the script exits.
+# CONTRACTS §harness contract: removes $HF_CONFIG on every invocation.
+# For save/respawn patterns, copy to an external tempdir before teardown.
 hf_teardown() {
     if [[ -n "${HF_PID:-}" ]]; then
         if kill -0 "$HF_PID" 2>/dev/null; then
             kill "$HF_PID" 2>/dev/null || true
-            # Give it a moment to shut down cleanly.
             local t=0
             while (( t < 20 )) && kill -0 "$HF_PID" 2>/dev/null; do
                 sleep 0.1
@@ -157,23 +149,28 @@ hf_teardown() {
         fi
         unset HF_PID
     fi
-    # If invoked from the EXIT trap, purge every tracked temp dir.
-    # Otherwise (explicit mid-script call) keep the dir on disk so the
-    # script can still read it after a subsequent `hf_spawn` rotates
-    # `$HF_CONFIG` to a different path. The EXIT trap catches leaks.
-    if [[ "${__HF_FINAL_EXIT:-0}" == "1" ]]; then
-        for d in ${__HF_TRACK_TMP:-}; do
-            if [[ -n "$d" && -d "$d" ]]; then
-                rm -rf "$d"
-            fi
-        done
-        __HF_TRACK_TMP=""
+    if [[ -n "${HF_CONFIG:-}" && -d "${HF_CONFIG:-}" ]]; then
+        rm -rf "$HF_CONFIG"
     fi
+    unset HF_CONFIG HF_PORT
 }
 
 __hf_exit_trap() {
-    __HF_FINAL_EXIT=1
     hf_teardown
+}
+
+# Append a domain→provider mapping to $HF_CONFIG/config.yaml's
+# provider_map block. Creates the block if missing. Pure bash, no yaml
+# parser required. For shell-level fixture mutation before hf_cmd runs.
+hf_add_provider_map() {
+    local domain="$1"
+    local provider="$2"
+    local cfg="$HF_CONFIG/config.yaml"
+    if [[ -f "$cfg" ]] && grep -q '^provider_map:' "$cfg"; then
+        printf '  %s: %s\n' "$domain" "$provider" >> "$cfg"
+    else
+        printf 'provider_map:\n  %s: %s\n' "$domain" "$provider" >> "$cfg"
+    fi
 }
 
 # Copy a fixture into $HF_CONFIG.
