@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# tier: 1
+set -euo pipefail
+source "$(dirname "$0")/../harness/lib.sh"
+
+# V5LIFECYCLE-2 is a zero-behavior-change refactor. Verify:
+#   (a) the full tier-1 sweep still passes;
+#   (b) no v5 source file outside ops/ and secrets/ uses serde_yaml /
+#       std::fs file I/O directly — all state access goes through
+#       ops::state.
+
+# (a) proxy check: run a trivial end-to-end (status + orgs list).
+hf_spawn
+hf_load_fixture "minimal_org"
+
+hf_cmd status 2>&1 | hf_assert_event '.type == "status"'
+hf_cmd orgs list 2>&1 | hf_assert_event '.type == "org_summary" and .name == "demo"'
+
+hf_teardown
+
+# (b) structural grep — D13 enforcement.
+cd "$(dirname "$0")/../../.."
+violations=$(grep -RE 'serde_yaml::(from_str|to_string|from_reader)|fs::(read_to_string|write|create_dir_all)' src/v5/ 2>/dev/null \
+    | grep -vE '^src/v5/(ops|secrets)/' || true)
+
+if [[ -n "$violations" ]]; then
+    echo "D13 violation — direct state I/O outside ops/ or secrets/:"
+    echo "$violations"
+    exit 1
+fi
+
+echo "PASS"
