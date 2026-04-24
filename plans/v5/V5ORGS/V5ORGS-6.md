@@ -1,7 +1,7 @@
 ---
 id: V5ORGS-6
 title: "orgs.update — patch org provider without clobbering other fields"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-6, V5CORE-9]
 unlocks: [V5ORGS-9]

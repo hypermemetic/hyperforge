@@ -283,6 +283,84 @@ impl OrgsHub {
             };
         }
     }
+
+    /// `orgs.update` — patch the provider on an existing org. Every
+    /// other field (credentials, repos) is preserved byte-equivalent
+    /// through the V5CORE-3 load/save round-trip. Omitting every
+    /// optional field is a typed no-op error, never a silent success.
+    /// (V5ORGS-6)
+    #[plexus_macros::method(
+        description = "Patch org provider without touching credentials or repos",
+        params(
+            org = "Org name",
+            provider = "New forge provider (optional)",
+            dry_run = "Preview without writing (default false)"
+        )
+    )]
+    pub async fn update(
+        &self,
+        org: Option<String>,
+        provider: Option<ProviderKind>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
+        let this = self.clone();
+        stream! {
+            let Some(org) = org else {
+                yield OrgsEvent::Error {
+                    code: "missing_param".into(),
+                    message: "missing required parameter 'org'".into(),
+                };
+                return;
+            };
+            if let Err(e) = validate_org_name(&org) {
+                yield OrgsEvent::Error { code: "invalid_name".into(), message: e };
+                return;
+            }
+            if provider.is_none() {
+                yield OrgsEvent::Error {
+                    code: "no_op".into(),
+                    message: "orgs.update requires at least one optional field to change".into(),
+                };
+                return;
+            }
+            let mut cfg = match read_org(&this.config_dir, &org) {
+                Ok(c) => c,
+                Err(ReadOrgError::NotFound) => {
+                    yield OrgsEvent::Error {
+                        code: "not_found".into(),
+                        message: format!("org {org:?} not found"),
+                    };
+                    return;
+                }
+                Err(ReadOrgError::Io(m)) => {
+                    yield OrgsEvent::Error { code: "io_error".into(), message: m };
+                    return;
+                }
+                Err(ReadOrgError::Parse(m)) => {
+                    yield OrgsEvent::Error { code: "parse_error".into(), message: m };
+                    return;
+                }
+            };
+            if let Some(p) = provider {
+                cfg.forge.provider = p;
+            }
+            let is_dry = dry_run.unwrap_or(false);
+            if !is_dry {
+                if let Err(e) = save_org(&this.orgs_dir(), &cfg) {
+                    yield OrgsEvent::Error {
+                        code: "io_error".into(),
+                        message: format!("{e}"),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::OrgSummary {
+                name: cfg.name,
+                provider: cfg.forge.provider,
+                repo_count: u32::try_from(cfg.repos.len()).unwrap_or(u32::MAX),
+            };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
