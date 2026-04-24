@@ -98,10 +98,11 @@ pub enum WorkspacesEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         remote: Option<crate::v5::adapters::ForgeMetadata>,
     },
-    /// V5WS-9 + V5PROV-8: aggregate across members. `created` counts
-    /// members that were registered locally but absent on the forge
-    /// and were created by this sync call. Invariant:
-    /// `total == in_sync + drifted + errored + created`.
+    /// V5WS-9 + V5PROV-8 + V5LIFECYCLE-10: aggregate across members.
+    /// `created` counts members that were absent on the forge and
+    /// created by this sync call. `skipped` counts members skipped
+    /// (e.g. `lifecycle: dismissed` without `include_dismissed`).
+    /// Invariant: `total == in_sync + drifted + errored + created + skipped`.
     WorkspaceSyncReport {
         name: String,
         total: u32,
@@ -110,7 +111,25 @@ pub enum WorkspacesEvent {
         errored: u32,
         #[serde(default)]
         created: u32,
+        #[serde(default)]
+        skipped: u32,
         per_repo: Vec<serde_json::Value>,
+    },
+    /// V5LIFECYCLE-10: a member was skipped in this sync pass.
+    SyncSkipped {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        reason: String,
+    },
+    /// V5LIFECYCLE-10: a local dir's `.hyperforge/config.toml`
+    /// declares a different identity than the workspace assigns.
+    /// Informational only — the org yaml remains authoritative.
+    ConfigDrift {
+        dir: String,
+        declared_org: String,
+        declared_repo: String,
+        workspace_org: String,
+        workspace_repo: String,
     },
 }
 
@@ -1102,6 +1121,35 @@ impl WorkspacesHub {
                         _ => new_repos.push(entry.clone()),
                     }
                 }
+                // V5LIFECYCLE-10: scan for .hyperforge/config.toml drift.
+                // For each scanned dir, read the file (if any) and
+                // compare its declared identity against the member
+                // this dir resolved to. Informational only — no yaml
+                // mutation happens from this check.
+                for (dname, dpath) in &entries {
+                    if let Ok(Some(hf_cfg)) = crate::v5::ops::fs::read_hyperforge_config(dpath) {
+                        // Find the decision that bound this dir (if any).
+                        let bound = decisions.iter().find(|d| d.dir.as_deref() == Some(dname));
+                        if let Some(dec) = bound {
+                            let m = &members[dec.idx];
+                            let declared_ref = format!("{}/{}", hf_cfg.org.as_str(), hf_cfg.repo_name);
+                            let ws_ref = format!(
+                                "{}/{}",
+                                m.reference.org.as_str(),
+                                m.reference.name.as_str()
+                            );
+                            if declared_ref != ws_ref {
+                                yield WorkspacesEvent::ConfigDrift {
+                                    dir: dname.clone(),
+                                    declared_org: hf_cfg.org.as_str().to_string(),
+                                    declared_repo: hf_cfg.repo_name,
+                                    workspace_org: m.reference.org.as_str().to_string(),
+                                    workspace_repo: m.reference.name.as_str().to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
                 if changed {
                     cfg.repos = new_repos;
                     if let Err(e) = crate::v5::config::save_workspace(&ws_dir, &cfg) {
@@ -1120,12 +1168,23 @@ impl WorkspacesHub {
     /// `WorkspaceSyncReport`. Serial execution; failures per member
     /// are counted and continue (D6). Read-only against forges, org
     /// yamls, workspace yamls, and the on-disk workspace `path`.
-    #[plexus_macros::method(params(name = "Workspace name"))]
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        include_dismissed = "Include members with lifecycle: dismissed (default false)"
+    ))]
     pub async fn sync(
         &self,
         name: String,
+        include_dismissed: Option<serde_json::Value>,
     ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
         let config_dir = self.config_dir.clone();
+        let include_dismissed_flag = include_dismissed
+            .as_ref()
+            .is_some_and(|v| match v {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => matches!(s.as_str(), "true" | "1" | "yes"),
+                _ => false,
+            });
         async_stream::stream! {
             if name.is_empty() {
                 yield WorkspacesEvent::Error {
@@ -1174,6 +1233,7 @@ impl WorkspacesHub {
             let mut drifted = 0u32;
             let mut errored = 0u32;
             let mut created = 0u32;
+            let mut skipped = 0u32;
             let mut per_repo: Vec<serde_json::Value> = Vec::new();
             let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
 
@@ -1241,6 +1301,20 @@ impl WorkspacesHub {
                     yield diff;
                     continue;
                 };
+                // V5LIFECYCLE-10: skip dismissed members unless include_dismissed.
+                if !include_dismissed_flag
+                    && repo.metadata.as_ref().and_then(|m| m.lifecycle)
+                        == Some(crate::v5::config::RepoLifecycle::Dismissed)
+                {
+                    let skip = WorkspacesEvent::SyncSkipped {
+                        reference: wire.clone(),
+                        reason: "dismissed".into(),
+                    };
+                    per_repo.push(serde_json::to_value(&skip).unwrap_or(serde_json::Value::Null));
+                    skipped += 1;
+                    yield skip;
+                    continue;
+                }
                 // Take the first remote as the canonical sync target
                 // (per-member single SyncDiff per the ticket).
                 let Some(remote) = repo.remotes.first() else {
@@ -1401,6 +1475,7 @@ impl WorkspacesHub {
                 drifted,
                 errored,
                 created,
+                skipped,
                 per_repo,
             };
         }

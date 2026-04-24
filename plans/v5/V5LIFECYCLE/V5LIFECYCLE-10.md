@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-10
 title: "workspaces.{reconcile,sync} consult .hyperforge/config.toml"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-6, V5LIFECYCLE-9]
 unlocks: [V5LIFECYCLE-11]

@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-6
 title: "repos.delete — soft semantics per D12 (privatize on remotes, mark dismissed)"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-5]
 unlocks: [V5LIFECYCLE-11]

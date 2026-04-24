@@ -7,6 +7,7 @@
 pub mod adapters;
 pub mod config;
 pub mod hub;
+pub mod ops;
 pub mod orgs;
 pub mod repos;
 pub mod secrets;

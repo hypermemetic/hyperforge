@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::v5::adapters::{
-    extract_host, for_provider, DriftFieldKind, ForgeAuth, ForgeMetadata, ForgePortError,
+    for_provider, DriftFieldKind, ForgeAuth, ForgeMetadata, ForgePortError,
     MetadataFields, ProviderVisibility,
 };
 use crate::v5::config::{
@@ -150,6 +150,65 @@ pub enum RepoEvent {
         error_class: Option<String>,
         message: String,
     },
+    // V5LIFECYCLE-6/7/8/9 events -----------------------------------------
+    /// Emitted by `repos.delete` per-provider when privatization succeeds.
+    ForgePrivatized {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        provider: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+    },
+    /// Emitted by `repos.delete` per-provider when privatization fails.
+    PrivatizeError {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        provider: String,
+        error_class: String,
+        message: String,
+    },
+    /// Emitted at the end of a successful `repos.delete` flow.
+    RepoDismissed {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        privatized_on: Vec<String>,
+        already: bool,
+    },
+    /// Emitted by `repos.purge` per-provider when forge delete succeeds.
+    ForgeDeleted {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        provider: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// Emitted by `repos.purge` per-provider on forge error.
+    PurgeError {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        provider: String,
+        error_class: String,
+        message: String,
+    },
+    /// Emitted at the end of a successful `repos.purge`.
+    RepoPurged {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+    },
+    /// Emitted by `repos.protect`.
+    RepoProtectionSet {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        protected: bool,
+    },
+    /// Emitted by `repos.init`.
+    HyperforgeConfigWritten {
+        path: String,
+        repo_name: String,
+        org: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -215,25 +274,11 @@ impl ReposHub {
 // Provider derivation (V5REPOS-12).
 // ---------------------------------------------------------------------
 
-pub(crate) fn derive_provider(
-    remote: &Remote,
-    provider_map: &BTreeMap<DomainName, ProviderKind>,
-) -> Result<ProviderKind, String> {
-    if let Some(p) = remote.provider {
-        return Ok(p);
-    }
-    let host = extract_host(remote.url.as_str())
-        .ok_or_else(|| format!("cannot extract host from url '{}'", remote.url))?;
-    provider_map
-        .get(&DomainName::from(host.as_str()))
-        .copied()
-        .ok_or_else(|| {
-            format!(
-                "derivation failed for url '{}': host '{}' not in provider_map and no override",
-                remote.url, host
-            )
-        })
-}
+// V5LIFECYCLE-3: relocated to `crate::v5::ops::repo::derive_provider`.
+// Re-exported here so existing callsites in this module and
+// `workspaces.rs` keep their short name without reintroducing a
+// duplicate implementation.
+pub(crate) use crate::v5::ops::repo::derive_provider;
 
 fn remote_to_wire(
     remote: &Remote,
@@ -1197,6 +1242,350 @@ impl ReposHub {
             yield RepoEvent::PushSummary { succeeded, errored, aborted };
         }
     }
+
+    // ==================================================================
+    // V5LIFECYCLE-6: repos.delete — soft (privatize + mark dismissed).
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn delete(
+        &self,
+        org: String,
+        name: String,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            if org.is_empty() || name.is_empty() {
+                yield validation_event("missing required parameter 'org' or 'name'");
+                return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
+            };
+            let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
+            let wire = RepoRefWire::from(&repo_ref);
+            // Protection guard.
+            if repo.metadata.as_ref().and_then(|m| m.protected).unwrap_or(false) {
+                yield RepoEvent::Error {
+                    code: Some("protected".into()),
+                    error_class: None,
+                    message: format!("repo '{name}' is protected; toggle via repos.protect first"),
+                };
+                return;
+            }
+            // Already-dismissed idempotency.
+            let already = repo.metadata.as_ref().and_then(|m| m.lifecycle)
+                == Some(crate::v5::config::RepoLifecycle::Dismissed);
+            if already {
+                let prev: Vec<String> = repo.metadata.as_ref()
+                    .map(|m| m.privatized_on.iter().map(|p| match p {
+                        ProviderKind::Github => "github".to_string(),
+                        ProviderKind::Codeberg => "codeberg".to_string(),
+                        ProviderKind::Gitlab => "gitlab".to_string(),
+                    }).collect())
+                    .unwrap_or_default();
+                yield RepoEvent::RepoDismissed { reference: wire, privatized_on: prev, already: true };
+                return;
+            }
+            // Privatize on every remote.
+            let resolver = YamlSecretStore::new(&config_dir);
+            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let mut privatized: std::collections::BTreeSet<ProviderKind> = std::collections::BTreeSet::new();
+            for r in &repo.remotes {
+                let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
+                    Ok(p) => p,
+                    Err(e) => { yield validation_event(e); continue; }
+                };
+                let provider_s = match provider {
+                    ProviderKind::Github => "github".to_string(),
+                    ProviderKind::Codeberg => "codeberg".to_string(),
+                    ProviderKind::Gitlab => "gitlab".to_string(),
+                };
+                let url_s = r.url.as_str().to_string();
+                if dry {
+                    yield RepoEvent::ForgePrivatized { reference: wire.clone(), provider: provider_s.clone(), url: url_s, dry_run: true };
+                    privatized.insert(provider);
+                    continue;
+                }
+                match crate::v5::ops::repo::privatize_on_forge(r, &repo_ref, &loaded.global.provider_map, &resolver, token_ref).await {
+                    Ok(()) => {
+                        privatized.insert(provider);
+                        yield RepoEvent::ForgePrivatized { reference: wire.clone(), provider: provider_s, url: url_s, dry_run: false };
+                    }
+                    Err(e) => {
+                        yield RepoEvent::PrivatizeError {
+                            reference: wire.clone(),
+                            provider: provider_s,
+                            error_class: e.class.as_str().to_string(),
+                            message: e.message,
+                        };
+                    }
+                }
+            }
+            let priv_list: Vec<String> = privatized.iter().map(|p| match p {
+                ProviderKind::Github => "github".to_string(),
+                ProviderKind::Codeberg => "codeberg".to_string(),
+                ProviderKind::Gitlab => "gitlab".to_string(),
+            }).collect();
+            if !dry {
+                let mut updated = existing.clone();
+                if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                    crate::v5::ops::repo::dismiss(mr, privatized);
+                }
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                    yield cfg_error_event(e); return;
+                }
+            }
+            yield RepoEvent::RepoDismissed { reference: wire, privatized_on: priv_list, already: false };
+        }
+    }
+
+    // ==================================================================
+    // V5LIFECYCLE-7: repos.purge — hard-delete, gated on dismissed.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn purge(
+        &self,
+        org: String,
+        name: String,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            if org.is_empty() || name.is_empty() {
+                yield validation_event("missing required parameter 'org' or 'name'");
+                return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
+            };
+            let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
+            let wire = RepoRefWire::from(&repo_ref);
+            if repo.metadata.as_ref().and_then(|m| m.protected).unwrap_or(false) {
+                yield RepoEvent::Error {
+                    code: Some("protected".into()),
+                    error_class: None,
+                    message: format!("repo '{name}' is protected"),
+                };
+                return;
+            }
+            if repo.metadata.as_ref().and_then(|m| m.lifecycle) != Some(crate::v5::config::RepoLifecycle::Dismissed) {
+                yield RepoEvent::Error {
+                    code: Some("not_dismissed".into()),
+                    error_class: None,
+                    message: "purge requires lifecycle: dismissed; run repos.delete first".into(),
+                };
+                return;
+            }
+            // Forge-delete every remote.
+            let resolver = YamlSecretStore::new(&config_dir);
+            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            for r in &repo.remotes {
+                let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
+                    Ok(p) => p,
+                    Err(e) => { yield validation_event(e); continue; }
+                };
+                let provider_s = match provider {
+                    ProviderKind::Github => "github".to_string(),
+                    ProviderKind::Codeberg => "codeberg".to_string(),
+                    ProviderKind::Gitlab => "gitlab".to_string(),
+                };
+                let url_s = r.url.as_str().to_string();
+                if dry {
+                    yield RepoEvent::ForgeDeleted { reference: wire.clone(), provider: provider_s, url: url_s, note: Some("dry_run".into()) };
+                    continue;
+                }
+                match crate::v5::ops::repo::delete_on_forge(r, &repo_ref, &loaded.global.provider_map, &resolver, token_ref).await {
+                    Ok(()) => yield RepoEvent::ForgeDeleted { reference: wire.clone(), provider: provider_s, url: url_s, note: None },
+                    Err(e) if matches!(e.class, crate::v5::adapters::ForgeErrorClass::NotFound) => {
+                        yield RepoEvent::ForgeDeleted { reference: wire.clone(), provider: provider_s, url: url_s, note: Some("already gone".into()) };
+                    }
+                    Err(e) => {
+                        yield RepoEvent::PurgeError {
+                            reference: wire.clone(),
+                            provider: provider_s,
+                            error_class: e.class.as_str().to_string(),
+                            message: e.message,
+                        };
+                    }
+                }
+            }
+            if !dry {
+                let mut updated = existing.clone();
+                let _ = crate::v5::ops::repo::purge(&mut updated, &RepoName::from(name.as_str()));
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                    yield cfg_error_event(e); return;
+                }
+            }
+            yield RepoEvent::RepoPurged { reference: wire };
+        }
+    }
+
+    // ==================================================================
+    // V5LIFECYCLE-8: repos.protect — toggle protection bit.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        protected = "Target state",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn protect(
+        &self,
+        org: String,
+        name: String,
+        protected: Option<Value>,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            let target = protected.as_ref().is_some_and(|v| to_bool(v, false));
+            if org.is_empty() || name.is_empty() {
+                yield validation_event("missing required parameter 'org' or 'name'");
+                return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            if crate::v5::ops::state::find_repo(existing, &name).is_none() {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
+            }
+            let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
+            let wire = RepoRefWire::from(&repo_ref);
+            if !dry {
+                let mut updated = existing.clone();
+                if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                    let md = mr.metadata.get_or_insert_with(RepoMetadataLocal::default);
+                    md.protected = if target { Some(true) } else { None };
+                }
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                    yield cfg_error_event(e); return;
+                }
+            }
+            yield RepoEvent::RepoProtectionSet { reference: wire, protected: target };
+        }
+    }
+
+    // ==================================================================
+    // V5LIFECYCLE-9: repos.init — write .hyperforge/config.toml.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        target_path = "Repo checkout directory (note: named target_path to avoid synapse's path-autoexpansion)",
+        org = "Owning org",
+        repo_name = "Repo identifier",
+        forges = "JSON array of provider names",
+        default_branch = "Default branch (defaults to main)",
+        visibility = "private|public|internal (default private)",
+        description = "Free-text description",
+        force = "Overwrite existing .hyperforge/config.toml",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn init(
+        &self,
+        target_path: String,
+        org: String,
+        repo_name: String,
+        forges: Option<Value>,
+        default_branch: Option<String>,
+        visibility: Option<String>,
+        description: Option<String>,
+        force: Option<Value>,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            let force_b = force.as_ref().is_some_and(|v| to_bool(v, false));
+            if target_path.is_empty() || org.is_empty() || repo_name.is_empty() {
+                yield validation_event("missing required parameter 'target_path', 'org', or 'repo_name'");
+                return;
+            }
+            let forges_list: Vec<ProviderKind> = match forges.as_ref() {
+                None => vec![ProviderKind::Github],
+                Some(v) => {
+                    let arr = if let Some(s) = v.as_str() {
+                        serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+                    } else if let Some(a) = v.as_array() {
+                        a.iter().filter_map(|e| e.as_str().map(String::from)).collect()
+                    } else { vec![] };
+                    arr.into_iter().filter_map(|s| match s.as_str() {
+                        "github" => Some(ProviderKind::Github),
+                        "codeberg" => Some(ProviderKind::Codeberg),
+                        "gitlab" => Some(ProviderKind::Gitlab),
+                        _ => None,
+                    }).collect()
+                }
+            };
+            let cfg = crate::v5::ops::fs::HyperforgeRepoConfig {
+                repo_name: repo_name.clone(),
+                org: OrgName::from(org.as_str()),
+                forges: forges_list,
+                default_branch: default_branch.or_else(|| Some("main".into())),
+                visibility,
+                description,
+            };
+            let path = std::path::PathBuf::from(&target_path);
+            if dry {
+                yield RepoEvent::HyperforgeConfigWritten {
+                    path: path.join(".hyperforge").join("config.toml").display().to_string(),
+                    repo_name: repo_name.clone(),
+                    org: org.clone(),
+                };
+                return;
+            }
+            match crate::v5::ops::fs::write_hyperforge_config(&path, &cfg, force_b) {
+                Ok(written_path) => {
+                    yield RepoEvent::HyperforgeConfigWritten {
+                        path: written_path.display().to_string(),
+                        repo_name,
+                        org,
+                    };
+                }
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        code: Some(e.code().into()),
+                        error_class: None,
+                        message: e.to_string(),
+                    };
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1241,48 +1630,23 @@ fn metadata_from_local(local: &Option<RepoMetadataLocal>) -> MetadataFields {
     out
 }
 
-pub(crate) fn compute_drift(local: &Option<RepoMetadataLocal>, remote: &ForgeMetadata) -> Vec<DriftField> {
-    let Some(local) = local else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    if let Some(v) = &local.default_branch {
-        if v != &remote.default_branch {
-            out.push(DriftField {
-                field: "default_branch".into(),
-                local: Value::String(v.clone()),
-                remote: Value::String(remote.default_branch.clone()),
-            });
-        }
-    }
-    if let Some(v) = &local.description {
-        if v != &remote.description {
-            out.push(DriftField {
-                field: "description".into(),
-                local: Value::String(v.clone()),
-                remote: Value::String(remote.description.clone()),
-            });
-        }
-    }
-    if let Some(v) = local.archived {
-        if v != remote.archived {
-            out.push(DriftField {
-                field: "archived".into(),
-                local: Value::Bool(v),
-                remote: Value::Bool(remote.archived),
-            });
-        }
-    }
-    if let Some(v) = &local.visibility {
-        if v != &remote.visibility {
-            out.push(DriftField {
-                field: "visibility".into(),
-                local: Value::String(v.clone()),
-                remote: Value::String(remote.visibility.clone()),
-            });
-        }
-    }
-    out
+// V5LIFECYCLE-3: `compute_drift` relocated to `crate::v5::ops::repo`.
+// The local `DriftField` wire type and `ops::repo::DriftField` are
+// structurally identical; we bridge via a thin helper so existing
+// callsites keep the short name + the wire shape this module already
+// serialized.
+pub(crate) fn compute_drift(
+    local: &Option<RepoMetadataLocal>,
+    remote: &ForgeMetadata,
+) -> Vec<DriftField> {
+    crate::v5::ops::repo::compute_drift(local, remote)
+        .into_iter()
+        .map(|d| DriftField {
+            field: d.field,
+            local: d.local,
+            remote: d.remote,
+        })
+        .collect()
 }
 
 // Silence unused-import lint if adapters are only used indirectly.

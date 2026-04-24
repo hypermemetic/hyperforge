@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-2
 title: "ops::state — shared yaml I/O, lookups, atomic mutation"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: [V5LIFECYCLE-3, V5LIFECYCLE-4]

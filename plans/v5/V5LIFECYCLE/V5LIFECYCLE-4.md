@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-4
 title: "ops::repo::{exists,create,delete}_on_forge — the forge-call wrappers"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-3]
 unlocks: [V5LIFECYCLE-5, V5LIFECYCLE-6, V5LIFECYCLE-7]

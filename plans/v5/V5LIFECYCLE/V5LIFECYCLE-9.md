@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-9
 title: "repos.init — write .hyperforge/config.toml in a repo checkout"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-2]
 unlocks: [V5LIFECYCLE-10, V5LIFECYCLE-11]

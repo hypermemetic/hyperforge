@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-3
 title: "ops::repo::sync_one — single pure sync, called by both hubs"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-2]
 unlocks: [V5LIFECYCLE-4]

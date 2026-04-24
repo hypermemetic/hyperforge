@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-5
 title: "RepoLifecycle state + ops::repo::{dismiss, purge}"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-4]
 unlocks: [V5LIFECYCLE-6, V5LIFECYCLE-7, V5LIFECYCLE-8]

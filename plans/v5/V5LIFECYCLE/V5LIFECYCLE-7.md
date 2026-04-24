@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-7
 title: "repos.purge — hard-delete, gated on dismissed"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-4, V5LIFECYCLE-5]
 unlocks: [V5LIFECYCLE-11]

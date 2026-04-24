@@ -1,7 +1,7 @@
 ---
 id: V5LIFECYCLE-8
 title: "repos.protect — toggle protection bit"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5LIFECYCLE-5]
 unlocks: [V5LIFECYCLE-11]
