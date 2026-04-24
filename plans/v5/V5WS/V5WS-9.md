@@ -1,7 +1,7 @@
 ---
 id: V5WS-9
 title: "workspaces.sync — orchestrate repos.sync over members, aggregate WorkspaceSyncReport"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5CORE-3, V5CORE-8, V5CORE-9, V5REPOS-13]
 unlocks: [V5WS-10]

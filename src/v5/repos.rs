@@ -182,7 +182,7 @@ impl ReposHub {
 // Provider derivation (V5REPOS-12).
 // ---------------------------------------------------------------------
 
-fn derive_provider(
+pub(crate) fn derive_provider(
     remote: &Remote,
     provider_map: &BTreeMap<DomainName, ProviderKind>,
 ) -> Result<ProviderKind, String> {
@@ -1017,7 +1017,7 @@ fn metadata_from_local(local: &Option<RepoMetadataLocal>) -> MetadataFields {
     out
 }
 
-fn compute_drift(local: &Option<RepoMetadataLocal>, remote: &ForgeMetadata) -> Vec<DriftField> {
+pub(crate) fn compute_drift(local: &Option<RepoMetadataLocal>, remote: &ForgeMetadata) -> Vec<DriftField> {
     let Some(local) = local else {
         return Vec::new();
     };

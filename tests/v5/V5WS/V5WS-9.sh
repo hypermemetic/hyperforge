@@ -52,6 +52,7 @@ hf_teardown
 # --- zero-member workspace ---
 hf_spawn
 hf_load_fixture "ws_empty"
+mkdir -p "$HF_CONFIG/workspaces"
 cat > "$HF_CONFIG/workspaces/empty-ws.yaml" <<'YAML'
 name: empty-ws
 path: /tmp/hf-v5-empty-ws

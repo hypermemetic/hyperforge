@@ -82,6 +82,31 @@ pub enum WorkspacesEvent {
         code: Option<String>,
         message: String,
     },
+    /// V5WS-9: per-member sync result. Shape parallels
+    /// `RepoEvent::SyncDiff` from V5REPOS-13; one event per workspace
+    /// member repo.
+    SyncDiff {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        status: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        drift: Vec<crate::v5::repos::DriftField>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_class: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote: Option<crate::v5::adapters::ForgeMetadata>,
+    },
+    /// V5WS-9: aggregate across members. Emitted once per call, last.
+    WorkspaceSyncReport {
+        name: String,
+        total: u32,
+        in_sync: u32,
+        drifted: u32,
+        errored: u32,
+        per_repo: Vec<serde_json::Value>,
+    },
 }
 
 /// Validate a `WorkspaceName`: ≤64 chars, ASCII, no `/`, no leading `.`.
@@ -1083,6 +1108,221 @@ impl WorkspacesHub {
                     }
                 }
             }
+        }
+    }
+
+    /// V5WS-9: orchestrate per-member sync, aggregate a
+    /// `WorkspaceSyncReport`. Serial execution; failures per member
+    /// are counted and continue (D6). Read-only against forges, org
+    /// yamls, workspace yamls, and the on-disk workspace `path`.
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn sync(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if name.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            }
+            // Load workspace yaml. Missing workspaces dir is treated
+            // as zero-workspace state, not a config error.
+            let ws_dir = config_dir.join("workspaces");
+            let all_ws = if ws_dir.is_dir() {
+                match crate::v5::config::load_workspaces(&ws_dir) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        yield WorkspacesEvent::Error {
+                            code: Some("config_error".into()),
+                            message: e.to_string(),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            let Some(ws) = all_ws.iter().find(|w| w.1.name.as_str() == name).map(|(_k, v)| v) else {
+                yield WorkspacesEvent::Error {
+                    code: Some("not_found".into()),
+                    message: format!("workspace '{name}' not found"),
+                };
+                return;
+            };
+            // Load orgs for repo lookup + credential resolution.
+            let loaded = match crate::v5::config::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let resolver = crate::v5::secrets::YamlSecretStore::new(&config_dir);
+            let mut in_sync = 0u32;
+            let mut drifted = 0u32;
+            let mut errored = 0u32;
+            let mut per_repo: Vec<serde_json::Value> = Vec::new();
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+
+            for entry in &ws.repos {
+                let (org_s, name_s) = match entry {
+                    crate::v5::config::WorkspaceRepo::Shorthand(s) => {
+                        match s.split_once('/') {
+                            Some((o, n)) => (o.to_string(), n.to_string()),
+                            None => {
+                                let wire = crate::v5::repos::RepoRefWire {
+                                    org: String::new(),
+                                    name: s.clone(),
+                                };
+                                let diff = WorkspacesEvent::SyncDiff {
+                                    reference: wire.clone(),
+                                    url: None,
+                                    status: "errored".into(),
+                                    drift: vec![],
+                                    error_class: Some("validation".into()),
+                                    remote: None,
+                                };
+                                per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));
+                                errored += 1;
+                                yield diff;
+                                continue;
+                            }
+                        }
+                    }
+                    crate::v5::config::WorkspaceRepo::Object { reference, .. } => (
+                        reference.org.as_str().to_string(),
+                        reference.name.as_str().to_string(),
+                    ),
+                };
+                let wire = crate::v5::repos::RepoRefWire {
+                    org: org_s.clone(),
+                    name: name_s.clone(),
+                };
+                // Find the org.
+                let Some(org_cfg) = loaded.orgs.get(&crate::v5::config::OrgName::from(org_s.as_str())) else {
+                    let diff = WorkspacesEvent::SyncDiff {
+                        reference: wire.clone(),
+                        url: None,
+                        status: "errored".into(),
+                        drift: vec![],
+                        error_class: Some("not_found".into()),
+                        remote: None,
+                    };
+                    per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));
+                    errored += 1;
+                    yield diff;
+                    continue;
+                };
+                // Find the repo.
+                let Some(repo) = org_cfg.repos.iter().find(|r| r.name.as_str() == name_s) else {
+                    let diff = WorkspacesEvent::SyncDiff {
+                        reference: wire.clone(),
+                        url: None,
+                        status: "errored".into(),
+                        drift: vec![],
+                        error_class: Some("not_found".into()),
+                        remote: None,
+                    };
+                    per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));
+                    errored += 1;
+                    yield diff;
+                    continue;
+                };
+                // Take the first remote as the canonical sync target
+                // (per-member single SyncDiff per the ticket).
+                let Some(remote) = repo.remotes.first() else {
+                    let diff = WorkspacesEvent::SyncDiff {
+                        reference: wire.clone(),
+                        url: None,
+                        status: "errored".into(),
+                        drift: vec![],
+                        error_class: Some("validation".into()),
+                        remote: None,
+                    };
+                    per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));
+                    errored += 1;
+                    yield diff;
+                    continue;
+                };
+                // Resolve provider + credentials + call adapter.
+                let provider = match crate::v5::repos::derive_provider(remote, &loaded.global.provider_map) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let diff = WorkspacesEvent::SyncDiff {
+                            reference: wire.clone(),
+                            url: Some(remote.url.as_str().to_string()),
+                            status: "errored".into(),
+                            drift: vec![],
+                            error_class: Some("network".into()),
+                            remote: None,
+                        };
+                        per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));
+                        errored += 1;
+                        yield diff;
+                        let _ = e;
+                        continue;
+                    }
+                };
+                let token_ref = org_cfg
+                    .forge
+                    .credentials
+                    .iter()
+                    .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::Token))
+                    .map(|c| c.key.clone());
+                let adapter = crate::v5::adapters::for_provider(provider);
+                let auth = crate::v5::adapters::ForgeAuth {
+                    token_ref: token_ref.as_deref(),
+                    resolver: &resolver,
+                };
+                let repo_ref = crate::v5::config::RepoRef {
+                    org: crate::v5::config::OrgName::from(org_s.as_str()),
+                    name: crate::v5::config::RepoName::from(name_s.as_str()),
+                };
+                let diff = match adapter.read_metadata(remote, &repo_ref, &auth).await {
+                    Ok(meta) => {
+                        let drift = crate::v5::repos::compute_drift(&repo.metadata, &meta);
+                        let status = if drift.is_empty() { "in_sync" } else { "drifted" };
+                        if status == "in_sync" { in_sync += 1; } else { drifted += 1; }
+                        WorkspacesEvent::SyncDiff {
+                            reference: wire.clone(),
+                            url: Some(remote.url.as_str().to_string()),
+                            status: status.into(),
+                            drift,
+                            error_class: None,
+                            remote: Some(meta),
+                        }
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        WorkspacesEvent::SyncDiff {
+                            reference: wire.clone(),
+                            url: Some(remote.url.as_str().to_string()),
+                            status: "errored".into(),
+                            drift: vec![],
+                            error_class: Some(e.class.as_str().to_string()),
+                            remote: None,
+                        }
+                    }
+                };
+                per_repo.push(serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null));
+                yield diff;
+            }
+
+            yield WorkspacesEvent::WorkspaceSyncReport {
+                name: ws.name.as_str().to_string(),
+                total,
+                in_sync,
+                drifted,
+                errored,
+                per_repo,
+            };
         }
     }
 }
