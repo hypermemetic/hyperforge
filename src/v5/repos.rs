@@ -821,6 +821,145 @@ impl ReposHub {
         }
     }
 
+    /// V5PROV-7: `repos.delete`. Complement to `repos.add`; a fresh
+    /// method (not an alias for V5REPOS-6's `remove`) so tests match
+    /// on `.type == "repo_deleted"` / `"remote_deleted"` without
+    /// colliding with `repo_removed`.
+    ///
+    /// Execution order with `delete_remote=true`:
+    /// 1. Validate inputs.
+    /// 2. Call `adapter.delete_repo` against the first remote.
+    ///    - Success → proceed.
+    ///    - `not_found` → drop local anyway (treat as already-gone),
+    ///      emit `remote_deleted` for callers that want to see the
+    ///      cascade shape.
+    ///    - Other error (auth/network/rate_limited) → emit typed
+    ///      error; local entry stays intact.
+    /// 3. Drop local org YAML entry; emit `repo_deleted`.
+    ///
+    /// With `delete_remote=false`, only the local entry is dropped
+    /// and `repo_deleted` is emitted (no `remote_deleted`).
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        delete_remote = "Forge-side delete (default false)",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn delete(
+        &self,
+        org: String,
+        name: String,
+        delete_remote: Option<Value>,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir: Result<PathBuf, String> = Ok(self.config_dir.clone());
+        stream! {
+            let dir = match config_dir {
+                Ok(d) => d,
+                Err(e) => { yield RepoEvent::Error { code: Some("config_error".into()), error_class: None, message: e }; return; }
+            };
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            let forge_delete = delete_remote.as_ref().is_some_and(|v| to_bool(v, false));
+            if org.is_empty() || name.is_empty() {
+                yield validation_event("missing required parameter 'org' or 'name'");
+                return;
+            }
+            let loaded = match load_all(&dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found"));
+                return;
+            };
+            let Some(repo) = find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'"));
+                return;
+            };
+            let repo_ref = RepoRef {
+                org: OrgName::from(org.as_str()),
+                name: RepoName::from(name.as_str()),
+            };
+            let repo_ref_wire = RepoRefWire::from(&repo_ref);
+            let orgs_dir = dir.join("orgs");
+
+            if forge_delete {
+                // Resolve provider for the first remote.
+                let provider_map = loaded.global.provider_map.clone();
+                let Some(first) = repo.remotes.first() else {
+                    yield validation_event(format!(
+                        "repo '{name}' has no remotes; delete_remote requires at least one"
+                    ));
+                    return;
+                };
+                let provider = match derive_provider(first, &provider_map) {
+                    Ok(p) => p,
+                    Err(e) => { yield validation_event(e); return; }
+                };
+                let url_s = first.url.as_str().to_string();
+                if dry {
+                    // Dry run: emit the success event stream without
+                    // forge or disk contact.
+                    yield RepoEvent::RemoteDeleted {
+                        reference: repo_ref_wire.clone(),
+                        url: url_s,
+                    };
+                    yield RepoEvent::RepoDeleted { reference: repo_ref_wire };
+                    return;
+                }
+                let resolver = YamlSecretStore::new(&dir);
+                let token_ref = existing
+                    .forge
+                    .credentials
+                    .iter()
+                    .find(|c| matches!(c.cred_type, CredentialType::Token))
+                    .map(|c| c.key.clone());
+                let auth = ForgeAuth {
+                    token_ref: token_ref.as_deref(),
+                    resolver: &resolver,
+                };
+                let adapter = for_provider(provider);
+                match adapter.delete_repo(first, &repo_ref, &auth).await {
+                    Ok(()) => {
+                        yield RepoEvent::RemoteDeleted {
+                            reference: repo_ref_wire.clone(),
+                            url: url_s,
+                        };
+                    }
+                    Err(e) if matches!(e.class, crate::v5::adapters::ForgeErrorClass::NotFound) => {
+                        // Remote was already gone (deleted out of
+                        // band). Proceed to drop local anyway but
+                        // still emit remote_deleted for cascade shape.
+                        yield RepoEvent::RemoteDeleted {
+                            reference: repo_ref_wire.clone(),
+                            url: url_s,
+                        };
+                    }
+                    Err(e) => {
+                        // auth / network / rate_limited / etc. — do
+                        // NOT drop the local entry.
+                        yield RepoEvent::Error {
+                            code: Some(e.class.as_str().into()),
+                            error_class: Some(e.class.as_str().into()),
+                            message: e.message,
+                        };
+                        return;
+                    }
+                }
+            }
+
+            if !dry {
+                let mut updated = existing.clone();
+                updated.repos.retain(|r| r.name.as_str() != name);
+                if let Err(e) = save_org(&orgs_dir, &updated) {
+                    yield cfg_error_event(e);
+                    return;
+                }
+            }
+            yield RepoEvent::RepoDeleted { reference: repo_ref_wire };
+        }
+    }
+
     /// V5REPOS-7: append a remote.
     #[plexus_macros::method(params(
         org = "Org name",

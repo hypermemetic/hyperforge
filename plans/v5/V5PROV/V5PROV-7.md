@@ -1,7 +1,7 @@
 ---
 id: V5PROV-7
 title: "repos.delete: extend delete_remote to call adapter.delete_repo"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PROV-2, V5PROV-3]
 unlocks: [V5PROV-9]
