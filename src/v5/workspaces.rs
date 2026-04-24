@@ -131,6 +131,23 @@ pub enum WorkspacesEvent {
         workspace_org: String,
         workspace_repo: String,
     },
+    /// V5PARITY-3: per-member result from a workspace-level git op.
+    MemberGitResult {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        op: String, // "clone" | "fetch" | "pull" | "push_refs"
+        status: String, // "ok" | "errored"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// V5PARITY-3: aggregate emitted after a workspace-level git op.
+    WorkspaceGitSummary {
+        name: String,
+        op: String,
+        total: u32,
+        ok: u32,
+        errored: u32,
+    },
     /// V5PARITY-2: per-dir result during `workspaces.discover`.
     /// `status` is `matched` (dir's origin resolves to a known repo),
     /// `orphan` (unknown origin), or `already_member` (a workspace
@@ -1607,6 +1624,164 @@ impl WorkspacesHub {
                 name: ws_name,
                 path: path.clone(),
                 repo_count: u32::try_from(matched_refs.len()).unwrap_or(u32::MAX),
+            };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-3: workspace-parallel git ops (sequential v1).
+    // ==================================================================
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn clone(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.git_op(name, "clone").await
+    }
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn fetch(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.git_op(name, "fetch").await
+    }
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn pull(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.git_op(name, "pull").await
+    }
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn push_all(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.git_op(name, "push_refs").await
+    }
+
+    /// Shared iteration for workspaces.{clone,fetch,pull,push_all}.
+    /// Sequential v1; bounded parallelism deferred to V5PARITY-12.
+    async fn git_op(
+        &self,
+        name: String,
+        op: &'static str,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if name.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            }
+            let ws = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace '{name}' not found"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let mut ok = 0u32;
+            let mut errored = 0u32;
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            for entry in &ws.repos {
+                let (org_s, name_s) = match entry {
+                    crate::v5::config::WorkspaceRepo::Shorthand(s) => {
+                        match s.split_once('/') {
+                            Some((o, n)) => (o.to_string(), n.to_string()),
+                            None => continue,
+                        }
+                    }
+                    crate::v5::config::WorkspaceRepo::Object { reference, .. } => (
+                        reference.org.as_str().to_string(),
+                        reference.name.as_str().to_string(),
+                    ),
+                };
+                let wire = crate::v5::repos::RepoRefWire {
+                    org: org_s.clone(),
+                    name: name_s.clone(),
+                };
+                let dir_name = match entry {
+                    crate::v5::config::WorkspaceRepo::Object { dir, .. } => dir.clone(),
+                    _ => name_s.clone(),
+                };
+                let dir = ws_path.join(&dir_name);
+                let result: Result<(), String> = (|| -> Result<(), String> {
+                    match op {
+                        "clone" => {
+                            let org_cfg = loaded.orgs.get(&crate::v5::config::OrgName::from(org_s.as_str()))
+                                .ok_or_else(|| format!("org '{org_s}' not found"))?;
+                            let repo = crate::v5::ops::state::find_repo(org_cfg, &name_s)
+                                .ok_or_else(|| format!("repo '{name_s}' not found in org '{org_s}'"))?;
+                            let first = repo.remotes.first()
+                                .ok_or_else(|| format!("repo '{name_s}' has no remotes"))?;
+                            crate::v5::ops::git::clone_repo(first.url.as_str(), &dir)
+                                .map_err(|e| e.to_string())
+                        }
+                        "fetch" => crate::v5::ops::git::fetch(&dir, None).map_err(|e| e.to_string()),
+                        "pull" => {
+                            let branch = crate::v5::ops::git::status(&dir).ok()
+                                .and_then(|s| s.branch).unwrap_or_else(|| "main".into());
+                            crate::v5::ops::git::pull_ff(&dir, "origin", &branch).map_err(|e| e.to_string())
+                        }
+                        "push_refs" => crate::v5::ops::git::push_refs(&dir, "origin", None).map_err(|e| e.to_string()),
+                        _ => Err(format!("unknown op: {op}")),
+                    }
+                })();
+                match result {
+                    Ok(()) => {
+                        ok += 1;
+                        yield WorkspacesEvent::MemberGitResult {
+                            reference: wire,
+                            op: op.to_string(),
+                            status: "ok".into(),
+                            message: None,
+                        };
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        yield WorkspacesEvent::MemberGitResult {
+                            reference: wire,
+                            op: op.to_string(),
+                            status: "errored".into(),
+                            message: Some(e),
+                        };
+                    }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(),
+                op: op.to_string(),
+                total,
+                ok,
+                errored,
             };
         }
     }

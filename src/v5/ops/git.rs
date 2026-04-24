@@ -1,0 +1,281 @@
+//! `ops::git` — subprocess wrappers over the user's `git` CLI (V5PARITY-3).
+//!
+//! Per ticket R1: shell out to `git` rather than using libgit2, so the
+//! user's SSH agent / credential helper / hooks / config all flow
+//! through transparently. D13: this is the ONLY module in src/v5/ that
+//! spawns `git` processes; hubs route through these helpers.
+
+use std::path::Path;
+use std::process::Command;
+
+use thiserror::Error;
+
+/// Git operation error. Narrow variants for the cases callers branch
+/// on; `Other` for everything else.
+#[derive(Debug, Error, Clone)]
+pub enum GitError {
+    #[error("git not found on PATH")]
+    GitNotFound,
+    #[error("target path is not a git working tree: {0}")]
+    NotAGitRepo(String),
+    #[error("working tree is dirty: {0}")]
+    DirtyTree(String),
+    #[error("destination already exists: {0}")]
+    DestExists(String),
+    #[error("non-fast-forward — branch has diverged")]
+    NonFastForward,
+    #[error("git command failed ({code}): {stderr}")]
+    CommandFailed { code: i32, stderr: String },
+    #[error("io error: {0}")]
+    Io(String),
+}
+
+impl GitError {
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::GitNotFound => "git_not_found",
+            Self::NotAGitRepo(_) => "not_a_git_repo",
+            Self::DirtyTree(_) => "dirty_tree",
+            Self::DestExists(_) => "dest_exists",
+            Self::NonFastForward => "non_ff",
+            Self::CommandFailed { .. } => "git_failed",
+            Self::Io(_) => "io",
+        }
+    }
+}
+
+/// Parsed output of `git status --porcelain=v2 --branch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub staged: u32,
+    pub unstaged: u32,
+    pub untracked: u32,
+}
+
+impl StatusSnapshot {
+    #[must_use]
+    pub const fn dirty(&self) -> bool {
+        self.staged > 0 || self.unstaged > 0 || self.untracked > 0
+    }
+}
+
+/// `git clone <url> <dest>` with optional transport flip. Refuses if
+/// `dest` already exists.
+pub fn clone_repo(url: &str, dest: &Path) -> Result<(), GitError> {
+    if dest.exists() {
+        return Err(GitError::DestExists(dest.display().to_string()));
+    }
+    run_git(
+        None,
+        &["clone", url, dest.to_str().unwrap_or("")],
+    )
+}
+
+/// `git -C <dir> fetch [<remote>]`. `None` fetches all remotes.
+pub fn fetch(dir: &Path, remote: Option<&str>) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let mut args: Vec<&str> = vec!["-C", dir.to_str().unwrap_or(""), "fetch"];
+    if let Some(r) = remote {
+        args.push(r);
+    } else {
+        args.push("--all");
+    }
+    run_git(None, &args)
+}
+
+/// `git -C <dir> pull --ff-only <remote> <branch>`. Errors with
+/// `DirtyTree` if the tree has uncommitted changes; `NonFastForward`
+/// if the branch has diverged.
+pub fn pull_ff(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    if is_dirty(dir)? {
+        return Err(GitError::DirtyTree(dir.display().to_string()));
+    }
+    match run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "pull", "--ff-only", remote, branch],
+    ) {
+        Ok(()) => Ok(()),
+        Err(GitError::CommandFailed { stderr, .. }) if stderr.contains("Not possible to fast-forward") => {
+            Err(GitError::NonFastForward)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `git -C <dir> push <remote> [<branch>]`.
+pub fn push_refs(dir: &Path, remote: &str, branch: Option<&str>) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let mut args: Vec<&str> = vec!["-C", dir.to_str().unwrap_or(""), "push", remote];
+    if let Some(b) = branch {
+        args.push(b);
+    }
+    run_git(None, &args)
+}
+
+/// `git -C <dir> status --porcelain=v2 --branch` parsed into typed form.
+pub fn status(dir: &Path) -> Result<StatusSnapshot, GitError> {
+    ensure_git_repo(dir)?;
+    let out = run_git_capture(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "status", "--porcelain=v2", "--branch"],
+    )?;
+    Ok(parse_status(&out))
+}
+
+/// Shortcut: `status(dir).dirty`.
+pub fn is_dirty(dir: &Path) -> Result<bool, GitError> {
+    status(dir).map(|s| s.dirty())
+}
+
+/// `git -C <dir> remote set-url <name> <url>`. Idempotent at the git
+/// level: setting to the same URL is a no-op write.
+pub fn set_remote_url(dir: &Path, name: &str, url: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "remote", "set-url", name, url],
+    )
+}
+
+// ---------------------------------------------------------------------
+// Internals.
+// ---------------------------------------------------------------------
+
+fn ensure_git_repo(dir: &Path) -> Result<(), GitError> {
+    let git_dir = dir.join(".git");
+    if !git_dir.exists() {
+        return Err(GitError::NotAGitRepo(dir.display().to_string()));
+    }
+    Ok(())
+}
+
+fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<(), GitError> {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    match cmd.output() {
+        Ok(out) => {
+            if out.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                let code = out.status.code().unwrap_or(-1);
+                Err(GitError::CommandFailed { code, stderr })
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(GitError::GitNotFound),
+        Err(e) => Err(GitError::Io(e.to_string())),
+    }
+}
+
+fn run_git_capture(cwd: Option<&Path>, args: &[&str]) -> Result<String, GitError> {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    match cmd.output() {
+        Ok(out) => {
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                let code = out.status.code().unwrap_or(-1);
+                Err(GitError::CommandFailed { code, stderr })
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(GitError::GitNotFound),
+        Err(e) => Err(GitError::Io(e.to_string())),
+    }
+}
+
+/// Parse `git status --porcelain=v2 --branch` output into a snapshot.
+/// Porcelain v2 format:
+///   # branch.oid <oid>
+///   # branch.head <branch>
+///   # branch.upstream <upstream>
+///   # branch.ab +N -M
+///   1 <status> ... (staged/unstaged)
+///   ? <path>      (untracked)
+fn parse_status(raw: &str) -> StatusSnapshot {
+    let mut branch = None;
+    let mut upstream = None;
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
+    let mut staged = 0u32;
+    let mut unstaged = 0u32;
+    let mut untracked = 0u32;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            branch = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            upstream = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            let mut it = rest.split_whitespace();
+            if let Some(a) = it.next() {
+                ahead = a.trim_start_matches('+').parse().unwrap_or(0);
+            }
+            if let Some(b) = it.next() {
+                behind = b.trim_start_matches('-').parse().unwrap_or(0);
+            }
+        } else if line.starts_with("1 ") || line.starts_with("2 ") {
+            // Ordinary / renamed changed entries. The 2nd field is the
+            // XY status codes: X = staged, Y = unstaged.
+            let fields: Vec<&str> = line.splitn(3, ' ').collect();
+            if fields.len() >= 2 {
+                let xy = fields[1].as_bytes();
+                if xy.first().is_some_and(|&c| c != b'.') {
+                    staged += 1;
+                }
+                if xy.get(1).is_some_and(|&c| c != b'.') {
+                    unstaged += 1;
+                }
+            }
+        } else if line.starts_with("? ") {
+            untracked += 1;
+        }
+    }
+    StatusSnapshot {
+        branch,
+        upstream,
+        ahead,
+        behind,
+        staged,
+        unstaged,
+        untracked,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_status_clean() {
+        let raw = "# branch.oid abc\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n";
+        let s = parse_status(raw);
+        assert_eq!(s.branch.as_deref(), Some("main"));
+        assert_eq!(s.ahead, 0);
+        assert_eq!(s.behind, 0);
+        assert!(!s.dirty());
+    }
+
+    #[test]
+    fn parse_status_dirty() {
+        let raw = "# branch.head main\n# branch.ab +2 -1\n1 M. N... 100644 100644 100644 aaa bbb file1\n? unknown.txt\n";
+        let s = parse_status(raw);
+        assert_eq!(s.ahead, 2);
+        assert_eq!(s.behind, 1);
+        assert_eq!(s.staged, 1);
+        assert_eq!(s.untracked, 1);
+        assert!(s.dirty());
+    }
+}

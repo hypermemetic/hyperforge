@@ -11,3 +11,4 @@
 pub mod state;
 pub mod repo;
 pub mod fs;
+pub mod git;

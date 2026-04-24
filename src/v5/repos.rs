@@ -223,6 +223,54 @@ pub enum RepoEvent {
         added: u32,
         skipped: u32,
     },
+    // V5PARITY-3 git transport events.
+    CloneDone {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        url: String,
+        dest: String,
+    },
+    FetchDone {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+    },
+    PullDone {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remote: String,
+        branch: String,
+    },
+    PushRefsDone {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remote: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
+    RepoStatus {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        upstream: Option<String>,
+        ahead: u32,
+        behind: u32,
+        staged: u32,
+        unstaged: u32,
+        untracked: u32,
+        dirty: bool,
+    },
+    RepoDirty {
+        path: String,
+        dirty: bool,
+    },
+    TransportSet {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        transport: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1649,6 +1697,291 @@ impl ReposHub {
             };
         }
     }
+
+    // ==================================================================
+    // V5PARITY-3: git transport methods.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        dest = "Destination directory (must not exist)"
+    ))]
+    pub async fn clone(
+        &self,
+        org: String,
+        name: String,
+        dest: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() || dest.is_empty() {
+                yield validation_event("missing required parameter 'org', 'name', or 'dest'");
+                return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(org_cfg) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(repo) = crate::v5::ops::state::find_repo(org_cfg, &name) else {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
+            };
+            let Some(first) = repo.remotes.first() else {
+                yield validation_event(format!("repo '{name}' has no remotes")); return;
+            };
+            let dest_path = std::path::PathBuf::from(&dest);
+            let url = first.url.as_str();
+            match crate::v5::ops::git::clone_repo(url, &dest_path) {
+                Ok(()) => yield RepoEvent::CloneDone {
+                    reference: RepoRefWire { org: org.clone(), name: name.clone() },
+                    url: url.to_string(),
+                    dest,
+                },
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()),
+                    error_class: None,
+                    message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(
+        path = "Repo checkout directory",
+        remote = "Optional remote name (default: all remotes)"
+    ))]
+    pub async fn fetch(
+        &self,
+        path: String,
+        remote: Option<String>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            match crate::v5::ops::git::fetch(&dir, remote.as_deref()) {
+                Ok(()) => yield RepoEvent::FetchDone {
+                    reference: RepoRefWire { org: String::new(), name: String::new() },
+                    remote,
+                },
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()),
+                    error_class: None,
+                    message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(
+        path = "Repo checkout directory",
+        remote = "Remote name (default: origin)",
+        branch = "Branch (default: current)"
+    ))]
+    pub async fn pull(
+        &self,
+        path: String,
+        remote: Option<String>,
+        branch: Option<String>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            let r = remote.unwrap_or_else(|| "origin".into());
+            let b = match branch {
+                Some(v) => v,
+                None => match crate::v5::ops::git::status(&dir) {
+                    Ok(s) => s.branch.unwrap_or_else(|| "main".into()),
+                    Err(e) => { yield RepoEvent::Error {
+                        code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                    }; return; }
+                },
+            };
+            match crate::v5::ops::git::pull_ff(&dir, &r, &b) {
+                Ok(()) => yield RepoEvent::PullDone {
+                    reference: RepoRefWire { org: String::new(), name: String::new() },
+                    remote: r,
+                    branch: b,
+                },
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()),
+                    error_class: None,
+                    message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(
+        path = "Repo checkout directory",
+        remote = "Remote name (default: origin)",
+        branch = "Branch (default: current)"
+    ))]
+    pub async fn push_refs(
+        &self,
+        path: String,
+        remote: Option<String>,
+        branch: Option<String>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            let r = remote.unwrap_or_else(|| "origin".into());
+            match crate::v5::ops::git::push_refs(&dir, &r, branch.as_deref()) {
+                Ok(()) => yield RepoEvent::PushRefsDone {
+                    reference: RepoRefWire { org: String::new(), name: String::new() },
+                    remote: r,
+                    branch,
+                },
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()),
+                    error_class: None,
+                    message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(path = "Repo checkout directory"))]
+    pub async fn status(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            match crate::v5::ops::git::status(&dir) {
+                Ok(s) => {
+                    let dirty = s.dirty();
+                    yield RepoEvent::RepoStatus {
+                        path,
+                        branch: s.branch,
+                        upstream: s.upstream,
+                        ahead: s.ahead,
+                        behind: s.behind,
+                        staged: s.staged,
+                        unstaged: s.unstaged,
+                        untracked: s.untracked,
+                        dirty,
+                    }
+                }
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(path = "Repo checkout directory"))]
+    pub async fn dirty(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            match crate::v5::ops::git::is_dirty(&dir) {
+                Ok(d) => yield RepoEvent::RepoDirty { path, dirty: d },
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        transport = "ssh | https",
+        path = "Optional checkout directory; if given, .git/config is updated too"
+    ))]
+    pub async fn set_transport(
+        &self,
+        org: String,
+        name: String,
+        transport: String,
+        path: Option<String>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() || transport.is_empty() {
+                yield validation_event("missing required parameter 'org', 'name', or 'transport'"); return;
+            }
+            match transport.as_str() {
+                "ssh" | "https" => {}
+                other => { yield validation_event(format!("unknown transport: {other}")); return; }
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(_) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
+            };
+            // Flip URL forms in org yaml.
+            let mut updated = existing.clone();
+            if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                for r in &mut mr.remotes {
+                    let new_url = flip_transport(r.url.as_str(), &transport);
+                    r.url = crate::v5::config::RemoteUrl::from(new_url.as_str());
+                }
+            }
+            let orgs_dir = config_dir.join("orgs");
+            if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                yield cfg_error_event(e); return;
+            }
+            // Update .git/config if a path was given.
+            if let Some(p) = path.as_ref() {
+                let dir = std::path::PathBuf::from(p);
+                if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated.clone(), &name) {
+                    if let Some(first) = mr.remotes.first() {
+                        let _ = crate::v5::ops::git::set_remote_url(&dir, "origin", first.url.as_str());
+                    }
+                }
+            }
+            yield RepoEvent::TransportSet {
+                reference: RepoRefWire { org, name },
+                transport,
+            };
+        }
+    }
+}
+
+/// Flip a git URL's transport form. Best-effort: recognizes the
+/// GitHub/GitLab/Codeberg patterns and rewrites; returns input
+/// unchanged for URLs it can't interpret.
+fn flip_transport(url: &str, to: &str) -> String {
+    // git@host:org/name.git  ↔  https://host/org/name.git
+    if let Some(rest) = url.strip_prefix("git@") {
+        if let Some((host, path)) = rest.split_once(':') {
+            if to == "https" {
+                return format!("https://{host}/{path}");
+            }
+        }
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        if let Some((host, path)) = rest.split_once('/') {
+            if to == "ssh" {
+                return format!("git@{host}:{path}");
+            }
+        }
+    }
+    url.to_string()
 }
 
 // ---------------------------------------------------------------------
