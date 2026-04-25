@@ -394,4 +394,30 @@ impl ForgePort for GitlabAdapter {
         }
         Ok(items)
     }
+
+    async fn rename_repo(
+        &self,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        new_name: &str,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError> {
+        let token = Self::token(auth).await?;
+        let host = Self::host_for(remote)?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = Self::project_url(&host, repo_ref);
+        let body = serde_json::json!({"name": new_name, "path": new_name});
+        let resp = client
+            .put(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("put {url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() { return Ok(()); }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
+    }
 }

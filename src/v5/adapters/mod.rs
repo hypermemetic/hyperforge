@@ -323,6 +323,17 @@ pub trait ForgePort: Send + Sync {
         org: &crate::v5::config::OrgName,
         auth: &ForgeAuth<'_>,
     ) -> Result<Vec<RemoteRepo>, ForgePortError>;
+
+    /// V5PARITY-6: rename a repo on the forge. The repo's URL changes
+    /// after this call; callers update yaml + .git/config remote URLs
+    /// as a follow-up.
+    async fn rename_repo(
+        &self,
+        remote: &Remote,
+        repo_ref: &RepoRef,
+        new_name: &str,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError>;
 }
 
 // ---------------------------------------------------------------------

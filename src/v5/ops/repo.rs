@@ -184,6 +184,23 @@ pub async fn delete_on_forge(
     adapter.delete_repo(remote, repo_ref, &auth).await
 }
 
+/// V5PARITY-6: rename a repo on the forge.
+pub async fn rename_on_forge(
+    remote: &Remote,
+    repo_ref: &RepoRef,
+    new_name: &str,
+    provider_map: &BTreeMap<DomainName, ProviderKind>,
+    resolver: &dyn SecretResolver,
+    token_ref: Option<&str>,
+) -> Result<(), ForgePortError> {
+    let provider = derive_provider(remote, provider_map).map_err(|e| {
+        ForgePortError::new(ForgeErrorClass::Network, e)
+    })?;
+    let adapter = for_provider(provider);
+    let auth = ForgeAuth { token_ref, resolver };
+    adapter.rename_repo(remote, repo_ref, new_name, &auth).await
+}
+
 /// V5PARITY-2: list repos on a forge for an org. `provider` is
 /// supplied explicitly because there's no per-repo `Remote` yet at
 /// import time.

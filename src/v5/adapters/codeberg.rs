@@ -400,6 +400,31 @@ impl ForgePort for CodebergAdapter {
         }
         Ok(items)
     }
+
+    async fn rename_repo(
+        &self,
+        _remote: &Remote,
+        repo_ref: &RepoRef,
+        new_name: &str,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<(), ForgePortError> {
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = self.api_url(repo_ref);
+        let body = serde_json::json!({"name": new_name});
+        let resp = client
+            .patch(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("patch {url}: {e}")))?;
+        let status = resp.status();
+        if status.is_success() { return Ok(()); }
+        let b = resp.text().await.unwrap_or_default();
+        Err(Self::map_status_error(status, &b))
+    }
 }
 
 fn push_gitea_items(items: &mut Vec<crate::v5::adapters::RemoteRepo>, body: &serde_json::Value) {

@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-6
 title: "LIFECYCLE-EXT — rename, set_default_branch, set_archived + workspace variants"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PARITY-2]
 unlocks: [V5PARITY-12]

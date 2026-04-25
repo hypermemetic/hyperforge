@@ -271,6 +271,21 @@ pub enum RepoEvent {
         reference: RepoRefWire,
         transport: String,
     },
+    // V5PARITY-6 lifecycle events.
+    RepoRenamed {
+        old_ref: RepoRefWire,
+        new_ref: RepoRefWire,
+    },
+    DefaultBranchSet {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        branch: String,
+    },
+    ArchivedSet {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        archived: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1957,6 +1972,232 @@ impl ReposHub {
             yield RepoEvent::TransportSet {
                 reference: RepoRefWire { org, name },
                 transport,
+            };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-6: rename / set_default_branch / set_archived.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Current repo name",
+        new_name = "New repo name on forge AND in yaml"
+    ))]
+    pub async fn rename(
+        &self,
+        org: String,
+        name: String,
+        new_name: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() || new_name.is_empty() {
+                yield validation_event("missing required parameter 'org', 'name', or 'new_name'"); return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
+            };
+            let Some(first) = repo.remotes.first() else {
+                yield validation_event(format!("repo '{name}' has no remotes")); return;
+            };
+            let resolver = YamlSecretStore::new(&config_dir);
+            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let repo_ref = RepoRef {
+                org: OrgName::from(org.as_str()),
+                name: RepoName::from(name.as_str()),
+            };
+            // Forge call first.
+            if let Err(e) = crate::v5::ops::repo::rename_on_forge(
+                first, &repo_ref, &new_name, &loaded.global.provider_map, &resolver, token_ref,
+            ).await {
+                yield RepoEvent::Error {
+                    code: Some(e.class.as_str().into()),
+                    error_class: Some(e.class.as_str().into()),
+                    message: e.message,
+                };
+                return;
+            }
+            // Update org yaml: rename the repo entry. Remote URLs that
+            // include `/<old_name>` get path-rewritten too.
+            let mut updated = existing.clone();
+            if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                mr.name = RepoName::from(new_name.as_str());
+                for r in &mut mr.remotes {
+                    let new_url = r.url.as_str()
+                        .replace(&format!("/{name}.git"), &format!("/{new_name}.git"))
+                        .replace(&format!("/{name}/"), &format!("/{new_name}/"));
+                    r.url = crate::v5::config::RemoteUrl::from(new_url.as_str());
+                }
+            }
+            let orgs_dir = config_dir.join("orgs");
+            if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                yield cfg_error_event(e); return;
+            }
+            // Walk every workspace yaml; rewrite refs that pointed at the old name.
+            let ws_dir = config_dir.join("workspaces");
+            if ws_dir.is_dir() {
+                if let Ok(all_ws) = crate::v5::ops::state::load_workspaces(&ws_dir) {
+                    for (_, mut ws) in all_ws {
+                        let mut changed = false;
+                        for entry in &mut ws.repos {
+                            match entry {
+                                crate::v5::config::WorkspaceRepo::Shorthand(s) => {
+                                    if *s == format!("{org}/{name}") {
+                                        *s = format!("{org}/{new_name}");
+                                        changed = true;
+                                    }
+                                }
+                                crate::v5::config::WorkspaceRepo::Object { reference, .. } => {
+                                    if reference.org.as_str() == org && reference.name.as_str() == name {
+                                        reference.name = RepoName::from(new_name.as_str());
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        if changed {
+                            let _ = crate::v5::ops::state::save_workspace(&ws_dir, &ws);
+                        }
+                    }
+                }
+            }
+            yield RepoEvent::RepoRenamed {
+                old_ref: RepoRefWire { org: org.clone(), name: name.clone() },
+                new_ref: RepoRefWire { org, name: new_name },
+            };
+        }
+    }
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        branch = "Default branch"
+    ))]
+    pub async fn set_default_branch(
+        &self,
+        org: String,
+        name: String,
+        branch: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() || branch.is_empty() {
+                yield validation_event("missing required parameter"); return;
+            }
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found")); return;
+            };
+            let Some(first) = repo.remotes.first() else {
+                yield validation_event("no remotes"); return;
+            };
+            let resolver = YamlSecretStore::new(&config_dir);
+            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let repo_ref = RepoRef {
+                org: OrgName::from(org.as_str()),
+                name: RepoName::from(name.as_str()),
+            };
+            let mut fields: MetadataFields = std::collections::BTreeMap::new();
+            fields.insert(DriftFieldKind::DefaultBranch, serde_json::Value::String(branch.clone()));
+            if let Err(e) = crate::v5::ops::repo::write_metadata_on_forge(
+                first, &repo_ref, &fields, &loaded.global.provider_map, &resolver, token_ref,
+            ).await {
+                yield RepoEvent::Error {
+                    code: Some(e.class.as_str().into()),
+                    error_class: Some(e.class.as_str().into()),
+                    message: e.message,
+                };
+                return;
+            }
+            // Mirror to local metadata.
+            let mut updated = existing.clone();
+            if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                let md = mr.metadata.get_or_insert_with(RepoMetadataLocal::default);
+                md.default_branch = Some(branch.clone());
+            }
+            let orgs_dir = config_dir.join("orgs");
+            if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                yield cfg_error_event(e); return;
+            }
+            yield RepoEvent::DefaultBranchSet {
+                reference: RepoRefWire { org, name },
+                branch,
+            };
+        }
+    }
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        archived = "true to archive, false to unarchive"
+    ))]
+    pub async fn set_archived(
+        &self,
+        org: String,
+        name: String,
+        archived: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() {
+                yield validation_event("missing required parameter"); return;
+            }
+            let target = archived.as_ref().is_some_and(|v| to_bool(v, false));
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found")); return;
+            };
+            let Some(first) = repo.remotes.first() else {
+                yield validation_event("no remotes"); return;
+            };
+            let resolver = YamlSecretStore::new(&config_dir);
+            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let repo_ref = RepoRef {
+                org: OrgName::from(org.as_str()),
+                name: RepoName::from(name.as_str()),
+            };
+            let mut fields: MetadataFields = std::collections::BTreeMap::new();
+            fields.insert(DriftFieldKind::Archived, serde_json::Value::Bool(target));
+            if let Err(e) = crate::v5::ops::repo::write_metadata_on_forge(
+                first, &repo_ref, &fields, &loaded.global.provider_map, &resolver, token_ref,
+            ).await {
+                yield RepoEvent::Error {
+                    code: Some(e.class.as_str().into()),
+                    error_class: Some(e.class.as_str().into()),
+                    message: e.message,
+                };
+                return;
+            }
+            let mut updated = existing.clone();
+            if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                let md = mr.metadata.get_or_insert_with(RepoMetadataLocal::default);
+                md.archived = Some(target);
+            }
+            let orgs_dir = config_dir.join("orgs");
+            if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                yield cfg_error_event(e); return;
+            }
+            yield RepoEvent::ArchivedSet {
+                reference: RepoRefWire { org, name },
+                archived: target,
             };
         }
     }
