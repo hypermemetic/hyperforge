@@ -322,11 +322,11 @@ impl BuildHub {
             };
             for (r, dir) in members {
                 // Pull the Cargo.toml at both refs via `git show`.
-                let from_raw = match git_show(&dir, &from_ref, "Cargo.toml") {
+                let from_raw = match crate::v5::ops::git::show(&dir, &from_ref, "Cargo.toml") {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                let to_raw = match git_show(&dir, &to_ref, "Cargo.toml") {
+                let to_raw = match crate::v5::ops::git::show(&dir, &to_ref, "Cargo.toml") {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
@@ -388,16 +388,10 @@ impl BuildHub {
             if let Err(e) = std::fs::write(&cargo, new_text) {
                 yield err("io", e.to_string()); return;
             }
-            // Commit + tag.
-            let _ = std::process::Command::new("git").args(["-C", dir.to_str().unwrap_or("")]).args(["add", "Cargo.toml"]).status();
-            let _ = std::process::Command::new("git")
-                .args(["-C", dir.to_str().unwrap_or("")])
-                .args(["commit", "-m", &format!("chore: bump version to {new}")])
-                .status();
-            let _ = std::process::Command::new("git")
-                .args(["-C", dir.to_str().unwrap_or("")])
-                .args(["tag", &format!("v{new}")])
-                .status();
+            // Commit + tag via ops::git (D13).
+            let _ = crate::v5::ops::git::add(&dir, &["Cargo.toml"]);
+            let _ = crate::v5::ops::git::commit(&dir, &format!("chore: bump version to {new}"));
+            let _ = crate::v5::ops::git::tag(&dir, &format!("v{new}"));
             yield BuildEvent::VersionBumped {
                 reference: crate::v5::repos::RepoRefWire { org, name },
                 old, new,
@@ -487,16 +481,10 @@ impl BuildHub {
             if let Err(e) = std::fs::write(&cargo, new_text) {
                 yield err("io", e.to_string()); return;
             }
-            let git = |args: &[&str]| {
-                let _ = std::process::Command::new("git")
-                    .args(["-C", dir.to_str().unwrap_or("")])
-                    .args(args)
-                    .status();
-            };
-            git(&["add", "Cargo.toml"]);
-            git(&["commit", "-m", &format!("chore: bump version to {new}")]);
+            let _ = crate::v5::ops::git::add(&dir, &["Cargo.toml"]);
+            let _ = crate::v5::ops::git::commit(&dir, &format!("chore: bump version to {new}"));
             let tag = format!("v{new}");
-            git(&["tag", &tag]);
+            let _ = crate::v5::ops::git::tag(&dir, &tag);
             yield BuildEvent::VersionBumped {
                 reference: crate::v5::repos::RepoRefWire { org: org.clone(), name: name.clone() },
                 old, new,
@@ -511,10 +499,7 @@ impl BuildHub {
             if let Err(e) = crate::v5::ops::git::push_refs(&dir, "origin", Some(&branch)) {
                 yield err(e.code(), e.to_string()); return;
             }
-            let _ = std::process::Command::new("git")
-                .args(["-C", dir.to_str().unwrap_or("")])
-                .args(["push", "origin", &tag])
-                .status();
+            let _ = crate::v5::ops::git::push_ref(&dir, "origin", &tag);
             // Publish is tier-2; run only if channel given.
             if let Some(ch) = channel {
                 let resolver = crate::v5::secrets::YamlSecretStore::new(&config_dir);
@@ -564,15 +549,9 @@ impl BuildHub {
                 match release::bump_cargo_toml(&raw, "patch") {
                     Ok((old, new, new_text)) => {
                         if std::fs::write(&cargo, new_text).is_err() { errored += 1; continue; }
-                        let _ = std::process::Command::new("git").args(["-C", dir.to_str().unwrap_or(""), "add", "Cargo.toml"]).status();
-                        let _ = std::process::Command::new("git")
-                            .args(["-C", dir.to_str().unwrap_or("")])
-                            .args(["commit", "-m", &format!("chore: bump version to {new}")])
-                            .status();
-                        let _ = std::process::Command::new("git")
-                            .args(["-C", dir.to_str().unwrap_or("")])
-                            .args(["tag", &format!("v{new}")])
-                            .status();
+                        let _ = crate::v5::ops::git::add(dir, &["Cargo.toml"]);
+                        let _ = crate::v5::ops::git::commit(dir, &format!("chore: bump version to {new}"));
+                        let _ = crate::v5::ops::git::tag(dir, &format!("v{new}"));
                         ok += 1;
                         yield BuildEvent::VersionBumped { reference: r.clone(), old, new };
                     }
@@ -795,23 +774,6 @@ impl BuildHub {
     }
 }
 
-/// `git show <ref>:<path>` against `dir`. Returns the file contents as
-/// seen at that commit.
-fn git_show(dir: &std::path::Path, rev: &str, path: &str) -> Result<String, crate::v5::ops::git::GitError> {
-    let out = std::process::Command::new("git")
-        .args(["-C", dir.to_str().unwrap_or("")])
-        .args(["show", &format!("{rev}:{path}")])
-        .output()
-        .map_err(|e| crate::v5::ops::git::GitError::Io(e.to_string()))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(crate::v5::ops::git::GitError::CommandFailed {
-            code: out.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
-    }
-}
 
 /// Minimal shell-escape: single-quote the value; escape embedded quotes.
 fn shell_escape(s: &str) -> String {

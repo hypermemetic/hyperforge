@@ -387,7 +387,7 @@ pub async fn sync_one(
 /// with `ops::state::save_org`.
 pub fn dismiss(repo: &mut OrgRepo, privatized: BTreeSet<ProviderKind>) {
     let md = repo.metadata.get_or_insert_with(RepoMetadataLocal::default);
-    md.lifecycle = Some(crate::v5::config::RepoLifecycle::Dismissed);
+    md.lifecycle = crate::v5::config::RepoLifecycle::Dismissed;
     md.privatized_on.extend(privatized);
 }
 
@@ -402,12 +402,12 @@ pub fn purge(org: &mut OrgConfig, name: &RepoName) -> Result<(), PurgeError> {
         .ok_or(PurgeError::NotFound)?;
     let repo = &org.repos[idx];
     let md = repo.metadata.as_ref();
-    let protected = md.and_then(|m| m.protected).unwrap_or(false);
+    let protected = md.is_some_and(|m| m.protected);
     if protected {
         return Err(PurgeError::Protected);
     }
-    let lifecycle = md.and_then(|m| m.lifecycle);
-    if lifecycle != Some(crate::v5::config::RepoLifecycle::Dismissed) {
+    let lifecycle = md.map_or(crate::v5::config::RepoLifecycle::Active, |m| m.lifecycle);
+    if lifecycle != crate::v5::config::RepoLifecycle::Dismissed {
         return Err(PurgeError::NotDismissed);
     }
     org.repos.remove(idx);

@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-12
 title: "CLEANUP — data-structure tightenings + parallel-test harness + residuals"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PARITY-2, V5PARITY-3, V5PARITY-4, V5PARITY-5, V5PARITY-6, V5PARITY-7, V5PARITY-8, V5PARITY-9, V5PARITY-10, V5PARITY-11]
 unlocks: [V5PARITY-13]

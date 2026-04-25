@@ -190,24 +190,50 @@ pub struct RepoMetadataLocal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     /// `active` (normal) | `dismissed` (soft-deleted). `purged` is a
-    /// transient — a purged repo is removed from the org yaml.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<RepoLifecycle>,
+    /// transient — a purged repo is removed from the org yaml. The
+    /// default is `Active`; serialized as absent so repos that never
+    /// went through soft-delete stay byte-identical on round-trip.
+    #[serde(default, skip_serializing_if = "RepoLifecycle::is_default")]
+    pub lifecycle: RepoLifecycle,
     /// Providers where privatization succeeded during soft-delete.
     /// Empty set → serialized as absent (skip_serializing_if).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub privatized_on: std::collections::BTreeSet<ProviderKind>,
     /// When true, `repos.delete` and `repos.purge` refuse this repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protected: Option<bool>,
+    /// Default false is serialized as absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub protected: bool,
 }
 
-/// Lifecycle phases a repo can occupy. See D12.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Lifecycle phases a repo can occupy. See D12. `Active` is the
+/// default — V5PARITY-12 upgraded this from `Option<RepoLifecycle>` to
+/// a required field so "unset vs Active" is no longer representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoLifecycle {
+    #[default]
     Active,
     Dismissed,
+}
+
+impl RepoLifecycle {
+    /// Used by `RepoMetadataLocal` via `skip_serializing_if` to keep
+    /// `Active` (the default) absent on the wire.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+impl OrgRepo {
+    /// The canonical / primary remote — by position, `remotes[0]`.
+    /// v5 doesn't model primary/mirror as a type-level split; the
+    /// position convention is enforced via this helper so the intent
+    /// is visible at call sites.
+    #[must_use]
+    pub fn canonical_remote(&self) -> Option<&Remote> {
+        self.remotes.first()
+    }
 }
 
 /// A workspace entry, either a string shorthand `<org>/<name>` or a

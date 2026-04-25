@@ -1323,8 +1323,8 @@ impl WorkspacesHub {
                 };
                 // V5LIFECYCLE-10: skip dismissed members unless include_dismissed.
                 if !include_dismissed_flag
-                    && repo.metadata.as_ref().and_then(|m| m.lifecycle)
-                        == Some(crate::v5::config::RepoLifecycle::Dismissed)
+                    && repo.metadata.as_ref().map_or(crate::v5::config::RepoLifecycle::Active, |m| m.lifecycle)
+                        == crate::v5::config::RepoLifecycle::Dismissed
                 {
                     let skip = WorkspacesEvent::SyncSkipped {
                         reference: wire.clone(),

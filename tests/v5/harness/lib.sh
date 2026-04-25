@@ -70,15 +70,20 @@ __hf_find_bin() {
     command -v hyperforge-v5 || return 1
 }
 
-# Pick a free ephemeral TCP port. Uses python3 since it's available on
-# the target platform; python3 is also used by several test scripts.
+# Pick a free ephemeral TCP port. V5PARITY-12: we set SO_REUSEADDR so
+# the daemon can bind the same port in the TOCTOU window between close
+# and daemon spawn; without this, parallel `cargo test` runs raced each
+# other on the OS's port allocation and produced flaky failures in
+# v5core_10 / v5lifecycle_8 / v5orgs_4 / v5repos_4.
 __hf_pick_port() {
     python3 -c '
 import socket
-s = socket.socket()
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
+port = s.getsockname()[1]
 s.close()
+print(port)
 '
 }
 

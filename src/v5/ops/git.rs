@@ -156,6 +156,61 @@ pub fn set_remote_url(dir: &Path, name: &str, url: &str) -> Result<(), GitError>
 }
 
 // ---------------------------------------------------------------------
+// V5PARITY-10: commit + tag helpers. Routing build-release through
+// ops::git keeps D13's "one subprocess entry point" invariant; see
+// V5LIFECYCLE-11's `command-git` DRY grep.
+// ---------------------------------------------------------------------
+
+/// `git -C <dir> add <path>`. Accepts one or more paths.
+pub fn add(dir: &Path, paths: &[&str]) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let mut args: Vec<&str> = vec!["-C", dir.to_str().unwrap_or(""), "add"];
+    args.extend_from_slice(paths);
+    run_git(None, &args)
+}
+
+/// `git -C <dir> commit -m <message>`. Fails with `CommandFailed` if
+/// there's nothing staged; callers that want "commit if there's
+/// anything to commit" should check `status()` first.
+pub fn commit(dir: &Path, message: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "commit", "-m", message],
+    )
+}
+
+/// `git -C <dir> tag <name>`. Lightweight tag.
+pub fn tag(dir: &Path, name: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "tag", name],
+    )
+}
+
+/// `git -C <dir> push <remote> <refspec>`. Used by V5PARITY-10's
+/// release flow to push both branch and tag. `push_refs` pushes all
+/// refs; `push_ref` is explicit.
+pub fn push_ref(dir: &Path, remote: &str, refspec: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "push", remote, refspec],
+    )
+}
+
+/// `git -C <dir> show <rev>:<path>`. Returns the file contents as
+/// seen at `rev`. Used by V5PARITY-9's `build.package_diff`.
+pub fn show(dir: &Path, rev: &str, path: &str) -> Result<String, GitError> {
+    ensure_git_repo(dir)?;
+    run_git_capture(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "show", &format!("{rev}:{path}")],
+    )
+}
+
+// ---------------------------------------------------------------------
 // V5PARITY-5: per-repo SSH command.
 //
 // Writes `core.sshCommand = ssh -i <key> -o IdentitiesOnly=yes` into

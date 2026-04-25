@@ -1336,7 +1336,7 @@ impl ReposHub {
             let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
             let wire = RepoRefWire::from(&repo_ref);
             // Protection guard.
-            if repo.metadata.as_ref().and_then(|m| m.protected).unwrap_or(false) {
+            if repo.metadata.as_ref().is_some_and(|m| m.protected) {
                 yield RepoEvent::Error {
                     code: Some("protected".into()),
                     error_class: None,
@@ -1345,8 +1345,8 @@ impl ReposHub {
                 return;
             }
             // Already-dismissed idempotency.
-            let already = repo.metadata.as_ref().and_then(|m| m.lifecycle)
-                == Some(crate::v5::config::RepoLifecycle::Dismissed);
+            let already = repo.metadata.as_ref().map_or(crate::v5::config::RepoLifecycle::Active, |m| m.lifecycle)
+                == crate::v5::config::RepoLifecycle::Dismissed;
             if already {
                 let prev: Vec<String> = repo.metadata.as_ref()
                     .map(|m| m.privatized_on.iter().map(|p| match p {
@@ -1446,7 +1446,7 @@ impl ReposHub {
             };
             let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
             let wire = RepoRefWire::from(&repo_ref);
-            if repo.metadata.as_ref().and_then(|m| m.protected).unwrap_or(false) {
+            if repo.metadata.as_ref().is_some_and(|m| m.protected) {
                 yield RepoEvent::Error {
                     code: Some("protected".into()),
                     error_class: None,
@@ -1454,7 +1454,7 @@ impl ReposHub {
                 };
                 return;
             }
-            if repo.metadata.as_ref().and_then(|m| m.lifecycle) != Some(crate::v5::config::RepoLifecycle::Dismissed) {
+            if repo.metadata.as_ref().map_or(crate::v5::config::RepoLifecycle::Active, |m| m.lifecycle) != crate::v5::config::RepoLifecycle::Dismissed {
                 yield RepoEvent::Error {
                     code: Some("not_dismissed".into()),
                     error_class: None,
@@ -1548,7 +1548,7 @@ impl ReposHub {
                 let mut updated = existing.clone();
                 if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
                     let md = mr.metadata.get_or_insert_with(RepoMetadataLocal::default);
-                    md.protected = if target { Some(true) } else { None };
+                    md.protected = target;
                 }
                 let orgs_dir = config_dir.join("orgs");
                 if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
