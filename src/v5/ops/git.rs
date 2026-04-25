@@ -67,12 +67,24 @@ impl StatusSnapshot {
 /// `git clone <url> <dest>` with optional transport flip. Refuses if
 /// `dest` already exists.
 pub fn clone_repo(url: &str, dest: &Path) -> Result<(), GitError> {
+    clone_repo_with_env(url, dest, &[])
+}
+
+/// `git clone <url> <dest>` with extra environment variables. Callers
+/// that need to forward a per-repo `GIT_SSH_COMMAND` (V5PARITY-5) do so
+/// via this variant; a regular clone uses `clone_repo`.
+pub fn clone_repo_with_env(
+    url: &str,
+    dest: &Path,
+    env: &[(&str, &str)],
+) -> Result<(), GitError> {
     if dest.exists() {
         return Err(GitError::DestExists(dest.display().to_string()));
     }
-    run_git(
+    run_git_with_env(
         None,
         &["clone", url, dest.to_str().unwrap_or("")],
+        env,
     )
 }
 
@@ -144,6 +156,62 @@ pub fn set_remote_url(dir: &Path, name: &str, url: &str) -> Result<(), GitError>
 }
 
 // ---------------------------------------------------------------------
+// V5PARITY-5: per-repo SSH command.
+//
+// Writes `core.sshCommand = ssh -i <key> -o IdentitiesOnly=yes` into
+// the repo's `.git/config` via `git config`. Never touches
+// `~/.ssh/config`. `IdentitiesOnly=yes` prevents ssh-agent from
+// silently preferring a different key that happens to be loaded.
+// ---------------------------------------------------------------------
+
+/// Format the ssh command we write into `.git/config`. Exposed for
+/// tests and callers that need to pass the same string as
+/// `GIT_SSH_COMMAND` during a clone.
+#[must_use]
+pub fn format_ssh_command(key_path: &Path) -> String {
+    format!("ssh -i {} -o IdentitiesOnly=yes", key_path.display())
+}
+
+/// Set the per-repo `core.sshCommand`. Idempotent.
+pub fn set_ssh_command(dir: &Path, key_path: &Path) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let cmd = format_ssh_command(key_path);
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "config", "core.sshCommand", &cmd],
+    )
+}
+
+/// Clear a previously-set `core.sshCommand`. A missing entry is not
+/// treated as an error.
+pub fn clear_ssh_command(dir: &Path) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    match run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "config", "--unset", "core.sshCommand"],
+    ) {
+        Ok(()) => Ok(()),
+        // Exit 5 from `git config --unset` means "key not set" — not
+        // an error for our idempotent clear.
+        Err(GitError::CommandFailed { code: 5, .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the current `core.sshCommand`. Returns `None` if unset.
+pub fn get_ssh_command(dir: &Path) -> Result<Option<String>, GitError> {
+    ensure_git_repo(dir)?;
+    match run_git_capture(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "config", "--get", "core.sshCommand"],
+    ) {
+        Ok(s) => Ok(Some(s.trim().to_string())),
+        Err(GitError::CommandFailed { code: 1, .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Internals.
 // ---------------------------------------------------------------------
 
@@ -156,8 +224,15 @@ fn ensure_git_repo(dir: &Path) -> Result<(), GitError> {
 }
 
 fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<(), GitError> {
+    run_git_with_env(cwd, args, &[])
+}
+
+fn run_git_with_env(cwd: Option<&Path>, args: &[&str], env: &[(&str, &str)]) -> Result<(), GitError> {
     let mut cmd = Command::new("git");
     cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     if let Some(c) = cwd {
         cmd.current_dir(c);
     }

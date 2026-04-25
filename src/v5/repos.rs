@@ -306,6 +306,17 @@ pub enum RepoEvent {
         threshold_bytes: u64,
         count: u64,
     },
+    // V5PARITY-5 SSH events.
+    RepoSshKeySet {
+        path: String,
+        key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        persisted: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1769,12 +1780,32 @@ impl ReposHub {
             };
             let dest_path = std::path::PathBuf::from(&dest);
             let url = first.url.as_str();
-            match crate::v5::ops::git::clone_repo(url, &dest_path) {
-                Ok(()) => yield RepoEvent::CloneDone {
-                    reference: RepoRefWire { org: org.clone(), name: name.clone() },
-                    url: url.to_string(),
-                    dest,
-                },
+            // V5PARITY-5: per-org SSH key routing. If the org has a
+            // `ssh_key` credential, forward it as GIT_SSH_COMMAND for
+            // the clone subprocess, then persist it via `core.sshCommand`
+            // in the newly-cloned repo so later fetch/pull/push reuse it.
+            let key_path = ssh_key_for_org(org_cfg);
+            let ssh_cmd = key_path.as_ref().map(|p| crate::v5::ops::git::format_ssh_command(p));
+            let env: Vec<(&str, &str)> = match ssh_cmd.as_deref() {
+                Some(s) => vec![("GIT_SSH_COMMAND", s)],
+                None => Vec::new(),
+            };
+            let clone_result = if env.is_empty() {
+                crate::v5::ops::git::clone_repo(url, &dest_path)
+            } else {
+                crate::v5::ops::git::clone_repo_with_env(url, &dest_path, &env)
+            };
+            match clone_result {
+                Ok(()) => {
+                    if let Some(p) = key_path.as_ref() {
+                        let _ = crate::v5::ops::git::set_ssh_command(&dest_path, p);
+                    }
+                    yield RepoEvent::CloneDone {
+                        reference: RepoRefWire { org: org.clone(), name: name.clone() },
+                        url: url.to_string(),
+                        dest,
+                    };
+                }
                 Err(e) => yield RepoEvent::Error {
                     code: Some(e.code().into()),
                     error_class: None,
@@ -2303,6 +2334,102 @@ impl ReposHub {
             }
         }
     }
+
+    // ==================================================================
+    // V5PARITY-5: per-repo SSH key wiring.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        path = "Repo checkout directory",
+        key = "Filesystem path to the SSH private key (~ expanded)",
+        org = "Optional org to persist the key on (adds a ssh_key credential)",
+        name = "Optional repo name (reserved for per-repo override)",
+        persist_to_org = "If true, also add the key to the org yaml (default: false)"
+    ))]
+    pub async fn set_ssh_key(
+        &self,
+        path: String,
+        key: String,
+        org: Option<String>,
+        name: Option<String>,
+        persist_to_org: Option<serde_json::Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if path.is_empty() || key.is_empty() {
+                yield validation_event("missing required parameter 'path' or 'key'");
+                return;
+            }
+            let persist = persist_to_org.as_ref().is_some_and(|v| match v {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => matches!(s.as_str(), "true" | "1" | "yes"),
+                _ => false,
+            });
+            let key_path = expand_tilde(&key);
+            if !key_path.exists() {
+                yield RepoEvent::Error {
+                    code: Some("invalid_key".into()),
+                    error_class: None,
+                    message: format!("ssh key not found: {}", key_path.display()),
+                };
+                return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            if let Err(e) = crate::v5::ops::git::set_ssh_command(&dir, &key_path) {
+                yield RepoEvent::Error {
+                    code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                };
+                return;
+            }
+            let mut persisted = false;
+            if persist {
+                if let Some(org_name) = org.as_deref() {
+                    let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                        Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+                    };
+                    if let Some(existing) = loaded.orgs.get(&OrgName::from(org_name)) {
+                        let mut updated = existing.clone();
+                        updated.forge.credentials.retain(|c| !matches!(c.cred_type, CredentialType::SshKey));
+                        updated.forge.credentials.push(crate::v5::config::CredentialEntry {
+                            key: key_path.display().to_string(),
+                            cred_type: CredentialType::SshKey,
+                        });
+                        let orgs_dir = config_dir.join("orgs");
+                        if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                            yield cfg_error_event(e); return;
+                        }
+                        persisted = true;
+                    }
+                }
+            }
+            yield RepoEvent::RepoSshKeySet {
+                path,
+                key: key_path.display().to_string(),
+                org,
+                name,
+                persisted,
+            };
+        }
+    }
+}
+
+/// Resolve the SSH private-key path for an org. Returns the path on
+/// the first `CredentialEntry { cred_type: SshKey }`. Consulted from
+/// `repos.clone` (V5PARITY-5) and from `repos.set_ssh_key`.
+fn ssh_key_for_org(org: &OrgConfig) -> Option<PathBuf> {
+    org.forge.credentials.iter()
+        .find(|c| matches!(c.cred_type, CredentialType::SshKey))
+        .map(|c| expand_tilde(&c.key))
+}
+
+/// Expand a leading `~/` to `$HOME`. Non-tilde paths pass through.
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(p)
 }
 
 /// Flip a git URL's transport form. Best-effort: recognizes the
