@@ -2373,39 +2373,9 @@ fn to_bool(v: &serde_json::Value) -> bool {
     }
 }
 
-/// Read `origin` URL out of a dir's `.git/config` without shelling
-/// out. Returns `None` if the dir is not a git working tree or the
-/// config does not declare `remote "origin"`.
+/// Read `origin` URL via `ops::git::read_origin_url` (V5PARITY-15).
+/// Backed by git2 for in-process speed; falls back to `git config
+/// --get` under `HF_GIT_FORCE_SUBPROCESS=1`.
 fn read_git_origin(dir: &std::path::Path) -> Option<String> {
-    let git_dir = dir.join(".git");
-    // `.git` may be a dir (classic) or a file containing `gitdir: <path>`
-    // (worktree / submodule). Resolve it.
-    let cfg_path = if git_dir.is_file() {
-        let txt = std::fs::read_to_string(&git_dir).ok()?;
-        let rest = txt.trim().strip_prefix("gitdir:")?.trim();
-        std::path::PathBuf::from(rest).join("config")
-    } else if git_dir.is_dir() {
-        git_dir.join("config")
-    } else {
-        return None;
-    };
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
-    // Minimal INI parse: look for `[remote "origin"]` section, then
-    // its `url = …` entry until the next `[…]` header.
-    let mut in_origin = false;
-    for line in raw.lines() {
-        let l = line.trim();
-        if l.starts_with('[') && l.ends_with(']') {
-            in_origin = l == "[remote \"origin\"]";
-            continue;
-        }
-        if !in_origin {
-            continue;
-        }
-        if let Some(rest) = l.strip_prefix("url") {
-            let rest = rest.trim_start().strip_prefix('=')?.trim();
-            return Some(rest.to_string());
-        }
-    }
-    None
+    crate::v5::ops::git::read_origin_url(dir).ok().flatten()
 }

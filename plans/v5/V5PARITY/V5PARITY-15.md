@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-15
 title: "GIT-ABSTRACTION — git2-backed local ops behind ops::git's typed API"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: [V5PARITY-3]
 unlocks: []

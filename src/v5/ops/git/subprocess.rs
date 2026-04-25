@@ -1,79 +1,24 @@
-//! `ops::git` — subprocess wrappers over the user's `git` CLI (V5PARITY-3).
+//! `ops::git::subprocess` — subprocess-backed git ops (V5PARITY-3).
 //!
-//! Per ticket R1: shell out to `git` rather than using libgit2, so the
-//! user's SSH agent / credential helper / hooks / config all flow
-//! through transparently. D13: this is the ONLY module in src/v5/ that
-//! spawns `git` processes; hubs route through these helpers.
+//! Per ticket R1: shells out to the user's `git` CLI so SSH agent /
+//! credential helper / hooks / `core.sshCommand` flow through
+//! transparently. This is the ONLY module under `src/v5/` that spawns
+//! `git` processes (D13 + V5LIFECYCLE-11's `command-git` invariant).
+//!
+//! V5PARITY-15 split this out from a single-file `ops::git` module —
+//! `mod.rs` now owns the public API and routes per-op between
+//! subprocess (network/hook ops) and `local` (git2-backed local ops).
 
 use std::path::Path;
 use std::process::Command;
 
-use thiserror::Error;
+use super::{GitError, StatusSnapshot};
 
-/// Git operation error. Narrow variants for the cases callers branch
-/// on; `Other` for everything else.
-#[derive(Debug, Error, Clone)]
-pub enum GitError {
-    #[error("git not found on PATH")]
-    GitNotFound,
-    #[error("target path is not a git working tree: {0}")]
-    NotAGitRepo(String),
-    #[error("working tree is dirty: {0}")]
-    DirtyTree(String),
-    #[error("destination already exists: {0}")]
-    DestExists(String),
-    #[error("non-fast-forward — branch has diverged")]
-    NonFastForward,
-    #[error("git command failed ({code}): {stderr}")]
-    CommandFailed { code: i32, stderr: String },
-    #[error("io error: {0}")]
-    Io(String),
-}
-
-impl GitError {
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::GitNotFound => "git_not_found",
-            Self::NotAGitRepo(_) => "not_a_git_repo",
-            Self::DirtyTree(_) => "dirty_tree",
-            Self::DestExists(_) => "dest_exists",
-            Self::NonFastForward => "non_ff",
-            Self::CommandFailed { .. } => "git_failed",
-            Self::Io(_) => "io",
-        }
-    }
-}
-
-/// Parsed output of `git status --porcelain=v2 --branch`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusSnapshot {
-    pub branch: Option<String>,
-    pub upstream: Option<String>,
-    pub ahead: u32,
-    pub behind: u32,
-    pub staged: u32,
-    pub unstaged: u32,
-    pub untracked: u32,
-}
-
-impl StatusSnapshot {
-    #[must_use]
-    pub const fn dirty(&self) -> bool {
-        self.staged > 0 || self.unstaged > 0 || self.untracked > 0
-    }
-}
-
-/// `git clone <url> <dest>` with optional transport flip. Refuses if
-/// `dest` already exists.
-pub fn clone_repo(url: &str, dest: &Path) -> Result<(), GitError> {
+pub(super) fn clone_repo(url: &str, dest: &Path) -> Result<(), GitError> {
     clone_repo_with_env(url, dest, &[])
 }
 
-/// `git clone <url> <dest>` with extra environment variables. Callers
-/// that need to forward a per-repo `GIT_SSH_COMMAND` (V5PARITY-5) do so
-/// via this variant; a regular clone uses `clone_repo`.
-pub fn clone_repo_with_env(
+pub(super) fn clone_repo_with_env(
     url: &str,
     dest: &Path,
     env: &[(&str, &str)],
@@ -88,8 +33,7 @@ pub fn clone_repo_with_env(
     )
 }
 
-/// `git -C <dir> fetch [<remote>]`. `None` fetches all remotes.
-pub fn fetch(dir: &Path, remote: Option<&str>) -> Result<(), GitError> {
+pub(super) fn fetch(dir: &Path, remote: Option<&str>) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     let mut args: Vec<&str> = vec!["-C", dir.to_str().unwrap_or(""), "fetch"];
     if let Some(r) = remote {
@@ -100,10 +44,7 @@ pub fn fetch(dir: &Path, remote: Option<&str>) -> Result<(), GitError> {
     run_git(None, &args)
 }
 
-/// `git -C <dir> pull --ff-only <remote> <branch>`. Errors with
-/// `DirtyTree` if the tree has uncommitted changes; `NonFastForward`
-/// if the branch has diverged.
-pub fn pull_ff(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
+pub(super) fn pull_ff(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     if is_dirty(dir)? {
         return Err(GitError::DirtyTree(dir.display().to_string()));
@@ -120,8 +61,7 @@ pub fn pull_ff(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
     }
 }
 
-/// `git -C <dir> push <remote> [<branch>]`.
-pub fn push_refs(dir: &Path, remote: &str, branch: Option<&str>) -> Result<(), GitError> {
+pub(super) fn push_refs(dir: &Path, remote: &str, branch: Option<&str>) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     let mut args: Vec<&str> = vec!["-C", dir.to_str().unwrap_or(""), "push", remote];
     if let Some(b) = branch {
@@ -130,8 +70,15 @@ pub fn push_refs(dir: &Path, remote: &str, branch: Option<&str>) -> Result<(), G
     run_git(None, &args)
 }
 
-/// `git -C <dir> status --porcelain=v2 --branch` parsed into typed form.
-pub fn status(dir: &Path) -> Result<StatusSnapshot, GitError> {
+pub(super) fn push_ref(dir: &Path, remote: &str, refspec: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "push", remote, refspec],
+    )
+}
+
+pub(super) fn status(dir: &Path) -> Result<StatusSnapshot, GitError> {
     ensure_git_repo(dir)?;
     let out = run_git_capture(
         None,
@@ -140,14 +87,11 @@ pub fn status(dir: &Path) -> Result<StatusSnapshot, GitError> {
     Ok(parse_status(&out))
 }
 
-/// Shortcut: `status(dir).dirty`.
-pub fn is_dirty(dir: &Path) -> Result<bool, GitError> {
+pub(super) fn is_dirty(dir: &Path) -> Result<bool, GitError> {
     status(dir).map(|s| s.dirty())
 }
 
-/// `git -C <dir> remote set-url <name> <url>`. Idempotent at the git
-/// level: setting to the same URL is a no-op write.
-pub fn set_remote_url(dir: &Path, name: &str, url: &str) -> Result<(), GitError> {
+pub(super) fn set_remote_url(dir: &Path, name: &str, url: &str) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     run_git(
         None,
@@ -155,24 +99,14 @@ pub fn set_remote_url(dir: &Path, name: &str, url: &str) -> Result<(), GitError>
     )
 }
 
-// ---------------------------------------------------------------------
-// V5PARITY-10: commit + tag helpers. Routing build-release through
-// ops::git keeps D13's "one subprocess entry point" invariant; see
-// V5LIFECYCLE-11's `command-git` DRY grep.
-// ---------------------------------------------------------------------
-
-/// `git -C <dir> add <path>`. Accepts one or more paths.
-pub fn add(dir: &Path, paths: &[&str]) -> Result<(), GitError> {
+pub(super) fn add(dir: &Path, paths: &[&str]) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     let mut args: Vec<&str> = vec!["-C", dir.to_str().unwrap_or(""), "add"];
     args.extend_from_slice(paths);
     run_git(None, &args)
 }
 
-/// `git -C <dir> commit -m <message>`. Fails with `CommandFailed` if
-/// there's nothing staged; callers that want "commit if there's
-/// anything to commit" should check `status()` first.
-pub fn commit(dir: &Path, message: &str) -> Result<(), GitError> {
+pub(super) fn commit(dir: &Path, message: &str) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     run_git(
         None,
@@ -180,40 +114,7 @@ pub fn commit(dir: &Path, message: &str) -> Result<(), GitError> {
     )
 }
 
-/// `git -C <dir> tag <name>`. Lightweight tag.
-pub fn tag(dir: &Path, name: &str) -> Result<(), GitError> {
-    ensure_git_repo(dir)?;
-    run_git(
-        None,
-        &["-C", dir.to_str().unwrap_or(""), "tag", name],
-    )
-}
-
-/// `git -C <dir> tag -a <name> -m <message>`. Annotated tag.
-pub fn tag_annotated(dir: &Path, name: &str, message: &str) -> Result<(), GitError> {
-    ensure_git_repo(dir)?;
-    run_git(
-        None,
-        &["-C", dir.to_str().unwrap_or(""), "tag", "-a", name, "-m", message],
-    )
-}
-
-/// `git -C <dir> checkout <branch>`. With `create`, runs
-/// `git checkout -b <branch>` (creates the branch if absent). Already
-/// being on the target branch is a successful no-op.
-pub fn checkout(dir: &Path, branch: &str, create: bool) -> Result<(), GitError> {
-    ensure_git_repo(dir)?;
-    let dir_s = dir.to_str().unwrap_or("");
-    if create {
-        // -B: reset/create — same effect whether the branch exists or not.
-        return run_git(None, &["-C", dir_s, "checkout", "-B", branch]);
-    }
-    run_git(None, &["-C", dir_s, "checkout", branch])
-}
-
-/// `git -C <dir> commit -m <message>`, with `--allow-empty` when set.
-/// Companion to plain `commit` for ceremonial commits.
-pub fn commit_with(dir: &Path, message: &str, allow_empty: bool) -> Result<(), GitError> {
+pub(super) fn commit_with(dir: &Path, message: &str, allow_empty: bool) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     let dir_s = dir.to_str().unwrap_or("");
     if allow_empty {
@@ -223,20 +124,32 @@ pub fn commit_with(dir: &Path, message: &str, allow_empty: bool) -> Result<(), G
     }
 }
 
-/// `git -C <dir> push <remote> <refspec>`. Used by V5PARITY-10's
-/// release flow to push both branch and tag. `push_refs` pushes all
-/// refs; `push_ref` is explicit.
-pub fn push_ref(dir: &Path, remote: &str, refspec: &str) -> Result<(), GitError> {
+pub(super) fn tag(dir: &Path, name: &str) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     run_git(
         None,
-        &["-C", dir.to_str().unwrap_or(""), "push", remote, refspec],
+        &["-C", dir.to_str().unwrap_or(""), "tag", name],
     )
 }
 
-/// `git -C <dir> show <rev>:<path>`. Returns the file contents as
-/// seen at `rev`. Used by V5PARITY-9's `build.package_diff`.
-pub fn show(dir: &Path, rev: &str, path: &str) -> Result<String, GitError> {
+pub(super) fn tag_annotated(dir: &Path, name: &str, message: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "tag", "-a", name, "-m", message],
+    )
+}
+
+pub(super) fn checkout(dir: &Path, branch: &str, create: bool) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let dir_s = dir.to_str().unwrap_or("");
+    if create {
+        return run_git(None, &["-C", dir_s, "checkout", "-B", branch]);
+    }
+    run_git(None, &["-C", dir_s, "checkout", branch])
+}
+
+pub(super) fn show(dir: &Path, rev: &str, path: &str) -> Result<String, GitError> {
     ensure_git_repo(dir)?;
     run_git_capture(
         None,
@@ -244,55 +157,67 @@ pub fn show(dir: &Path, rev: &str, path: &str) -> Result<String, GitError> {
     )
 }
 
-// ---------------------------------------------------------------------
-// V5PARITY-5: per-repo SSH command.
-//
-// Writes `core.sshCommand = ssh -i <key> -o IdentitiesOnly=yes` into
-// the repo's `.git/config` via `git config`. Never touches
-// `~/.ssh/config`. `IdentitiesOnly=yes` prevents ssh-agent from
-// silently preferring a different key that happens to be loaded.
-// ---------------------------------------------------------------------
-
-/// Format the ssh command we write into `.git/config`. Exposed for
-/// tests and callers that need to pass the same string as
-/// `GIT_SSH_COMMAND` during a clone.
-#[must_use]
-pub fn format_ssh_command(key_path: &Path) -> String {
-    format!("ssh -i {} -o IdentitiesOnly=yes", key_path.display())
-}
-
-/// Set the per-repo `core.sshCommand`. Idempotent.
-pub fn set_ssh_command(dir: &Path, key_path: &Path) -> Result<(), GitError> {
+pub(super) fn set_ssh_command(dir: &Path, key_path: &Path) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
-    let cmd = format_ssh_command(key_path);
+    let cmd = super::format_ssh_command(key_path);
     run_git(
         None,
         &["-C", dir.to_str().unwrap_or(""), "config", "core.sshCommand", &cmd],
     )
 }
 
-/// Clear a previously-set `core.sshCommand`. A missing entry is not
-/// treated as an error.
-pub fn clear_ssh_command(dir: &Path) -> Result<(), GitError> {
+pub(super) fn clear_ssh_command(dir: &Path) -> Result<(), GitError> {
     ensure_git_repo(dir)?;
     match run_git(
         None,
         &["-C", dir.to_str().unwrap_or(""), "config", "--unset", "core.sshCommand"],
     ) {
         Ok(()) => Ok(()),
-        // Exit 5 from `git config --unset` means "key not set" — not
-        // an error for our idempotent clear.
         Err(GitError::CommandFailed { code: 5, .. }) => Ok(()),
         Err(e) => Err(e),
     }
 }
 
-/// Read the current `core.sshCommand`. Returns `None` if unset.
-pub fn get_ssh_command(dir: &Path) -> Result<Option<String>, GitError> {
+pub(super) fn get_ssh_command(dir: &Path) -> Result<Option<String>, GitError> {
     ensure_git_repo(dir)?;
     match run_git_capture(
         None,
         &["-C", dir.to_str().unwrap_or(""), "config", "--get", "core.sshCommand"],
+    ) {
+        Ok(s) => Ok(Some(s.trim().to_string())),
+        Err(GitError::CommandFailed { code: 1, .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the `origin` remote URL via subprocess. Used as the fallback
+/// when `local::read_origin_url` (git2-backed) is disabled via
+/// `HF_GIT_FORCE_SUBPROCESS=1`.
+///
+/// Uses `git config --file <path> --get` to read directly from the
+/// config file without requiring repo state — `git -C <dir> config`
+/// would fail on test fixtures that wrote a bare `.git/config`. The
+/// `local` backend handles that case via `git2::Config::open`; this
+/// keeps behavior parity.
+pub(super) fn read_origin_url(dir: &Path) -> Result<Option<String>, GitError> {
+    let git_dir = dir.join(".git");
+    if !git_dir.exists() {
+        return Ok(None);
+    }
+    let cfg_path = if git_dir.is_file() {
+        let txt = std::fs::read_to_string(&git_dir).map_err(|e| GitError::Io(e.to_string()))?;
+        let rest = txt.trim().strip_prefix("gitdir:").map(str::trim)
+            .ok_or_else(|| GitError::Io("malformed .git pointer file".into()))?;
+        std::path::PathBuf::from(rest).join("config")
+    } else {
+        git_dir.join("config")
+    };
+    if !cfg_path.is_file() {
+        return Ok(None);
+    }
+    match run_git_capture(
+        None,
+        &["config", "--file", cfg_path.to_str().unwrap_or(""), "--get", "remote.origin.url"],
     ) {
         Ok(s) => Ok(Some(s.trim().to_string())),
         Err(GitError::CommandFailed { code: 1, .. }) => Ok(None),
@@ -391,8 +316,6 @@ fn parse_status(raw: &str) -> StatusSnapshot {
                 behind = b.trim_start_matches('-').parse().unwrap_or(0);
             }
         } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            // Ordinary / renamed changed entries. The 2nd field is the
-            // XY status codes: X = staged, Y = unstaged.
             let fields: Vec<&str> = line.splitn(3, ' ').collect();
             if fields.len() >= 2 {
                 let xy = fields[1].as_bytes();

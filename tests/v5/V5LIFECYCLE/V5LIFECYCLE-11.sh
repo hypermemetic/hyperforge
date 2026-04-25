@@ -44,10 +44,10 @@ grep_violation "adapter-meta" '[^/]adapter\.(read_metadata|write_metadata)' '^sr
 grep_violation "adapter-life" '[^/]adapter\.(create_repo|delete_repo|repo_exists|update_repo)' '^src/v5/ops/'
 grep_violation "for_provider" '[^a-z:]for_provider\(' '^src/v5/(ops|adapters)/'
 grep_violation "compute_drift" '[^a-z_]compute_drift\(' '^src/v5/ops/'
-# V5PARITY-12 new invariant: `Command::new("git")` lives in ops/git.rs only.
-# build/*, hubs, and workspace helpers must route through the typed wrappers
-# there. Test code + v4 modules are excluded — this guard is for v5 surface.
-grep_violation "command-git"  'Command::new\("git"\)' '^src/v5/ops/git\.rs'
+# V5PARITY-12 new invariant: `Command::new("git")` lives in ops/git/* only.
+# V5PARITY-15 widened the path scope from a single file to the dir after
+# the module split into mod.rs / subprocess.rs / local.rs.
+grep_violation "command-git"  'Command::new\("git"\)' '^src/v5/ops/git/'
 
 # --- U5: .hyperforge init (always tier 1) ---
 TMP="$(mktemp -d -t v5life-ckpt-XXXXXX)"
