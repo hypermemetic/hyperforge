@@ -5,6 +5,8 @@
 //! v4 activation tree in `crate::hub` / `crate::hubs` is untouched.
 
 pub mod adapters;
+pub mod build;
+pub mod build_hub;
 pub mod config;
 pub mod hub;
 pub mod ops;

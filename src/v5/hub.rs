@@ -146,6 +146,12 @@ impl HyperforgeHub {
         crate::v5::secrets_hub::SecretsHub::new(self.state.config_dir.clone())
     }
 
+    /// Build namespace — V5PARITY-9/10/11. Manifest, release, dist, exec.
+    #[plexus_macros::child]
+    fn build(&self) -> crate::v5::build_hub::BuildHub {
+        crate::v5::build_hub::BuildHub::new(self.state.config_dir.clone())
+    }
+
     /// Return daemon version and config directory.
     #[plexus_macros::method]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {

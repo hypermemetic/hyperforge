@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-10
 title: "BUILD-RELEASE — bump, publish, release, release_all"
-status: Ready
+status: Complete
 type: implementation
 blocked_by: [V5PARITY-9]
 unlocks: [V5PARITY-12]
