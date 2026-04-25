@@ -167,6 +167,46 @@ pub enum WorkspacesEvent {
         path: String,
         repo_count: u32,
     },
+    /// V5PARITY-4: per-member analytics event (size/loc/large/dirty).
+    /// `metric` is `size`, `loc`, `large_files`, or `dirty`; fields
+    /// populated depend on the metric.
+    MemberAnalytics {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        metric: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loc_total: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        large_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dirty: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// V5PARITY-4: workspace-wide aggregate.
+    WorkspaceAnalyticsSummary {
+        name: String,
+        metric: String,
+        total: u32,
+        ok: u32,
+        errored: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_file_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_loc: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_large_files: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dirty_count: Option<u32>,
+    },
 }
 
 /// Validate a `WorkspaceName`: ≤64 chars, ASCII, no `/`, no leading `.`.
@@ -1784,6 +1824,274 @@ impl WorkspacesHub {
                 errored,
             };
         }
+    }
+
+    // ==================================================================
+    // V5PARITY-4: workspace-level analytics aggregates.
+    // ==================================================================
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn repo_sizes(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.analytics_op(name, "size").await
+    }
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn loc(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.analytics_op(name, "loc").await
+    }
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        threshold = "Threshold in KB (default: 100)"
+    ))]
+    pub async fn large_files(
+        &self,
+        name: String,
+        threshold: Option<u64>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.analytics_op_large(name, threshold.unwrap_or(100) * 1024).await
+    }
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn dirty(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        self.analytics_op(name, "dirty").await
+    }
+
+    async fn analytics_op(
+        &self,
+        name: String,
+        metric: &'static str,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if name.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            }
+            let ws = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace '{name}' not found"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let mut ok = 0u32;
+            let mut errored = 0u32;
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let mut total_bytes: u64 = 0;
+            let mut total_file_count: u64 = 0;
+            let mut total_loc: u64 = 0;
+            let mut dirty_count: u32 = 0;
+            for entry in &ws.repos {
+                let (org_s, name_s) = workspace_member_ref(entry);
+                let wire = crate::v5::repos::RepoRefWire {
+                    org: org_s.clone(),
+                    name: name_s.clone(),
+                };
+                let dir_name = match entry {
+                    crate::v5::config::WorkspaceRepo::Object { dir, .. } => dir.clone(),
+                    _ => name_s.clone(),
+                };
+                let dir = ws_path.join(&dir_name);
+                match metric {
+                    "size" => match crate::v5::ops::analytics::repo_size(&dir) {
+                        Ok(s) => {
+                            ok += 1;
+                            total_bytes += s.bytes;
+                            total_file_count += s.file_count;
+                            yield WorkspacesEvent::MemberAnalytics {
+                                reference: wire, metric: metric.into(),
+                                bytes: Some(s.bytes), file_count: Some(s.file_count),
+                                loc_total: None, large_count: None, dirty: None,
+                                status: Some("ok".into()), message: None,
+                            };
+                        }
+                        Err(e) => {
+                            errored += 1;
+                            yield WorkspacesEvent::MemberAnalytics {
+                                reference: wire, metric: metric.into(),
+                                bytes: None, file_count: None,
+                                loc_total: None, large_count: None, dirty: None,
+                                status: Some("errored".into()), message: Some(e.to_string()),
+                            };
+                        }
+                    },
+                    "loc" => match crate::v5::ops::analytics::repo_loc(&dir) {
+                        Ok(m) => {
+                            ok += 1;
+                            let t: u64 = m.values().sum();
+                            total_loc += t;
+                            yield WorkspacesEvent::MemberAnalytics {
+                                reference: wire, metric: metric.into(),
+                                bytes: None, file_count: None,
+                                loc_total: Some(t), large_count: None, dirty: None,
+                                status: Some("ok".into()), message: None,
+                            };
+                        }
+                        Err(e) => {
+                            errored += 1;
+                            yield WorkspacesEvent::MemberAnalytics {
+                                reference: wire, metric: metric.into(),
+                                bytes: None, file_count: None,
+                                loc_total: None, large_count: None, dirty: None,
+                                status: Some("errored".into()), message: Some(e.to_string()),
+                            };
+                        }
+                    },
+                    "dirty" => match crate::v5::ops::git::is_dirty(&dir) {
+                        Ok(d) => {
+                            ok += 1;
+                            if d { dirty_count += 1; }
+                            yield WorkspacesEvent::MemberAnalytics {
+                                reference: wire, metric: metric.into(),
+                                bytes: None, file_count: None,
+                                loc_total: None, large_count: None, dirty: Some(d),
+                                status: Some("ok".into()), message: None,
+                            };
+                        }
+                        Err(e) => {
+                            errored += 1;
+                            yield WorkspacesEvent::MemberAnalytics {
+                                reference: wire, metric: metric.into(),
+                                bytes: None, file_count: None,
+                                loc_total: None, large_count: None, dirty: None,
+                                status: Some("errored".into()), message: Some(e.to_string()),
+                            };
+                        }
+                    },
+                    _ => unreachable!("analytics_op called with unknown metric: {metric}"),
+                }
+            }
+            yield WorkspacesEvent::WorkspaceAnalyticsSummary {
+                name: ws.name.as_str().to_string(),
+                metric: metric.into(),
+                total, ok, errored,
+                total_bytes: if metric == "size" { Some(total_bytes) } else { None },
+                total_file_count: if metric == "size" { Some(total_file_count) } else { None },
+                total_loc: if metric == "loc" { Some(total_loc) } else { None },
+                total_large_files: None,
+                dirty_count: if metric == "dirty" { Some(dirty_count) } else { None },
+            };
+        }
+    }
+
+    async fn analytics_op_large(
+        &self,
+        name: String,
+        threshold_bytes: u64,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if name.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            }
+            let ws = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("not_found".into()),
+                        message: format!("workspace '{name}' not found"),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let mut ok = 0u32;
+            let mut errored = 0u32;
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let mut total_large: u64 = 0;
+            for entry in &ws.repos {
+                let (org_s, name_s) = workspace_member_ref(entry);
+                let wire = crate::v5::repos::RepoRefWire {
+                    org: org_s.clone(), name: name_s.clone(),
+                };
+                let dir_name = match entry {
+                    crate::v5::config::WorkspaceRepo::Object { dir, .. } => dir.clone(),
+                    _ => name_s.clone(),
+                };
+                let dir = ws_path.join(&dir_name);
+                match crate::v5::ops::analytics::large_files(&dir, threshold_bytes) {
+                    Ok(items) => {
+                        ok += 1;
+                        let cnt = items.len() as u64;
+                        total_large += cnt;
+                        yield WorkspacesEvent::MemberAnalytics {
+                            reference: wire, metric: "large_files".into(),
+                            bytes: None, file_count: None,
+                            loc_total: None, large_count: Some(cnt), dirty: None,
+                            status: Some("ok".into()), message: None,
+                        };
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        yield WorkspacesEvent::MemberAnalytics {
+                            reference: wire, metric: "large_files".into(),
+                            bytes: None, file_count: None,
+                            loc_total: None, large_count: None, dirty: None,
+                            status: Some("errored".into()), message: Some(e.to_string()),
+                        };
+                    }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceAnalyticsSummary {
+                name: ws.name.as_str().to_string(),
+                metric: "large_files".into(),
+                total, ok, errored,
+                total_bytes: None, total_file_count: None,
+                total_loc: None, total_large_files: Some(total_large),
+                dirty_count: None,
+            };
+        }
+    }
+}
+
+/// Extract `(org, name)` from a WorkspaceRepo. Shorthand `"org/name"`
+/// and the object form both route through this.
+fn workspace_member_ref(entry: &crate::v5::config::WorkspaceRepo) -> (String, String) {
+    match entry {
+        crate::v5::config::WorkspaceRepo::Shorthand(s) => {
+            s.split_once('/')
+                .map(|(o, n)| (o.to_string(), n.to_string()))
+                .unwrap_or_else(|| (String::new(), s.clone()))
+        }
+        crate::v5::config::WorkspaceRepo::Object { reference, .. } => (
+            reference.org.as_str().to_string(),
+            reference.name.as_str().to_string(),
+        ),
     }
 }
 

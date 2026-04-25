@@ -286,6 +286,26 @@ pub enum RepoEvent {
         reference: RepoRefWire,
         archived: bool,
     },
+    // V5PARITY-4 analytics events.
+    RepoSizeSummary {
+        path: String,
+        bytes: u64,
+        file_count: u64,
+    },
+    RepoLocSummary {
+        path: String,
+        by_language: BTreeMap<String, u64>,
+        total: u64,
+    },
+    LargeFile {
+        path: String,
+        size: u64,
+    },
+    LargeFilesSummary {
+        path: String,
+        threshold_bytes: u64,
+        count: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2199,6 +2219,88 @@ impl ReposHub {
                 reference: RepoRefWire { org, name },
                 archived: target,
             };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-4: analytics (size, loc, large_files).
+    // `dirty` is defined above and reused by workspace aggregates;
+    // D13 keeps is_dirty in ops::git so this ticket does not
+    // reintroduce a second implementation.
+    // ==================================================================
+
+    #[plexus_macros::method(params(path = "Repo checkout directory"))]
+    pub async fn size(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            match crate::v5::ops::analytics::repo_size(&dir) {
+                Ok(s) => yield RepoEvent::RepoSizeSummary {
+                    path, bytes: s.bytes, file_count: s.file_count,
+                },
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(path = "Repo checkout directory"))]
+    pub async fn loc(
+        &self,
+        path: String,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let dir = std::path::PathBuf::from(&path);
+            match crate::v5::ops::analytics::repo_loc(&dir) {
+                Ok(m) => {
+                    let total: u64 = m.values().sum();
+                    yield RepoEvent::RepoLocSummary { path, by_language: m, total };
+                }
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                },
+            }
+        }
+    }
+
+    #[plexus_macros::method(params(
+        path = "Repo checkout directory",
+        threshold = "Threshold in KB (default: 100)"
+    ))]
+    pub async fn large_files(
+        &self,
+        path: String,
+        threshold: Option<u64>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        stream! {
+            if path.is_empty() {
+                yield validation_event("missing required parameter 'path'"); return;
+            }
+            let threshold_bytes = threshold.unwrap_or(100) * 1024;
+            let dir = std::path::PathBuf::from(&path);
+            match crate::v5::ops::analytics::large_files(&dir, threshold_bytes) {
+                Ok(items) => {
+                    let count = items.len() as u64;
+                    for it in items {
+                        yield RepoEvent::LargeFile { path: it.path, size: it.size };
+                    }
+                    yield RepoEvent::LargeFilesSummary {
+                        path, threshold_bytes, count,
+                    };
+                }
+                Err(e) => yield RepoEvent::Error {
+                    code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                },
+            }
         }
     }
 }
