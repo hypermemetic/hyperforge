@@ -189,6 +189,40 @@ pub fn tag(dir: &Path, name: &str) -> Result<(), GitError> {
     )
 }
 
+/// `git -C <dir> tag -a <name> -m <message>`. Annotated tag.
+pub fn tag_annotated(dir: &Path, name: &str, message: &str) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    run_git(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "tag", "-a", name, "-m", message],
+    )
+}
+
+/// `git -C <dir> checkout <branch>`. With `create`, runs
+/// `git checkout -b <branch>` (creates the branch if absent). Already
+/// being on the target branch is a successful no-op.
+pub fn checkout(dir: &Path, branch: &str, create: bool) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let dir_s = dir.to_str().unwrap_or("");
+    if create {
+        // -B: reset/create — same effect whether the branch exists or not.
+        return run_git(None, &["-C", dir_s, "checkout", "-B", branch]);
+    }
+    run_git(None, &["-C", dir_s, "checkout", branch])
+}
+
+/// `git -C <dir> commit -m <message>`, with `--allow-empty` when set.
+/// Companion to plain `commit` for ceremonial commits.
+pub fn commit_with(dir: &Path, message: &str, allow_empty: bool) -> Result<(), GitError> {
+    ensure_git_repo(dir)?;
+    let dir_s = dir.to_str().unwrap_or("");
+    if allow_empty {
+        run_git(None, &["-C", dir_s, "commit", "--allow-empty", "-m", message])
+    } else {
+        run_git(None, &["-C", dir_s, "commit", "-m", message])
+    }
+}
+
 /// `git -C <dir> push <remote> <refspec>`. Used by V5PARITY-10's
 /// release flow to push both branch and tag. `push_refs` pushes all
 /// refs; `push_ref` is explicit.

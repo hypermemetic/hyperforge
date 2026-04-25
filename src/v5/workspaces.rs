@@ -189,6 +189,34 @@ pub enum WorkspacesEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// V5PARITY-14: per-member git status snapshot. Fields mirror
+    /// V5PARITY-3's `RepoEvent::RepoStatus`; no central bookkeeping
+    /// shape because workspace status is fundamentally read-only and
+    /// the per-member detail is the user-facing payload.
+    StatusSnapshot {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        upstream: Option<String>,
+        ahead: u32,
+        behind: u32,
+        staged: u32,
+        unstaged: u32,
+        untracked: u32,
+        dirty: bool,
+    },
+    /// V5PARITY-14: workspace-wide status aggregate.
+    WorkspaceStatusSummary {
+        name: String,
+        total: u32,
+        clean: u32,
+        dirty: u32,
+        ahead: u32,
+        behind: u32,
+        errored: u32,
+    },
     /// V5PARITY-4: workspace-wide aggregate.
     WorkspaceAnalyticsSummary {
         name: String,
@@ -1669,7 +1697,14 @@ impl WorkspacesHub {
     }
 
     // ==================================================================
-    // V5PARITY-3: workspace-parallel git ops (sequential v1).
+    // V5PARITY-3 / V5PARITY-14: workspace git verbs.
+    //
+    // Sequential v1 (matches V5PARITY-3 scope; bounded parallelism is a
+    // separate concern not yet ticketed). Each public method has its
+    // own loop and yields its own events directly — no central
+    // string-dispatch helper. The shared shape (load workspace + decode
+    // members) lives in the small typed helpers `load_iter_ctx` and
+    // `member_ctxs` defined below.
     // ==================================================================
 
     #[plexus_macros::method(params(name = "Workspace name"))]
@@ -1677,7 +1712,28 @@ impl WorkspacesHub {
         &self,
         name: String,
     ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
-        self.git_op(name, "clone").await
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                let result = ctx.repo.and_then(|r| r.canonical_remote())
+                    .ok_or_else(|| "no remotes".to_string())
+                    .and_then(|r| crate::v5::ops::git::clone_repo(r.url.as_str(), &ctx.dir).map_err(|e| e.to_string()));
+                match result {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "clone"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "clone", e); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "clone".into(),
+                total, ok, errored,
+            };
+        }
     }
 
     #[plexus_macros::method(params(name = "Workspace name"))]
@@ -1685,7 +1741,25 @@ impl WorkspacesHub {
         &self,
         name: String,
     ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
-        self.git_op(name, "fetch").await
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                match crate::v5::ops::git::fetch(&ctx.dir, None) {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "fetch"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "fetch", e.to_string()); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "fetch".into(),
+                total, ok, errored,
+            };
+        }
     }
 
     #[plexus_macros::method(params(name = "Workspace name"))]
@@ -1693,135 +1767,232 @@ impl WorkspacesHub {
         &self,
         name: String,
     ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
-        self.git_op(name, "pull").await
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                let branch = crate::v5::ops::git::status(&ctx.dir).ok()
+                    .and_then(|s| s.branch).unwrap_or_else(|| "main".into());
+                match crate::v5::ops::git::pull_ff(&ctx.dir, "origin", &branch) {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "pull"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "pull", e.to_string()); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "pull".into(),
+                total, ok, errored,
+            };
+        }
     }
 
     #[plexus_macros::method(params(name = "Workspace name"))]
-    pub async fn push_all(
+    pub async fn push(
         &self,
         name: String,
-    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
-        self.git_op(name, "push_refs").await
-    }
-
-    /// Shared iteration for workspaces.{clone,fetch,pull,push_all}.
-    /// Sequential v1; bounded parallelism deferred to V5PARITY-12.
-    async fn git_op(
-        &self,
-        name: String,
-        op: &'static str,
     ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
         let config_dir = self.config_dir.clone();
         async_stream::stream! {
-            if name.is_empty() {
-                yield WorkspacesEvent::Error {
-                    code: Some("validation".into()),
-                    message: "missing required parameter 'name'".into(),
-                };
-                return;
-            }
-            let ws = match crate::v5::ops::state::load_workspace(&config_dir, &name) {
-                Ok(Some(c)) => c,
-                Ok(None) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("not_found".into()),
-                        message: format!("workspace '{name}' not found"),
-                    };
-                    return;
-                }
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("config_error".into()),
-                        message: e.to_string(),
-                    };
-                    return;
-                }
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
             };
-            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
-                Ok(l) => l,
-                Err(e) => {
-                    yield WorkspacesEvent::Error {
-                        code: Some("config_error".into()),
-                        message: e.to_string(),
-                    };
-                    return;
-                }
-            };
-            let mut ok = 0u32;
-            let mut errored = 0u32;
-            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
             let ws_path = std::path::PathBuf::from(ws.path.as_str());
-            for entry in &ws.repos {
-                let (org_s, name_s) = match entry {
-                    crate::v5::config::WorkspaceRepo::Shorthand(s) => {
-                        match s.split_once('/') {
-                            Some((o, n)) => (o.to_string(), n.to_string()),
-                            None => continue,
-                        }
-                    }
-                    crate::v5::config::WorkspaceRepo::Object { reference, .. } => (
-                        reference.org.as_str().to_string(),
-                        reference.name.as_str().to_string(),
-                    ),
-                };
-                let wire = crate::v5::repos::RepoRefWire {
-                    org: org_s.clone(),
-                    name: name_s.clone(),
-                };
-                let dir_name = match entry {
-                    crate::v5::config::WorkspaceRepo::Object { dir, .. } => dir.clone(),
-                    _ => name_s.clone(),
-                };
-                let dir = ws_path.join(&dir_name);
-                let result: Result<(), String> = (|| -> Result<(), String> {
-                    match op {
-                        "clone" => {
-                            let org_cfg = loaded.orgs.get(&crate::v5::config::OrgName::from(org_s.as_str()))
-                                .ok_or_else(|| format!("org '{org_s}' not found"))?;
-                            let repo = crate::v5::ops::state::find_repo(org_cfg, &name_s)
-                                .ok_or_else(|| format!("repo '{name_s}' not found in org '{org_s}'"))?;
-                            let first = repo.remotes.first()
-                                .ok_or_else(|| format!("repo '{name_s}' has no remotes"))?;
-                            crate::v5::ops::git::clone_repo(first.url.as_str(), &dir)
-                                .map_err(|e| e.to_string())
-                        }
-                        "fetch" => crate::v5::ops::git::fetch(&dir, None).map_err(|e| e.to_string()),
-                        "pull" => {
-                            let branch = crate::v5::ops::git::status(&dir).ok()
-                                .and_then(|s| s.branch).unwrap_or_else(|| "main".into());
-                            crate::v5::ops::git::pull_ff(&dir, "origin", &branch).map_err(|e| e.to_string())
-                        }
-                        "push_refs" => crate::v5::ops::git::push_refs(&dir, "origin", None).map_err(|e| e.to_string()),
-                        _ => Err(format!("unknown op: {op}")),
-                    }
-                })();
-                match result {
-                    Ok(()) => {
-                        ok += 1;
-                        yield WorkspacesEvent::MemberGitResult {
-                            reference: wire,
-                            op: op.to_string(),
-                            status: "ok".into(),
-                            message: None,
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                match crate::v5::ops::git::push_refs(&ctx.dir, "origin", None) {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "push"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "push", e.to_string()); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "push".into(),
+                total, ok, errored,
+            };
+        }
+    }
+
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn status(
+        &self,
+        name: String,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let (mut clean, mut dirty, mut ahead, mut behind, mut errored) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                match crate::v5::ops::git::status(&ctx.dir) {
+                    Ok(s) => {
+                        let is_dirty = s.dirty();
+                        if is_dirty { dirty += 1; } else { clean += 1; }
+                        if s.ahead > 0 { ahead += 1; }
+                        if s.behind > 0 { behind += 1; }
+                        yield WorkspacesEvent::StatusSnapshot {
+                            reference: ctx.reference,
+                            branch: s.branch, upstream: s.upstream,
+                            ahead: s.ahead, behind: s.behind,
+                            staged: s.staged, unstaged: s.unstaged, untracked: s.untracked,
+                            dirty: is_dirty,
                         };
                     }
                     Err(e) => {
                         errored += 1;
-                        yield WorkspacesEvent::MemberGitResult {
-                            reference: wire,
-                            op: op.to_string(),
-                            status: "errored".into(),
-                            message: Some(e),
-                        };
+                        yield member_err(&ctx.reference, "status", e.to_string());
                     }
                 }
             }
-            yield WorkspacesEvent::WorkspaceGitSummary {
+            yield WorkspacesEvent::WorkspaceStatusSummary {
                 name: ws.name.as_str().to_string(),
-                op: op.to_string(),
-                total,
-                ok,
-                errored,
+                total, clean, dirty, ahead, behind, errored,
+            };
+        }
+    }
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        branch = "Branch name",
+        create = "If true, create the branch if absent (uses checkout -B)"
+    ))]
+    pub async fn checkout(
+        &self,
+        name: String,
+        branch: String,
+        create: Option<serde_json::Value>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if branch.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'branch'".into(),
+                };
+                return;
+            }
+            let create_b = create.as_ref().is_some_and(to_bool);
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                match crate::v5::ops::git::checkout(&ctx.dir, &branch, create_b) {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "checkout"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "checkout", e.to_string()); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "checkout".into(),
+                total, ok, errored,
+            };
+        }
+    }
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        message = "Commit message",
+        only_dirty = "If true (default), skip members with no staged changes",
+        allow_empty = "If true, pass --allow-empty to git commit"
+    ))]
+    pub async fn commit(
+        &self,
+        name: String,
+        message: String,
+        only_dirty: Option<serde_json::Value>,
+        allow_empty: Option<serde_json::Value>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if message.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'message'".into(),
+                };
+                return;
+            }
+            let only_dirty_b = only_dirty.as_ref().map_or(true, to_bool);
+            let allow_empty_b = allow_empty.as_ref().is_some_and(to_bool);
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32; let mut skipped = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                if only_dirty_b && !allow_empty_b {
+                    let nothing_to_commit = crate::v5::ops::git::status(&ctx.dir)
+                        .map(|s| s.staged == 0)
+                        .unwrap_or(false);
+                    if nothing_to_commit {
+                        skipped += 1;
+                        yield WorkspacesEvent::MemberGitResult {
+                            reference: ctx.reference,
+                            op: "commit".into(), status: "skipped".into(),
+                            message: Some("no staged changes".into()),
+                        };
+                        continue;
+                    }
+                }
+                match crate::v5::ops::git::commit_with(&ctx.dir, &message, allow_empty_b) {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "commit"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "commit", e.to_string()); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "commit".into(),
+                total, ok: ok + skipped, errored,
+            };
+        }
+    }
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        tag = "Tag name",
+        message = "Optional annotated-tag message"
+    ))]
+    pub async fn tag(
+        &self,
+        name: String,
+        tag: String,
+        message: Option<String>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if tag.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'tag'".into(),
+                };
+                return;
+            }
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let total = u32::try_from(ws.repos.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                let result = match message.as_deref() {
+                    Some(m) if !m.is_empty() => crate::v5::ops::git::tag_annotated(&ctx.dir, &tag, m),
+                    _ => crate::v5::ops::git::tag(&ctx.dir, &tag),
+                };
+                match result {
+                    Ok(()) => { ok += 1; yield member_ok(&ctx.reference, "tag"); }
+                    Err(e) => { errored += 1; yield member_err(&ctx.reference, "tag", e.to_string()); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws.name.as_str().to_string(), op: "tag".into(),
+                total, ok, errored,
             };
         }
     }
@@ -2092,6 +2263,113 @@ fn workspace_member_ref(entry: &crate::v5::config::WorkspaceRepo) -> (String, St
             reference.org.as_str().to_string(),
             reference.name.as_str().to_string(),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// V5PARITY-14: typed helpers shared by the workspace git verbs.
+// Each verb method has its own loop; these helpers carry the shared
+// pieces (load + decode) without becoming a string-dispatch hub.
+// ---------------------------------------------------------------------
+
+/// Per-member iteration context. `repo` is `None` when the member's
+/// org/repo can't be resolved against the loaded config — verbs that
+/// need the canonical remote (like `clone`) check this; verbs that
+/// only need the on-disk `dir` (like `fetch`/`status`) ignore it.
+struct MemberCtx<'a> {
+    reference: crate::v5::repos::RepoRefWire,
+    repo: Option<&'a crate::v5::config::OrgRepo>,
+    dir: std::path::PathBuf,
+}
+
+/// Load workspace + the global `LoadedConfig` for an iteration. On any
+/// failure returns the wire `Error` event the caller should yield.
+async fn load_iter_ctx(
+    config_dir: &std::path::Path,
+    name: &str,
+) -> Result<(crate::v5::config::WorkspaceConfig, crate::v5::config::LoadedConfig), WorkspacesEvent> {
+    if name.is_empty() {
+        return Err(WorkspacesEvent::Error {
+            code: Some("validation".into()),
+            message: "missing required parameter 'name'".into(),
+        });
+    }
+    let ws = match crate::v5::ops::state::load_workspace(config_dir, name) {
+        Ok(Some(c)) => c,
+        Ok(None) => return Err(WorkspacesEvent::Error {
+            code: Some("not_found".into()),
+            message: format!("workspace '{name}' not found"),
+        }),
+        Err(e) => return Err(WorkspacesEvent::Error {
+            code: Some("config_error".into()),
+            message: e.to_string(),
+        }),
+    };
+    let loaded = crate::v5::ops::state::load_all(config_dir)
+        .map_err(|e| WorkspacesEvent::Error {
+            code: Some("config_error".into()),
+            message: e.to_string(),
+        })?;
+    Ok((ws, loaded))
+}
+
+/// Iterate decoded member contexts. Skips shorthand entries that don't
+/// have `<org>/<name>` shape.
+fn member_ctxs<'a>(
+    ws: &'a crate::v5::config::WorkspaceConfig,
+    loaded: &'a crate::v5::config::LoadedConfig,
+    ws_path: &'a std::path::Path,
+) -> impl Iterator<Item = MemberCtx<'a>> + 'a {
+    ws.repos.iter().filter_map(|entry| {
+        let (org_s, name_s) = match entry {
+            crate::v5::config::WorkspaceRepo::Shorthand(s) => s.split_once('/')
+                .map(|(o, n)| (o.to_string(), n.to_string()))?,
+            crate::v5::config::WorkspaceRepo::Object { reference, .. } => (
+                reference.org.as_str().to_string(),
+                reference.name.as_str().to_string(),
+            ),
+        };
+        let dir_name = match entry {
+            crate::v5::config::WorkspaceRepo::Object { dir, .. } => dir.clone(),
+            _ => name_s.clone(),
+        };
+        let dir = ws_path.join(&dir_name);
+        let repo = loaded.orgs
+            .get(&crate::v5::config::OrgName::from(org_s.as_str()))
+            .and_then(|o| crate::v5::ops::state::find_repo(o, &name_s));
+        Some(MemberCtx {
+            reference: crate::v5::repos::RepoRefWire { org: org_s, name: name_s },
+            repo,
+            dir,
+        })
+    })
+}
+
+fn member_ok(reference: &crate::v5::repos::RepoRefWire, op: &str) -> WorkspacesEvent {
+    WorkspacesEvent::MemberGitResult {
+        reference: reference.clone(),
+        op: op.into(),
+        status: "ok".into(),
+        message: None,
+    }
+}
+
+fn member_err(reference: &crate::v5::repos::RepoRefWire, op: &str, msg: impl Into<String>) -> WorkspacesEvent {
+    WorkspacesEvent::MemberGitResult {
+        reference: reference.clone(),
+        op: op.into(),
+        status: "errored".into(),
+        message: Some(msg.into()),
+    }
+}
+
+/// Coerce a JSON value to bool. Accepts `true`/false`, the strings
+/// `"true"`/`"1"`/`"yes"` (lowercase), or returns the supplied default.
+fn to_bool(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => matches!(s.as_str(), "true" | "1" | "yes"),
+        _ => false,
     }
 }
 
