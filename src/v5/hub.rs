@@ -64,6 +64,32 @@ pub enum HyperforgeV5Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         present: Option<bool>,
     },
+    // V5PARITY-8: CLI events.
+    ReloadDone {
+        orgs: u32,
+        workspaces: u32,
+        secrets_refs: u32,
+    },
+    ConfigShow {
+        provider_map: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_workspace: Option<String>,
+    },
+    SshKeySet {
+        org: String,
+        forge: String,
+        path: String,
+    },
+    SshKeyShow {
+        org: String,
+        forge: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    BeginNextStep {
+        action: String,
+        message: String,
+    },
 }
 
 /// Root activation for hyperforge v5.
@@ -296,6 +322,235 @@ impl HyperforgeHub {
                     };
                 }
             }
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-8: CLI ergonomics — root methods.
+    // ==================================================================
+
+    /// Re-read all yaml from disk. v5 currently re-reads per-call so
+    /// this is a no-op invalidator; future caching makes it load-bearing.
+    #[plexus_macros::method]
+    pub async fn reload(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let store = YamlSecretStore::new(&config_dir);
+            let secrets_refs = store.list_refs().map(|v| v.len() as u32).unwrap_or(0);
+            yield HyperforgeV5Event::ReloadDone {
+                orgs: loaded.orgs.len() as u32,
+                workspaces: loaded.workspaces.len() as u32,
+                secrets_refs,
+            };
+        }
+    }
+
+    /// Show resolved global config: provider_map + default_workspace.
+    #[plexus_macros::method]
+    pub async fn config_show(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let mut pm = serde_json::Map::new();
+            for (k, v) in &loaded.global.provider_map {
+                let val = match v {
+                    crate::v5::config::ProviderKind::Github => "github",
+                    crate::v5::config::ProviderKind::Codeberg => "codeberg",
+                    crate::v5::config::ProviderKind::Gitlab => "gitlab",
+                };
+                pm.insert(k.as_str().to_string(), serde_json::Value::String(val.into()));
+            }
+            yield HyperforgeV5Event::ConfigShow {
+                provider_map: serde_json::Value::Object(pm),
+                default_workspace: loaded.global.default_workspace.as_ref().map(|w| w.as_str().to_string()),
+            };
+        }
+    }
+
+    /// Set an SSH-key credential on an org's forge block.
+    /// Convenience wrapper over `orgs.set_credential` with SSH-specific
+    /// shape; the underlying storage is identical.
+    #[plexus_macros::method(params(
+        org = "Org name",
+        forge = "Provider name (github | codeberg | gitlab)",
+        key = "Filesystem path to the SSH private key (~ expanded)"
+    ))]
+    pub async fn config_set_ssh_key(
+        &self,
+        org: String,
+        forge: String,
+        key: String,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            if org.is_empty() || forge.is_empty() || key.is_empty() {
+                yield HyperforgeV5Event::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter".into(),
+                };
+                return;
+            }
+            // Expand ~/.
+            let expanded = if let Some(rest) = key.strip_prefix("~/") {
+                if let Some(home) = std::env::var_os("HOME") {
+                    std::path::PathBuf::from(home).join(rest).display().to_string()
+                } else { key.clone() }
+            } else { key.clone() };
+            // Load + mutate the org yaml directly (cred shape: ssh_key).
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let Some(existing) = loaded.orgs.get(&crate::v5::config::OrgName::from(org.as_str())) else {
+                yield HyperforgeV5Event::Error {
+                    code: Some("not_found".into()),
+                    message: format!("org '{org}' not found"),
+                };
+                return;
+            };
+            let mut updated = existing.clone();
+            // Drop any existing ssh_key cred (one per forge convention),
+            // then add a fresh one.
+            updated.forge.credentials.retain(|c| !matches!(c.cred_type, crate::v5::config::CredentialType::SshKey));
+            updated.forge.credentials.push(crate::v5::config::CredentialEntry {
+                key: expanded.clone(),
+                cred_type: crate::v5::config::CredentialType::SshKey,
+            });
+            let orgs_dir = config_dir.join("orgs");
+            if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                yield HyperforgeV5Event::Error {
+                    code: Some("config_error".into()),
+                    message: e.to_string(),
+                };
+                return;
+            }
+            yield HyperforgeV5Event::SshKeySet { org, forge, path: expanded };
+        }
+    }
+
+    /// Read SSH key path(s) configured on an org. Never reveals file CONTENT.
+    #[plexus_macros::method(params(
+        org = "Org name",
+        forge = "Optional forge filter"
+    ))]
+    pub async fn config_show_ssh_key(
+        &self,
+        org: String,
+        forge: Option<String>,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let Some(existing) = loaded.orgs.get(&crate::v5::config::OrgName::from(org.as_str())) else {
+                yield HyperforgeV5Event::Error {
+                    code: Some("not_found".into()),
+                    message: format!("org '{org}' not found"),
+                };
+                return;
+            };
+            let provider_str = match existing.forge.provider {
+                crate::v5::config::ProviderKind::Github => "github",
+                crate::v5::config::ProviderKind::Codeberg => "codeberg",
+                crate::v5::config::ProviderKind::Gitlab => "gitlab",
+            };
+            // Apply optional --forge filter (we only have one forge per org for now,
+            // but the parameter is here for v4-shape compatibility).
+            if let Some(f) = forge.as_deref() {
+                if f != provider_str {
+                    yield HyperforgeV5Event::SshKeyShow {
+                        org: org.clone(),
+                        forge: f.to_string(),
+                        path: None,
+                    };
+                    return;
+                }
+            }
+            let path = existing.forge.credentials.iter()
+                .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::SshKey))
+                .map(|c| c.key.clone());
+            yield HyperforgeV5Event::SshKeyShow {
+                org,
+                forge: provider_str.to_string(),
+                path,
+            };
+        }
+    }
+
+    /// Guided onboarding entry point. Idempotent.
+    /// Creates `$HF_CONFIG/config.yaml` with the default provider_map
+    /// if missing; then emits a list of next-step suggestions.
+    #[plexus_macros::method]
+    pub async fn begin(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        let config_dir = self.state.config_dir.clone();
+        stream! {
+            // Ensure config.yaml exists with the default provider_map.
+            let cfg_path = config_dir.join("config.yaml");
+            let existed = cfg_path.exists();
+            if !existed {
+                if let Err(e) = std::fs::create_dir_all(&config_dir) {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("io_error".into()),
+                        message: format!("create config dir: {e}"),
+                    };
+                    return;
+                }
+                let default_yaml = "provider_map:\n  github.com: github\n  codeberg.org: codeberg\n  gitlab.com: gitlab\n";
+                if let Err(e) = std::fs::write(&cfg_path, default_yaml) {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("io_error".into()),
+                        message: format!("write {}: {e}", cfg_path.display()),
+                    };
+                    return;
+                }
+            }
+            yield HyperforgeV5Event::BeginNextStep {
+                action: "orgs.create".into(),
+                message: "Register an org: `orgs create --name <org> --provider github`".into(),
+            };
+            yield HyperforgeV5Event::BeginNextStep {
+                action: "secrets.set".into(),
+                message: "Add a token: `secrets set --key secrets://github/<org>/token --value <gh-token>`".into(),
+            };
+            yield HyperforgeV5Event::BeginNextStep {
+                action: "orgs.set_credential".into(),
+                message: "Wire it: `orgs set_credential --name <org> --key secrets://github/<org>/token --type token`".into(),
+            };
+            yield HyperforgeV5Event::BeginNextStep {
+                action: "repos.import".into(),
+                message: "Pull in your repos: `repos import --org <org> --forge github`".into(),
+            };
         }
     }
 }
