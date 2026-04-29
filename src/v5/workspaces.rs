@@ -167,6 +167,19 @@ pub enum WorkspacesEvent {
         path: String,
         repo_count: u32,
     },
+    /// V5PARITY-22: workspace created via `from_org`.
+    WorkspaceCreated {
+        name: String,
+        path: String,
+        org: String,
+    },
+    /// V5PARITY-22: per-member add result during `from_org`.
+    MemberAdded {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        already_present: bool,
+    },
     /// V5PARITY-4: per-member analytics event (size/loc/large/dirty).
     /// `metric` is `size`, `loc`, `large_files`, or `dirty`; fields
     /// populated depend on the metric.
@@ -1999,6 +2012,210 @@ impl WorkspacesHub {
     }
 
     // ==================================================================
+    // V5PARITY-22: workspaces.from_org — one-shot workspace creation.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name (must already be configured)",
+        target_path = "Absolute filesystem path for the workspace (named target_path because synapse path-expands params named exactly 'path')",
+        name = "Workspace name (defaults to org name)",
+        filter = "Glob filter on member names; comma-separated for multiple",
+        clone = "Clone every member into the path (default: true)",
+        update = "On re-run, run pull on existing checkouts (default: false)"
+    ))]
+    pub async fn from_org(
+        &self,
+        org: String,
+        target_path: String,
+        name: Option<String>,
+        filter: Option<String>,
+        clone: Option<serde_json::Value>,
+        update: Option<serde_json::Value>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if org.is_empty() || target_path.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'org' or 'target_path'".into(),
+                };
+                return;
+            }
+            let do_clone = clone.as_ref().map_or(true, to_bool);
+            let do_update = update.as_ref().is_some_and(to_bool);
+            let ws_name = name.unwrap_or_else(|| org.clone());
+            let ws_path = std::path::PathBuf::from(&target_path);
+
+            // Load org config.
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("config_error".into()),
+                        message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            let org_key = crate::v5::config::OrgName::from(org.as_str());
+            let Some(org_cfg) = loaded.orgs.get(&org_key) else {
+                yield WorkspacesEvent::Error {
+                    code: Some("not_found".into()),
+                    message: format!("org '{org}' not found"),
+                };
+                return;
+            };
+            // Filter member set.
+            let glob = filter.as_deref().map(|s| GlobSet::from_csv(s)).transpose();
+            let glob = match glob {
+                Ok(g) => g,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("validation".into()),
+                        message: format!("invalid filter: {e}"),
+                    };
+                    return;
+                }
+            };
+            let candidates: Vec<&crate::v5::config::OrgRepo> = org_cfg.repos.iter()
+                .filter(|r| glob.as_ref().map_or(true, |g| g.matches(r.name.as_str())))
+                .collect();
+            if candidates.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "filter matched zero repos".into(),
+                };
+                return;
+            }
+            // Ensure path exists.
+            if let Err(e) = std::fs::create_dir_all(&ws_path) {
+                yield WorkspacesEvent::Error {
+                    code: Some("io_error".into()),
+                    message: format!("create {}: {e}", ws_path.display()),
+                };
+                return;
+            }
+            // Load (or create) the workspace yaml.
+            let ws_dir = config_dir.join("workspaces");
+            let existing_ws = if ws_dir.is_dir() {
+                crate::v5::ops::state::load_workspaces(&ws_dir).ok()
+                    .and_then(|m| m.into_iter().find(|(_, w)| w.name.as_str() == ws_name)
+                        .map(|(_, w)| w))
+            } else {
+                None
+            };
+            let mut ws = existing_ws.unwrap_or_else(|| crate::v5::config::WorkspaceConfig {
+                name: crate::v5::config::WorkspaceName::from(ws_name.as_str()),
+                path: crate::v5::config::FsPath::from(target_path.as_str()),
+                repos: Vec::new(),
+            });
+            let was_new = ws.repos.is_empty();
+            // Existing membership index.
+            let mut already: std::collections::BTreeSet<(String, String)> = ws.repos.iter()
+                .filter_map(|wr| match wr {
+                    crate::v5::config::WorkspaceRepo::Shorthand(s) => s.split_once('/')
+                        .map(|(o, n)| (o.to_string(), n.to_string())),
+                    crate::v5::config::WorkspaceRepo::Object { reference, .. } => Some((
+                        reference.org.as_str().to_string(),
+                        reference.name.as_str().to_string(),
+                    )),
+                })
+                .collect();
+            if was_new {
+                yield WorkspacesEvent::WorkspaceCreated {
+                    name: ws_name.clone(),
+                    path: target_path.clone(),
+                    org: org.clone(),
+                };
+            }
+            // Add members.
+            for repo in &candidates {
+                let key = (org.clone(), repo.name.as_str().to_string());
+                let already_present = already.contains(&key);
+                if !already_present {
+                    ws.repos.push(crate::v5::config::WorkspaceRepo::Shorthand(
+                        format!("{}/{}", key.0, key.1),
+                    ));
+                    already.insert(key.clone());
+                }
+                yield WorkspacesEvent::MemberAdded {
+                    reference: crate::v5::repos::RepoRefWire {
+                        org: key.0.clone(), name: key.1.clone(),
+                    },
+                    already_present,
+                };
+            }
+            // Persist workspace yaml.
+            if let Err(e) = crate::v5::ops::state::save_workspace(&ws_dir, &ws) {
+                yield WorkspacesEvent::Error {
+                    code: Some("io_error".into()),
+                    message: e.to_string(),
+                };
+                return;
+            }
+            // Optionally clone (or pull-update) each member.
+            if !do_clone {
+                yield WorkspacesEvent::WorkspaceGitSummary {
+                    name: ws_name, op: "from_org".into(),
+                    total: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+                    ok: 0, errored: 0,
+                };
+                return;
+            }
+            let total = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+            let mut ok = 0u32;
+            let mut errored = 0u32;
+            // Resolve org's SSH key for clone forwarding (V5PARITY-5).
+            let key_path = ssh_key_path_for_org(org_cfg);
+            let ssh_cmd = key_path.as_ref().map(|p| crate::v5::ops::git::format_ssh_command(p));
+            for repo in &candidates {
+                let wire = crate::v5::repos::RepoRefWire {
+                    org: org.clone(),
+                    name: repo.name.as_str().to_string(),
+                };
+                let dir = ws_path.join(repo.name.as_str());
+                let result: Result<(), String> = (|| {
+                    if dir.exists() {
+                        if !do_update { return Ok(()); }
+                        // pull on existing
+                        let branch = crate::v5::ops::git::status(&dir).ok()
+                            .and_then(|s| s.branch).unwrap_or_else(|| "main".into());
+                        crate::v5::ops::git::pull_ff(&dir, "origin", &branch)
+                            .map_err(|e| e.to_string())
+                    } else {
+                        let url = repo.canonical_remote().map(|r| r.url.as_str())
+                            .ok_or_else(|| "no remote".to_string())?;
+                        let env: Vec<(&str, &str)> = match ssh_cmd.as_deref() {
+                            Some(s) => vec![("GIT_SSH_COMMAND", s)],
+                            None => Vec::new(),
+                        };
+                        let r = if env.is_empty() {
+                            crate::v5::ops::git::clone_repo(url, &dir)
+                        } else {
+                            crate::v5::ops::git::clone_repo_with_env(url, &dir, &env)
+                        };
+                        r.map_err(|e| e.to_string())?;
+                        // Persist core.sshCommand on the new clone so
+                        // subsequent fetch/pull/push reuses the key.
+                        if let Some(p) = key_path.as_ref() {
+                            let _ = crate::v5::ops::git::set_ssh_command(&dir, p);
+                        }
+                        Ok(())
+                    }
+                })();
+                match result {
+                    Ok(()) => { ok += 1; yield member_ok(&wire, "from_org"); }
+                    Err(e) => { errored += 1; yield member_err(&wire, "from_org", e); }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceGitSummary {
+                name: ws_name, op: "from_org".into(),
+                total, ok, errored,
+            };
+        }
+    }
+
+    // ==================================================================
     // V5PARITY-4: workspace-level analytics aggregates.
     // ==================================================================
 
@@ -2372,6 +2589,75 @@ fn to_bool(v: &serde_json::Value) -> bool {
         serde_json::Value::String(s) => matches!(s.as_str(), "true" | "1" | "yes"),
         _ => false,
     }
+}
+
+/// V5PARITY-22: minimal glob matcher. Supports `*` (any chars), `?`
+/// (single char). Comma-separated patterns via `from_csv` are OR'd.
+/// Lifted to its own helper rather than pulling in the `glob` crate
+/// since v5's filter needs are basic.
+struct GlobSet {
+    patterns: Vec<String>,
+}
+
+impl GlobSet {
+    fn from_csv(s: &str) -> Result<Self, String> {
+        let patterns: Vec<String> = s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if patterns.is_empty() {
+            return Err("empty filter".into());
+        }
+        Ok(Self { patterns })
+    }
+    fn matches(&self, name: &str) -> bool {
+        self.patterns.iter().any(|p| glob_match(p, name))
+    }
+}
+
+fn glob_match(pattern: &str, s: &str) -> bool {
+    // Iterative DP over (pattern_idx, str_idx).
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1; ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// V5PARITY-22 helper: resolve the org's SSH private key path. Mirrors
+/// `repos.rs::ssh_key_for_org` (different module visibility, same shape).
+fn ssh_key_path_for_org(org: &crate::v5::config::OrgConfig) -> Option<std::path::PathBuf> {
+    org.forge.credentials.iter()
+        .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::SshKey))
+        .map(|c| {
+            let raw = c.key.as_str();
+            if let Some(rest) = raw.strip_prefix("~/") {
+                if let Some(home) = std::env::var_os("HOME") {
+                    return std::path::PathBuf::from(home).join(rest);
+                }
+            }
+            std::path::PathBuf::from(raw)
+        })
 }
 
 /// Read `origin` URL via `ops::git::read_origin_url` (V5PARITY-15).

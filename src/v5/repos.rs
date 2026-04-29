@@ -317,6 +317,25 @@ pub enum RepoEvent {
         #[serde(skip_serializing_if = "std::ops::Not::not", default)]
         persisted: bool,
     },
+    // V5PARITY-25: adopt-existing-checkout events.
+    /// `repos.register` succeeded — the local checkout is now tracked.
+    RepoRegistered {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        path: String,
+        remotes: Vec<RemoteWire>,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        init_done: bool,
+    },
+    /// `repos.register` found an existing entry under the same name
+    /// with different remotes — refuses to overwrite. Caller resolves
+    /// manually (e.g. `repos.add_remote` to merge).
+    RepoConflict {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        existing_remotes: Vec<String>,
+        observed_remotes: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2419,6 +2438,182 @@ impl ReposHub {
             };
         }
     }
+
+    // ==================================================================
+    // V5PARITY-25: adopt an existing local checkout.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        target_path = "Path to an existing checkout (named target_path because synapse path-expands params named exactly 'path')",
+        org = "Override the auto-derived org name (default: derived from origin URL via provider_map)",
+        repo_name = "Override the auto-derived repo name (default: last URL segment minus .git)",
+        init = "Run repos.init to write .hyperforge/config.toml (default: true)"
+    ))]
+    pub async fn register(
+        &self,
+        target_path: String,
+        org: Option<String>,
+        repo_name: Option<String>,
+        init: Option<serde_json::Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if target_path.is_empty() {
+                yield validation_event("missing required parameter 'target_path'");
+                return;
+            }
+            let do_init = init.as_ref().map_or(true, |v| to_bool(v, true));
+            let dir = std::path::PathBuf::from(&target_path);
+            if !dir.is_dir() {
+                yield validation_event(format!("not a directory: {}", dir.display()));
+                return;
+            }
+            // Read origin URL via ops::git (V5PARITY-15).
+            let origin = match crate::v5::ops::git::read_origin_url(&dir) {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    yield validation_event(format!("no origin remote in {}", dir.display()));
+                    return;
+                }
+                Err(e) => {
+                    yield RepoEvent::Error {
+                        code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                    };
+                    return;
+                }
+            };
+            // Parse host/owner/name.
+            let Some((host, derived_owner, derived_name)) =
+                crate::v5::adapters::parse_remote_url(&origin)
+            else {
+                yield validation_event(format!("could not parse remote URL: {origin}"));
+                return;
+            };
+            // Resolve provider via the global provider_map.
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let domain = DomainName::from(host.as_str());
+            let provider = match loaded.global.provider_map.get(&domain) {
+                Some(p) => *p,
+                None => {
+                    yield validation_event(format!("no provider for host '{host}'; add it to config.yaml provider_map"));
+                    return;
+                }
+            };
+            let _ = provider; // recorded on Remote below if/when needed
+            let org_name = org.as_deref().unwrap_or(&derived_owner).to_string();
+            let name = repo_name.as_deref().unwrap_or(&derived_name).to_string();
+            let org_key = OrgName::from(org_name.as_str());
+            let mut org_cfg = match loaded.orgs.get(&org_key).cloned() {
+                Some(c) => c,
+                None => {
+                    yield not_found_event(format!("org '{org_name}' not configured; run orgs.bootstrap first"));
+                    return;
+                }
+            };
+            // Collect ALL remotes from the checkout's git config (not
+            // just origin). Pulls these via git2 for free locally.
+            let observed_remotes = collect_all_remotes(&dir).unwrap_or_else(|_| {
+                vec![crate::v5::config::Remote {
+                    url: crate::v5::config::RemoteUrl::from(origin.as_str()),
+                    provider: None,
+                }]
+            });
+            // Conflict check: existing entry with same name but different remotes.
+            if let Some(existing) = org_cfg.repos.iter().find(|r| r.name.as_str() == name) {
+                let existing_urls: std::collections::BTreeSet<&str> =
+                    existing.remotes.iter().map(|r| r.url.as_str()).collect();
+                let observed_urls: std::collections::BTreeSet<&str> =
+                    observed_remotes.iter().map(|r| r.url.as_str()).collect();
+                if existing_urls != observed_urls {
+                    yield RepoEvent::RepoConflict {
+                        reference: RepoRefWire { org: org_name, name },
+                        existing_remotes: existing_urls.into_iter().map(String::from).collect(),
+                        observed_remotes: observed_urls.into_iter().map(String::from).collect(),
+                    };
+                    return;
+                }
+                // Same remotes — idempotent, no write needed but emit success.
+            } else {
+                // Add the new entry.
+                org_cfg.repos.push(crate::v5::config::OrgRepo {
+                    name: RepoName::from(name.as_str()),
+                    remotes: observed_remotes.clone(),
+                    metadata: None,
+                });
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &org_cfg) {
+                    yield cfg_error_event(e); return;
+                }
+            }
+            // Optionally write `.hyperforge/config.toml` via repos.init.
+            let init_done = if do_init {
+                let hf_dir = dir.join(".hyperforge");
+                let _ = std::fs::create_dir_all(&hf_dir);
+                let toml = format!(
+                    "repo_name = \"{name}\"\norg = \"{org_name}\"\nforges = [\"{provider_str}\"]\n",
+                    provider_str = match provider {
+                        ProviderKind::Github => "github",
+                        ProviderKind::Codeberg => "codeberg",
+                        ProviderKind::Gitlab => "gitlab",
+                    },
+                );
+                let _ = std::fs::write(hf_dir.join("config.toml"), toml);
+                true
+            } else { false };
+            let remotes_wire: Vec<RemoteWire> = observed_remotes.iter().map(|r| RemoteWire {
+                url: r.url.as_str().to_string(),
+                provider: match provider {
+                    ProviderKind::Github => "github".into(),
+                    ProviderKind::Codeberg => "codeberg".into(),
+                    ProviderKind::Gitlab => "gitlab".into(),
+                },
+            }).collect();
+            yield RepoEvent::RepoRegistered {
+                reference: RepoRefWire { org: org_name, name },
+                path: target_path,
+                remotes: remotes_wire,
+                init_done,
+            };
+        }
+    }
+}
+
+/// V5PARITY-25 helper: enumerate every remote on a checkout via git2.
+/// Falls back to `Err` if the dir isn't a real repo (caller may have
+/// only origin from `read_origin_url`'s INI fallback).
+fn collect_all_remotes(dir: &std::path::Path) -> Result<Vec<crate::v5::config::Remote>, ()> {
+    use git2::Repository;
+    let repo = Repository::open(dir).map_err(|_| ())?;
+    let names = repo.remotes().map_err(|_| ())?;
+    let mut origin_url: Option<String> = None;
+    let mut others: Vec<String> = Vec::new();
+    for name in names.iter().flatten() {
+        if let Ok(remote) = repo.find_remote(name) {
+            if let Some(url) = remote.url() {
+                if name == "origin" {
+                    origin_url = Some(url.to_string());
+                } else {
+                    others.push(url.to_string());
+                }
+            }
+        }
+    }
+    let mut out: Vec<crate::v5::config::Remote> = Vec::new();
+    if let Some(u) = origin_url {
+        out.push(crate::v5::config::Remote {
+            url: crate::v5::config::RemoteUrl::from(u.as_str()),
+            provider: None,
+        });
+    }
+    for u in others {
+        out.push(crate::v5::config::Remote {
+            url: crate::v5::config::RemoteUrl::from(u.as_str()),
+            provider: None,
+        });
+    }
+    if out.is_empty() { Err(()) } else { Ok(out) }
 }
 
 /// Resolve the SSH private-key path for an org. Returns the path on

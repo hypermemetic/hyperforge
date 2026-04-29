@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-25
 title: "REPO-REGISTER — adopt an existing local checkout"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: []

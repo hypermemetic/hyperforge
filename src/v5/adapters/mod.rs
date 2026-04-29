@@ -387,6 +387,39 @@ pub fn for_provider(kind: ProviderKind) -> Box<dyn ForgePort> {
 // Shared helpers used by concrete adapters.
 // ---------------------------------------------------------------------
 
+/// V5PARITY-25: parse `(host, owner, name)` from a git URL. Strips
+/// `.git` suffix. Owner is the last-but-one path segment; name is the
+/// last segment (gitlab nested groups are simplified to that pair).
+#[must_use]
+pub fn parse_remote_url(url: &str) -> Option<(String, String, String)> {
+    let host = extract_host(url)?;
+    let trimmed = url.trim();
+    // Find the path portion after the host.
+    let path = if let Some(rest) = trimmed.strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("ssh://"))
+        .or_else(|| trimmed.strip_prefix("git://"))
+    {
+        // After scheme. Skip the host (and optional :port).
+        let after_host = rest.split_once('/').map(|(_, p)| p)?;
+        after_host.to_string()
+    } else if let Some(at) = trimmed.find('@') {
+        let after_at = &trimmed[at + 1..];
+        let (_, p) = after_at.split_once(':')?;
+        p.to_string()
+    } else {
+        return None;
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let name = segments[segments.len() - 1].to_string();
+    let owner = segments[segments.len() - 2].to_string();
+    Some((host, owner, name))
+}
+
 /// Extract host portion of a `Remote`'s URL. Accepts:
 /// * `https://host/path…`
 /// * `http://host/path…`

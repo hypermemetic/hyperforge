@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-23
 title: "AUTH-DISCOVERY — providerless requirements + external-token detect"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: [V5PARITY-20, V5PARITY-21]

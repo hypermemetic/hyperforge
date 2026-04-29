@@ -95,6 +95,31 @@ pub enum HyperforgeV5Event {
         action: String,
         message: String,
     },
+    // V5PARITY-23 auth-discovery events.
+    /// Static (no-org) scope/permission requirements for a provider.
+    /// Emitted by `auth_requirements_for`.
+    AuthRequirementsFor {
+        provider: String,
+        required_scopes: Vec<String>,
+        recommended_scopes: Vec<String>,
+        optional_scopes: Vec<String>,
+    },
+    /// External CLI auth detected on the host. Emitted by
+    /// `auth_detect_external`. Token values NEVER appear in this
+    /// payload; only metadata.
+    ExternalAuthDetected {
+        provider: String,
+        source: String, // "gh-cli" | "glab-cli" | etc.
+        logged_in: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        scopes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accessible_orgs: Option<Vec<String>>,
+    },
 }
 
 /// Root activation for hyperforge v5.
@@ -573,6 +598,91 @@ impl HyperforgeHub {
                 action: "repos.import".into(),
                 message: "Pull in your repos: `repos import --org <org> --forge github`".into(),
             };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-23: auth discovery (no org context).
+    // ==================================================================
+
+    /// Static scope/permission requirements per provider for full
+    /// hyperforge functionality. Independent of any configured org.
+    #[plexus_macros::method(params(provider = "github | codeberg | gitlab"))]
+    pub async fn auth_requirements_for(
+        &self,
+        provider: String,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        stream! {
+            let lower = provider.to_lowercase();
+            let (required, recommended, optional): (&[&str], &[&str], &[&str]) = match lower.as_str() {
+                "github"   => (&["repo", "read:org"], &["delete_repo"], &["gist"]),
+                "codeberg" => (&["repository", "read:user"], &[], &[]),
+                "gitlab"   => (&["api", "read_repository"], &["write_repository"], &[]),
+                _ => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("validation".into()),
+                        message: format!("unknown provider '{provider}'"),
+                    };
+                    return;
+                }
+            };
+            yield HyperforgeV5Event::AuthRequirementsFor {
+                provider: lower,
+                required_scopes: required.iter().map(|&s| s.to_string()).collect(),
+                recommended_scopes: recommended.iter().map(|&s| s.to_string()).collect(),
+                optional_scopes: optional.iter().map(|&s| s.to_string()).collect(),
+            };
+        }
+    }
+
+    /// Probe for known external auth sources on the daemon host.
+    /// Without `--provider`, probes all three. Token values are NEVER
+    /// included in the emitted events.
+    #[plexus_macros::method(params(provider = "Optional filter: github | codeberg | gitlab"))]
+    pub async fn auth_detect_external(
+        &self,
+        provider: Option<String>,
+    ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
+        stream! {
+            use crate::v5::ops::external_auth::{
+                detect_status, list_accessible_orgs, ExternalAuthProvider,
+            };
+            let providers: Vec<ExternalAuthProvider> = match provider.as_deref() {
+                None => vec![
+                    ExternalAuthProvider::Github,
+                    ExternalAuthProvider::Codeberg,
+                    ExternalAuthProvider::Gitlab,
+                ],
+                Some("github") => vec![ExternalAuthProvider::Github],
+                Some("codeberg") => vec![ExternalAuthProvider::Codeberg],
+                Some("gitlab") => vec![ExternalAuthProvider::Gitlab],
+                Some(other) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("validation".into()),
+                        message: format!("unknown provider '{other}'"),
+                    };
+                    return;
+                }
+            };
+            for p in providers {
+                let Some(status) = detect_status(p) else { continue };
+                // For logged-in providers, list orgs. Failures here are
+                // non-fatal — emit the status without orgs.
+                let accessible_orgs = if status.logged_in {
+                    list_accessible_orgs(p).ok()
+                } else {
+                    None
+                };
+                yield HyperforgeV5Event::ExternalAuthDetected {
+                    provider: p.to_string(),
+                    source: format!("{}-cli", p.cli()),
+                    logged_in: status.logged_in,
+                    username: status.username,
+                    host: status.host,
+                    scopes: status.scopes,
+                    accessible_orgs,
+                };
+            }
         }
     }
 }

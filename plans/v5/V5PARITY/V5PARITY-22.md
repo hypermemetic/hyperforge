@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-22
 title: "WS-FROM-ORG — `workspaces.from_org` one-shot creation"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: [V5PARITY-3, V5PARITY-21]
 unlocks: []
