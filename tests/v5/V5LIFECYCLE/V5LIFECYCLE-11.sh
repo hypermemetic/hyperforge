@@ -48,6 +48,9 @@ grep_violation "compute_drift" '[^a-z_]compute_drift\(' '^src/v5/ops/'
 # V5PARITY-15 widened the path scope from a single file to the dir after
 # the module split into mod.rs / subprocess.rs / local.rs.
 grep_violation "command-git"  'Command::new\("git"\)' '^src/v5/ops/git/'
+# V5PARITY-27: `Command::new("gh")` lives in ops/external_auth/ only.
+# Same shape as command-git — single subprocess source per forge CLI.
+grep_violation "command-gh"   'Command::new\("gh"\)' '^src/v5/ops/external_auth/'
 
 # --- U5: .hyperforge init (always tier 1) ---
 TMP="$(mktemp -d -t v5life-ckpt-XXXXXX)"

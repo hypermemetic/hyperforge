@@ -1405,6 +1405,7 @@ impl WorkspacesHub {
                     .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::Token))
                     .map(|c| c.key.clone());
                 let token_ref_str = token_ref.as_deref();
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(org_cfg));
                 let _ = provider; // provider derivation happens inside ops::repo::*
                 let repo_ref = crate::v5::config::RepoRef {
                     org: crate::v5::config::OrgName::from(org_s.as_str()),
@@ -1412,7 +1413,7 @@ impl WorkspacesHub {
                 };
                 // V5LIFECYCLE-4: probe for existence via ops::repo.
                 match crate::v5::ops::repo::exists_on_forge(
-                    remote, &repo_ref, &loaded.global.provider_map, &resolver, token_ref_str,
+                    remote, &repo_ref, &loaded.global.provider_map, &resolver, token_ref_str, fallback_token_ref.clone(),
                 ).await {
                     Ok(false) => {
                         // Absent → create via ops::repo::create_on_forge.
@@ -1432,7 +1433,7 @@ impl WorkspacesHub {
                             .and_then(|m| m.description.clone())
                             .unwrap_or_default();
                         let diff = match crate::v5::ops::repo::create_on_forge(
-                            remote, &repo_ref, vis, &desc, &loaded.global.provider_map, &resolver, token_ref_str,
+                            remote, &repo_ref, vis, &desc, &loaded.global.provider_map, &resolver, token_ref_str, fallback_token_ref.clone(),
                         ).await {
                             Ok(()) => {
                                 created += 1;

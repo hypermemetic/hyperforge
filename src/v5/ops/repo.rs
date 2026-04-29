@@ -125,6 +125,19 @@ pub fn token_ref_for(org: &OrgConfig) -> Option<&str> {
         .map(|c| c.key.as_str())
 }
 
+/// V5PARITY-24: provider-default secret path for an org. The convention
+/// is `secrets://<provider>/_default/token`. Always returns a path; the
+/// secret may or may not exist — that's a runtime resolution concern.
+#[must_use]
+pub fn default_token_ref_for(org: &OrgConfig) -> String {
+    let provider = match org.forge.provider {
+        ProviderKind::Github => "github",
+        ProviderKind::Codeberg => "codeberg",
+        ProviderKind::Gitlab => "gitlab",
+    };
+    format!("secrets://{provider}/_default/token")
+}
+
 /// Does this remote exist on its forge?
 pub async fn exists_on_forge(
     remote: &Remote,
@@ -132,15 +145,13 @@ pub async fn exists_on_forge(
     provider_map: &BTreeMap<DomainName, ProviderKind>,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<bool, ForgePortError> {
     let provider = derive_provider(remote, provider_map).map_err(|e| {
         ForgePortError::new(ForgeErrorClass::Network, e)
     })?;
     let adapter = for_provider(provider);
-    let auth = ForgeAuth {
-        token_ref: token_ref,
-        resolver,
-    };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     adapter.repo_exists(remote, repo_ref, &auth).await
 }
 
@@ -153,15 +164,13 @@ pub async fn create_on_forge(
     provider_map: &BTreeMap<DomainName, ProviderKind>,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<(), ForgePortError> {
     let provider = derive_provider(remote, provider_map).map_err(|e| {
         ForgePortError::new(ForgeErrorClass::Network, e)
     })?;
     let adapter = for_provider(provider);
-    let auth = ForgeAuth {
-        token_ref: token_ref,
-        resolver,
-    };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     adapter.create_repo(remote, repo_ref, visibility, description, &auth).await
 }
 
@@ -172,15 +181,13 @@ pub async fn delete_on_forge(
     provider_map: &BTreeMap<DomainName, ProviderKind>,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<(), ForgePortError> {
     let provider = derive_provider(remote, provider_map).map_err(|e| {
         ForgePortError::new(ForgeErrorClass::Network, e)
     })?;
     let adapter = for_provider(provider);
-    let auth = ForgeAuth {
-        token_ref: token_ref,
-        resolver,
-    };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     adapter.delete_repo(remote, repo_ref, &auth).await
 }
 
@@ -192,12 +199,13 @@ pub async fn rename_on_forge(
     provider_map: &BTreeMap<DomainName, ProviderKind>,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<(), ForgePortError> {
     let provider = derive_provider(remote, provider_map).map_err(|e| {
         ForgePortError::new(ForgeErrorClass::Network, e)
     })?;
     let adapter = for_provider(provider);
-    let auth = ForgeAuth { token_ref, resolver };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     adapter.rename_repo(remote, repo_ref, new_name, &auth).await
 }
 
@@ -209,12 +217,10 @@ pub async fn list_on_forge(
     org: &crate::v5::config::OrgName,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<Vec<crate::v5::adapters::RemoteRepo>, ForgePortError> {
     let adapter = for_provider(provider);
-    let auth = ForgeAuth {
-        token_ref,
-        resolver,
-    };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     adapter.list_repos(org, &auth).await
 }
 
@@ -226,15 +232,13 @@ pub async fn write_metadata_on_forge(
     provider_map: &BTreeMap<DomainName, ProviderKind>,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<MetadataFields, ForgePortError> {
     let provider = derive_provider(remote, provider_map).map_err(|e| {
         ForgePortError::new(ForgeErrorClass::Network, e)
     })?;
     let adapter = for_provider(provider);
-    let auth = ForgeAuth {
-        token_ref,
-        resolver,
-    };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     adapter.write_metadata(remote, repo_ref, fields, &auth).await
 }
 
@@ -247,15 +251,13 @@ pub async fn privatize_on_forge(
     provider_map: &BTreeMap<DomainName, ProviderKind>,
     resolver: &dyn SecretResolver,
     token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
 ) -> Result<(), ForgePortError> {
     let provider = derive_provider(remote, provider_map).map_err(|e| {
         ForgePortError::new(ForgeErrorClass::Network, e)
     })?;
     let adapter = for_provider(provider);
-    let auth = ForgeAuth {
-        token_ref: token_ref,
-        resolver,
-    };
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
     let mut fields: MetadataFields = std::collections::BTreeMap::new();
     fields.insert(
         DriftFieldKind::Visibility,
@@ -313,6 +315,7 @@ pub async fn sync_one(
     remote_filter: Option<&str>,
 ) -> Vec<SyncOutcomeEntry> {
     let tref = token_ref_for(org);
+    let fallback = Some(default_token_ref_for(org));
     let repo_ref = RepoRef {
         org: org.name.clone(),
         name: repo.name.clone(),
@@ -342,6 +345,7 @@ pub async fn sync_one(
         let adapter = for_provider(provider.unwrap());
         let auth = ForgeAuth {
             token_ref: tref,
+            fallback_token_ref: fallback.clone(),
             resolver,
         };
         match adapter.read_metadata(r, &repo_ref, &auth).await {

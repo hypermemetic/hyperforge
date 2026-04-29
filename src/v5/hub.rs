@@ -27,9 +27,14 @@ use crate::v5::workspaces::WorkspacesHub;
 pub enum HyperforgeV5Event {
     /// Daemon self-report. `version` is the crate version; `config_dir`
     /// is the absolute, expanded config directory in use (V5CORE-5).
+    /// V5PARITY-26: `onboarding_hint` is populated only when the
+    /// config dir is empty (no orgs, no workspaces) so first-time
+    /// users see a pointer to `begin` without having to know it exists.
     Status {
         version: String,
         config_dir: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        onboarding_hint: Option<String>,
     },
     /// Secret-resolve success (V5CORE-4). Carries the plaintext value
     /// under `.value`. Only emitted by `resolve_secret`; the redaction
@@ -156,9 +161,19 @@ impl HyperforgeHub {
     #[plexus_macros::method]
     pub async fn status(&self) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
         let version = env!("CARGO_PKG_VERSION").to_string();
-        let config_dir = self.state.config_dir.display().to_string();
+        let config_dir_path = self.state.config_dir.clone();
+        let config_dir = config_dir_path.display().to_string();
         stream! {
-            yield HyperforgeV5Event::Status { version, config_dir };
+            // V5PARITY-26: empty-config detection — no orgs/, no workspaces/.
+            let onboarding_hint = if config_is_empty(&config_dir_path) {
+                Some(
+                    "Run `hyperforge-v5 onboard` for guided setup, or call `begin` for next-step hints."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            yield HyperforgeV5Event::Status { version, config_dir, onboarding_hint };
         }
     }
 
@@ -254,6 +269,7 @@ impl HyperforgeHub {
                         &loaded.global.provider_map,
                         &resolver,
                         Some(cred.key.as_str()),
+                        Some(crate::v5::ops::repo::default_token_ref_for(org_cfg)),
                     ).await;
                     let (valid, msg) = match result {
                         Ok(_) => (true, None),
@@ -559,4 +575,21 @@ impl HyperforgeHub {
             };
         }
     }
+}
+
+/// V5PARITY-26: a config dir is "empty" when neither `orgs/` nor
+/// `workspaces/` contains any *.yaml files. We don't check `secrets.yaml`
+/// because the secret store is permissioned-but-content-shared with v4
+/// in the historical layout — finding it doesn't imply v5 setup.
+fn config_is_empty(config_dir: &std::path::Path) -> bool {
+    fn dir_has_yaml(p: &std::path::Path) -> bool {
+        std::fs::read_dir(p)
+            .ok()
+            .map(|rd| rd.flatten().any(|e| {
+                e.path().extension().is_some_and(|ext| ext == "yaml")
+            }))
+            .unwrap_or(false)
+    }
+    !dir_has_yaml(&config_dir.join("orgs"))
+        && !dir_has_yaml(&config_dir.join("workspaces"))
 }

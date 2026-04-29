@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-26
 title: "BEGIN-AS-FIRST-RUN — surface onboarding hints automatically"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: []

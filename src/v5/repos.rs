@@ -805,9 +805,10 @@ impl ReposHub {
                 // V5LIFECYCLE-4: route through ops::repo wrappers.
                 let resolver = YamlSecretStore::new(&dir);
                 let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
                 let _ = provider; // provider is still derived for logging but we no longer need the adapter handle here
                 match crate::v5::ops::repo::exists_on_forge(
-                    first, &repo_ref, &loaded.global.provider_map, &resolver, token_ref,
+                    first, &repo_ref, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone(),
                 ).await {
                     Ok(true) => {
                         let rolled_back = existing.clone();
@@ -836,7 +837,7 @@ impl ReposHub {
                     }
                 }
                 match crate::v5::ops::repo::create_on_forge(
-                    first, &repo_ref, vis, &desc, &loaded.global.provider_map, &resolver, token_ref,
+                    first, &repo_ref, vis, &desc, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone(),
                 ).await {
                     Ok(()) => {
                         yield RepoEvent::RepoCreated {
@@ -1235,6 +1236,7 @@ impl ReposHub {
                 .iter()
                 .find(|c| matches!(c.cred_type, CredentialType::Token))
                 .map(|c| c.key.clone());
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(org_cfg));
             let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
 
             let mut succeeded: Vec<String> = Vec::new();
@@ -1273,7 +1275,7 @@ impl ReposHub {
                 // V5LIFECYCLE-4: write via ops::repo helper.
                 let _ = provider; // logging placeholder; provider is re-derived inside the helper
                 match crate::v5::ops::repo::write_metadata_on_forge(
-                    r, &repo_ref, &to_apply, &loaded.global.provider_map, &resolver, token_ref.as_deref(),
+                    r, &repo_ref, &to_apply, &loaded.global.provider_map, &resolver, token_ref.as_deref(), fallback_token_ref.clone(),
                 ).await {
                     Ok(applied) => {
                         let names: Vec<String> = applied
@@ -1361,6 +1363,7 @@ impl ReposHub {
             // Privatize on every remote.
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let mut privatized: std::collections::BTreeSet<ProviderKind> = std::collections::BTreeSet::new();
             for r in &repo.remotes {
                 let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
@@ -1378,7 +1381,7 @@ impl ReposHub {
                     privatized.insert(provider);
                     continue;
                 }
-                match crate::v5::ops::repo::privatize_on_forge(r, &repo_ref, &loaded.global.provider_map, &resolver, token_ref).await {
+                match crate::v5::ops::repo::privatize_on_forge(r, &repo_ref, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone()).await {
                     Ok(()) => {
                         privatized.insert(provider);
                         yield RepoEvent::ForgePrivatized { reference: wire.clone(), provider: provider_s, url: url_s, dry_run: false };
@@ -1465,6 +1468,7 @@ impl ReposHub {
             // Forge-delete every remote.
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             for r in &repo.remotes {
                 let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
                     Ok(p) => p,
@@ -1480,7 +1484,7 @@ impl ReposHub {
                     yield RepoEvent::ForgeDeleted { reference: wire.clone(), provider: provider_s, url: url_s, note: Some("dry_run".into()) };
                     continue;
                 }
-                match crate::v5::ops::repo::delete_on_forge(r, &repo_ref, &loaded.global.provider_map, &resolver, token_ref).await {
+                match crate::v5::ops::repo::delete_on_forge(r, &repo_ref, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone()).await {
                     Ok(()) => yield RepoEvent::ForgeDeleted { reference: wire.clone(), provider: provider_s, url: url_s, note: None },
                     Err(e) if matches!(e.class, crate::v5::adapters::ForgeErrorClass::NotFound) => {
                         yield RepoEvent::ForgeDeleted { reference: wire.clone(), provider: provider_s, url: url_s, note: Some("already gone".into()) };
@@ -1688,8 +1692,9 @@ impl ReposHub {
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(org_cfg);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(org_cfg));
             let remote_repos = match crate::v5::ops::repo::list_on_forge(
-                provider, &OrgName::from(org.as_str()), &resolver, token_ref,
+                provider, &OrgName::from(org.as_str()), &resolver, token_ref, fallback_token_ref.clone(),
             ).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -2061,13 +2066,14 @@ impl ReposHub {
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let repo_ref = RepoRef {
                 org: OrgName::from(org.as_str()),
                 name: RepoName::from(name.as_str()),
             };
             // Forge call first.
             if let Err(e) = crate::v5::ops::repo::rename_on_forge(
-                first, &repo_ref, &new_name, &loaded.global.provider_map, &resolver, token_ref,
+                first, &repo_ref, &new_name, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone(),
             ).await {
                 yield RepoEvent::Error {
                     code: Some(e.class.as_str().into()),
@@ -2157,6 +2163,7 @@ impl ReposHub {
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let repo_ref = RepoRef {
                 org: OrgName::from(org.as_str()),
                 name: RepoName::from(name.as_str()),
@@ -2164,7 +2171,7 @@ impl ReposHub {
             let mut fields: MetadataFields = std::collections::BTreeMap::new();
             fields.insert(DriftFieldKind::DefaultBranch, serde_json::Value::String(branch.clone()));
             if let Err(e) = crate::v5::ops::repo::write_metadata_on_forge(
-                first, &repo_ref, &fields, &loaded.global.provider_map, &resolver, token_ref,
+                first, &repo_ref, &fields, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone(),
             ).await {
                 yield RepoEvent::Error {
                     code: Some(e.class.as_str().into()),
@@ -2221,6 +2228,7 @@ impl ReposHub {
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let repo_ref = RepoRef {
                 org: OrgName::from(org.as_str()),
                 name: RepoName::from(name.as_str()),
@@ -2228,7 +2236,7 @@ impl ReposHub {
             let mut fields: MetadataFields = std::collections::BTreeMap::new();
             fields.insert(DriftFieldKind::Archived, serde_json::Value::Bool(target));
             if let Err(e) = crate::v5::ops::repo::write_metadata_on_forge(
-                first, &repo_ref, &fields, &loaded.global.provider_map, &resolver, token_ref,
+                first, &repo_ref, &fields, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone(),
             ).await {
                 yield RepoEvent::Error {
                     code: Some(e.class.as_str().into()),

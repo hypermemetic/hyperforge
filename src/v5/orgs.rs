@@ -68,6 +68,43 @@ pub enum OrgsEvent {
     },
     /// Generic error event. `code` is drawn from a closed set per method.
     Error { code: String, message: String },
+    // V5PARITY-21: orgs.bootstrap events.
+    /// One stage of `bootstrap` succeeded — `secret_set` event from the
+    /// underlying secret store (mirrored here for stream coherence).
+    SecretSet {
+        key: String,
+        value_length: u32,
+    },
+    /// `bootstrap` reached `import` and got a count back.
+    ImportSummary {
+        org: OrgName,
+        added: u32,
+        skipped: u32,
+        total: u32,
+    },
+    /// Final aggregate emitted by a successful bootstrap.
+    BootstrapDone {
+        org: OrgName,
+        provider: ProviderKind,
+        repos_added: u32,
+    },
+    /// Bootstrap failed at `stage`. Closed enum — see `BootstrapStage`.
+    BootstrapFailed {
+        stage: BootstrapStage,
+        message: String,
+    },
+}
+
+/// V5PARITY-21: closed enum for `bootstrap`'s stage discriminator.
+/// Wire form is the snake-case variant string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapStage {
+    TokenResolve,
+    Secret,
+    OrgCreate,
+    Credential,
+    Import,
 }
 
 // ---------------------------------------------------------------------
@@ -567,6 +604,253 @@ impl OrgsHub {
             };
         }
     }
+
+    // ==================================================================
+    // V5PARITY-21: orgs.bootstrap — one-shot secret + org + cred + import.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        name = "Org name",
+        provider = "github | codeberg | gitlab",
+        token = "Token value or special form (gh-token://, env://VAR)",
+        secret_key = "Override the default secret path (defaults to secrets://<provider>/<name>/token)",
+        use_default_token = "If true, register the org with the provider-default credential ref instead of a per-org one (V5PARITY-24)",
+        import = "Run repos.import after credentials wired (default: true)",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn bootstrap(
+        &self,
+        name: Option<String>,
+        provider: Option<ProviderKind>,
+        token: Option<String>,
+        secret_key: Option<String>,
+        use_default_token: Option<bool>,
+        import: Option<bool>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
+        let this = self.clone();
+        stream! {
+            let Some(name) = name.filter(|s| !s.is_empty()) else {
+                yield OrgsEvent::BootstrapFailed {
+                    stage: BootstrapStage::OrgCreate,
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            };
+            let Some(provider) = provider else {
+                yield OrgsEvent::BootstrapFailed {
+                    stage: BootstrapStage::OrgCreate,
+                    message: "missing required parameter 'provider'".into(),
+                };
+                return;
+            };
+            let Some(token) = token.filter(|s| !s.is_empty()) else {
+                yield OrgsEvent::BootstrapFailed {
+                    stage: BootstrapStage::TokenResolve,
+                    message: "missing required parameter 'token'".into(),
+                };
+                return;
+            };
+            let dry = dry_run.unwrap_or(false);
+            let do_import = import.unwrap_or(true);
+            let use_default = use_default_token.unwrap_or(false);
+
+            // --- Stage: token_resolve. Special forms expand here. ---
+            let token_value = match resolve_token_form(&token, provider).await {
+                Ok(v) => v,
+                Err(e) => {
+                    yield OrgsEvent::BootstrapFailed {
+                        stage: BootstrapStage::TokenResolve,
+                        message: e,
+                    };
+                    return;
+                }
+            };
+
+            // --- Stage: secret. Compute path, write to store. ---
+            let provider_str = match provider {
+                ProviderKind::Github => "github",
+                ProviderKind::Codeberg => "codeberg",
+                ProviderKind::Gitlab => "gitlab",
+            };
+            let secret_path = secret_key.unwrap_or_else(|| {
+                if use_default {
+                    format!("secrets://{provider_str}/_default/token")
+                } else {
+                    format!("secrets://{provider_str}/{name}/token")
+                }
+            });
+            let token_len = u32::try_from(token_value.len()).unwrap_or(u32::MAX);
+            if !dry {
+                let store = crate::v5::secrets::YamlSecretStore::new(this.config_dir.as_ref());
+                let parsed = match crate::v5::secrets::SecretRef::parse(&secret_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        yield OrgsEvent::BootstrapFailed {
+                            stage: BootstrapStage::Secret,
+                            message: format!("invalid secret path '{secret_path}': {e}"),
+                        };
+                        return;
+                    }
+                };
+                if let Err(e) = store.put_secret(&parsed, &token_value) {
+                    yield OrgsEvent::BootstrapFailed {
+                        stage: BootstrapStage::Secret,
+                        message: format!("write secret: {e}"),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::SecretSet { key: secret_path.clone(), value_length: token_len };
+
+            // --- Stage: org_create. Use the existing helper (idempotent on existing). ---
+            // Build OrgConfig and write it (or detect existing).
+            let org_name = OrgName::from(name.as_str());
+            let orgs_dir = this.config_dir.join("orgs");
+            let existing = if orgs_dir.is_dir() {
+                match crate::v5::ops::state::load_orgs(&orgs_dir) {
+                    Ok(map) => map.into_iter()
+                        .find(|(n, _)| n.as_str() == name.as_str())
+                        .map(|(_, v)| v),
+                    Err(e) => {
+                        yield OrgsEvent::BootstrapFailed {
+                            stage: BootstrapStage::OrgCreate,
+                            message: format!("load orgs: {e}"),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut cfg = existing.unwrap_or_else(|| crate::v5::config::OrgConfig {
+                name: org_name.clone(),
+                forge: crate::v5::config::ForgeBlock {
+                    provider,
+                    credentials: Vec::new(),
+                },
+                repos: Vec::new(),
+            });
+            cfg.forge.provider = provider;
+
+            // --- Stage: credential. Replace any existing token cred with the new ref. ---
+            cfg.forge.credentials.retain(|c| !matches!(c.cred_type, CredentialType::Token));
+            cfg.forge.credentials.push(CredentialEntry {
+                key: secret_path,
+                cred_type: CredentialType::Token,
+            });
+
+            if !dry {
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &cfg) {
+                    yield OrgsEvent::BootstrapFailed {
+                        stage: BootstrapStage::OrgCreate,
+                        message: format!("write org yaml: {e}"),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::OrgSummary {
+                name: org_name.clone(),
+                provider,
+                repo_count: u32::try_from(cfg.repos.len()).unwrap_or(0),
+            };
+            yield OrgsEvent::CredentialAdded {
+                org: org_name.clone(),
+                entry: cfg.forge.credentials.last().expect("just pushed").clone(),
+                dry_run: dry,
+            };
+
+            // --- Stage: import. Optional. Reuses the same routing as repos.import. ---
+            if !do_import || dry {
+                yield OrgsEvent::BootstrapDone {
+                    org: org_name,
+                    provider,
+                    repos_added: 0,
+                };
+                return;
+            }
+            let resolver = crate::v5::secrets::YamlSecretStore::new(this.config_dir.as_ref());
+            let token_ref = crate::v5::ops::repo::token_ref_for(&cfg);
+            let fallback = Some(crate::v5::ops::repo::default_token_ref_for(&cfg));
+            let remote_repos = match crate::v5::ops::repo::list_on_forge(
+                provider, &org_name, &resolver, token_ref, fallback,
+            ).await {
+                Ok(v) => v,
+                Err(e) => {
+                    yield OrgsEvent::BootstrapFailed {
+                        stage: BootstrapStage::Import,
+                        message: format!("list_repos: {}", e.message),
+                    };
+                    return;
+                }
+            };
+            let total = u32::try_from(remote_repos.len()).unwrap_or(0);
+            let existing_names: std::collections::BTreeSet<String> = cfg.repos.iter()
+                .map(|r| r.name.as_str().to_string())
+                .collect();
+            let mut added = 0u32;
+            let mut skipped = 0u32;
+            for r in remote_repos {
+                if existing_names.contains(&r.name) {
+                    skipped += 1;
+                    continue;
+                }
+                cfg.repos.push(crate::v5::config::OrgRepo {
+                    name: crate::v5::config::RepoName::from(r.name.as_str()),
+                    remotes: vec![crate::v5::config::Remote {
+                        url: crate::v5::config::RemoteUrl::from(r.url.as_str()),
+                        provider: None,
+                    }],
+                    metadata: None,
+                });
+                added += 1;
+            }
+            if added > 0 {
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &cfg) {
+                    yield OrgsEvent::BootstrapFailed {
+                        stage: BootstrapStage::Import,
+                        message: format!("save org yaml: {e}"),
+                    };
+                    return;
+                }
+            }
+            yield OrgsEvent::ImportSummary {
+                org: org_name.clone(),
+                added,
+                skipped,
+                total,
+            };
+            yield OrgsEvent::BootstrapDone {
+                org: org_name,
+                provider,
+                repos_added: added,
+            };
+        }
+    }
+}
+
+/// V5PARITY-21: resolve `token` argument to a concrete value. Recognized
+/// special forms: `gh-token://` (calls `ops::external_auth::read_token`)
+/// and `env://VAR`. Anything else is passed through as a raw token.
+async fn resolve_token_form(
+    token: &str,
+    provider: ProviderKind,
+) -> Result<String, String> {
+    if let Some(scheme_rest) = token.strip_prefix("gh-token://") {
+        let _ = scheme_rest; // currently no path component
+        let ext_provider = match provider {
+            ProviderKind::Github => crate::v5::ops::external_auth::ExternalAuthProvider::Github,
+            ProviderKind::Codeberg => crate::v5::ops::external_auth::ExternalAuthProvider::Codeberg,
+            ProviderKind::Gitlab => crate::v5::ops::external_auth::ExternalAuthProvider::Gitlab,
+        };
+        return crate::v5::ops::external_auth::read_token(ext_provider)
+            .map_err(|e| e.to_string());
+    }
+    if let Some(var) = token.strip_prefix("env://") {
+        return std::env::var(var)
+            .map_err(|e| format!("env var '{var}': {e}"));
+    }
+    Ok(token.to_string())
 }
 
 // ---------------------------------------------------------------------

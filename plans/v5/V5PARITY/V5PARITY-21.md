@@ -1,9 +1,9 @@
 ---
 id: V5PARITY-21
 title: "ORG-BOOTSTRAP — one-shot `orgs.bootstrap` RPC"
-status: Pending
+status: Complete
 type: implementation
-blocked_by: []
+blocked_by: [V5PARITY-27]
 unlocks: [V5PARITY-20, V5PARITY-22]
 ---
 
@@ -29,7 +29,9 @@ Adding an org currently takes four RPCs in strict order: `secrets.set` → `orgs
 - `env://VAR` — read from `VAR` env var on the daemon
 - raw string — store directly
 
-Emits one event per stage (`secret_set`, `org_created`, `credential_added`, `import_summary`) plus a final `bootstrap_done { org, provider, repos_added }` aggregate. On failure at any stage, emits the partial events plus `bootstrap_failed { stage, message }` — caller can inspect what landed.
+Emits one event per stage (`secret_set`, `org_created`, `credential_added`, `import_summary`) plus a final `bootstrap_done { org, provider, repos_added }` aggregate. On failure at any stage, emits the partial events plus `bootstrap_failed { stage: BootstrapStage, message }` — caller can inspect what landed.
+
+`BootstrapStage` is a closed enum (rejected at the wire boundary if anything else): `token_resolve | secret | org_create | credential | import`.
 
 **Idempotency.** Re-running with the same `--name`/`--provider` updates the credential and re-runs import; doesn't error on existing org.
 
@@ -49,5 +51,5 @@ Emits one event per stage (`secret_set`, `org_created`, `credential_added`, `imp
 
 ## Completion
 
-- Run `bash tests/v5/V5PARITY/V5PARITY-21.sh` → exit 0 (tier 1 — uses raw-string token; tier 2 stage covers gh-token://).
+- Run `bash tests/v5/V5PARITY/V5PARITY-21.sh` → exit 0. Tier 1 uses raw-string + a `gh` shim on PATH for `gh-token://`; tier 2 (HF_V5_TEST_CONFIG_DIR) optionally exercises a real `gh` binary.
 - Ready → Complete in-commit.

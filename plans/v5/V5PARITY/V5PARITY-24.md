@@ -1,7 +1,7 @@
 ---
 id: V5PARITY-24
 title: "SHARED-CRED — provider-default credential fallback"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: []

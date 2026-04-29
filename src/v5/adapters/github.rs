@@ -30,15 +30,10 @@ impl GithubAdapter {
     }
 
     async fn token(auth: &ForgeAuth<'_>) -> Result<String, ForgePortError> {
-        let token_ref = auth
-            .token_ref
-            .ok_or_else(|| ForgePortError::auth("no token credential on org"))?;
-        let parsed = crate::v5::secrets::SecretRef::parse(token_ref)
-            .map_err(|e| ForgePortError::auth(format!("invalid secret ref: {e}")))?;
-        let value = auth
-            .resolver
-            .resolve(&parsed)
-            .map_err(|e| ForgePortError::auth(format!("resolve {token_ref}: {e}")))?;
+        // V5PARITY-24: try explicit token_ref first; fall back to
+        // the org's provider-default. Both paths handled by
+        // ForgeAuth::resolve_token.
+        let value = auth.resolve_token()?;
         if value.trim().is_empty() {
             return Err(ForgePortError::auth("token is empty"));
         }

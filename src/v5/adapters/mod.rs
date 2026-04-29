@@ -205,9 +205,42 @@ impl std::error::Error for ForgePortError {}
 /// never leaves the adapter.
 #[derive(Clone)]
 pub struct ForgeAuth<'a> {
-    /// `secrets://…` reference. Adapter calls `resolver.resolve(...)`.
+    /// `secrets://…` reference. Adapter calls `resolve_token()`.
     pub token_ref: Option<&'a str>,
+    /// V5PARITY-24: provider-default fallback. Adapter checks this
+    /// when `token_ref` is absent or its secret resolution fails.
+    /// Constructed by callers via `ops::repo::default_token_ref_for`.
+    pub fallback_token_ref: Option<String>,
     pub resolver: &'a dyn SecretResolver,
+}
+
+impl<'a> ForgeAuth<'a> {
+    /// V5PARITY-24 token resolution. Tries `token_ref` first; if it's
+    /// absent OR the resolver returns an error (typically "secret not
+    /// found"), tries `fallback_token_ref`. Adapters call this instead
+    /// of resolving directly.
+    pub fn resolve_token(&self) -> Result<String, ForgePortError> {
+        let mut last_err: Option<ForgePortError> = None;
+        let candidates = self.token_ref.map(str::to_string).into_iter()
+            .chain(self.fallback_token_ref.clone().into_iter());
+        for candidate in candidates {
+            let parsed = match crate::v5::secrets::SecretRef::parse(&candidate) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(ForgePortError::auth(format!("invalid secret ref: {e}")));
+                    continue;
+                }
+            };
+            match self.resolver.resolve(&parsed) {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    last_err = Some(ForgePortError::auth(format!("resolve {candidate}: {e}")));
+                    continue;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ForgePortError::auth("no token credential on org")))
+    }
 }
 
 /// `ProviderVisibility` (per CONTRACTS §types).

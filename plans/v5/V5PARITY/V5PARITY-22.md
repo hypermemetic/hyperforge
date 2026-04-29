@@ -13,7 +13,7 @@ After `orgs.bootstrap` registers an org with N repos, a user who wants "all of t
 
 ## Required behavior
 
-**`workspaces.from_org --org <org> --path <abs-path> [--filter <glob>] [--name <ws-name>] [--clone bool]`**
+**`workspaces.from_org --org <org> --path <abs-path> [--filter <glob>] [--name <ws-name>] [--clone bool] [--update bool]`**
 
 1. Verifies `<org>` exists and is non-empty (else `validation` error).
 2. Creates `<path>` if missing.

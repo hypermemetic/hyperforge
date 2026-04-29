@@ -13,3 +13,4 @@ pub mod repo;
 pub mod fs;
 pub mod git;
 pub mod analytics;
+pub mod external_auth;
