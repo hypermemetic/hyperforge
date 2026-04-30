@@ -326,6 +326,20 @@ pub enum RepoEvent {
         #[serde(skip_serializing_if = "std::ops::Not::not", default)]
         changed: bool,
     },
+    /// V5PARITY-35: per-repo `forges` scope updated.
+    ForgesSet {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        /// `null` when the field is unset (legacy unscoped behavior).
+        forges: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        changed: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+        /// Path to the per-repo file if it was updated, else `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
+    },
     // V5PARITY-25: adopt-existing-checkout events.
     /// `repos.register` succeeded — the local checkout is now tracked.
     RepoRegistered {
@@ -2763,6 +2777,151 @@ impl ReposHub {
             }
         }
     }
+
+    // ==================================================================
+    // V5PARITY-35: typed RPC for scoping a repo's forges.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Org name",
+        name = "Repo name",
+        forges = "Comma-separated providers (github,codeberg,gitlab) | 'none' (= []) | 'unset' (= null)",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn set_forges(
+        &self,
+        org: String,
+        name: String,
+        forges: String,
+        dry_run: Option<serde_json::Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() {
+                yield validation_event("missing required parameter 'org' or 'name'");
+                return;
+            }
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            // Parse the special-form forges argument.
+            let target = match parse_forges_arg(&forges) {
+                Ok(t) => t,
+                Err(e) => { yield validation_event(e); return; }
+            };
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let Some(existing) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield not_found_event(format!("org '{org}' not found")); return;
+            };
+            let Some(_repo) = crate::v5::ops::state::find_repo(existing, &name) else {
+                yield not_found_event(format!("repo '{name}' not found in org '{org}'")); return;
+            };
+            let mut updated = existing.clone();
+            let mut changed = false;
+            if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &name) {
+                if mr.forges != target {
+                    mr.forges = target.clone();
+                    changed = true;
+                }
+            }
+            if changed && !dry {
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                    yield cfg_error_event(e); return;
+                }
+            }
+            // Best-effort: write through to .hyperforge/config.toml if a
+            // checkout for this repo can be found under any workspace path.
+            let local_path = if dry { None } else {
+                write_through_repo_config(&config_dir, &org, &name, target.as_deref(), &loaded)
+            };
+            yield RepoEvent::ForgesSet {
+                reference: RepoRefWire { org, name },
+                forges: target.map(|v| v.into_iter().map(|p| match p {
+                    ProviderKind::Github => "github".to_string(),
+                    ProviderKind::Codeberg => "codeberg".to_string(),
+                    ProviderKind::Gitlab => "gitlab".to_string(),
+                }).collect()),
+                changed,
+                dry_run: dry,
+                local_path,
+            };
+        }
+    }
+}
+
+/// V5PARITY-35: parse the `forges` arg.
+/// - `unset` → `None`              (legacy unscoped behavior; field removed)
+/// - `none`  → `Some(vec![])`      (scoped to no forges)
+/// - csv     → `Some(vec![...])`   (scoped to listed providers)
+pub(crate) fn parse_forges_arg(raw: &str) -> Result<Option<Vec<ProviderKind>>, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("unset") || trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Some(Vec::new()));
+    }
+    let mut out: Vec<ProviderKind> = Vec::new();
+    for part in trimmed.split(',') {
+        let p = match part.trim().to_ascii_lowercase().as_str() {
+            "github" => ProviderKind::Github,
+            "codeberg" => ProviderKind::Codeberg,
+            "gitlab" => ProviderKind::Gitlab,
+            other => return Err(format!("unknown provider '{other}' in forges list")),
+        };
+        if !out.contains(&p) { out.push(p); }
+    }
+    Ok(Some(out))
+}
+
+/// V5PARITY-35: best-effort write-through to `.hyperforge/config.toml`.
+/// Searches every workspace yaml for a member matching `(org, name)`;
+/// uses the workspace path + member dir to locate the checkout. Writes
+/// the file's `forges` to match the provided value. Returns the path
+/// written, or `None` if no checkout was found.
+pub(crate) fn write_through_repo_config(
+    config_dir: &std::path::Path,
+    org: &str,
+    name: &str,
+    target: Option<&[ProviderKind]>,
+    loaded: &crate::v5::config::LoadedConfig,
+) -> Option<String> {
+    use crate::v5::config::WorkspaceRepo;
+    let mut hits: Vec<std::path::PathBuf> = Vec::new();
+    for ws in loaded.workspaces.values() {
+        let ws_path = std::path::PathBuf::from(ws.path.as_str());
+        for entry in &ws.repos {
+            let (o, n, dir) = match entry {
+                WorkspaceRepo::Shorthand(s) => match s.split_once('/') {
+                    Some((a, b)) => (a.to_string(), b.to_string(), b.to_string()),
+                    None => continue,
+                },
+                WorkspaceRepo::Object { reference, dir } => (
+                    reference.org.as_str().to_string(),
+                    reference.name.as_str().to_string(),
+                    dir.clone(),
+                ),
+            };
+            if o == org && n == name {
+                hits.push(ws_path.join(dir));
+            }
+        }
+    }
+    let _ = config_dir; // kept for future use (e.g., reading workspace yaml directly)
+    let dir = hits.into_iter().find(|p| p.is_dir())?;
+    // Read existing file (if any), update forges, write back.
+    let cfg_path = dir.join(".hyperforge").join("config.toml");
+    let mut existing = crate::v5::ops::fs::read_hyperforge_config(&dir).ok().flatten()?;
+    let new_forges: Vec<ProviderKind> = target.map(|s| s.to_vec()).unwrap_or_default();
+    if existing.forges == new_forges {
+        // No change needed.
+        return Some(cfg_path.display().to_string());
+    }
+    existing.forges = new_forges;
+    let _ = std::fs::create_dir_all(dir.join(".hyperforge"));
+    crate::v5::ops::fs::write_hyperforge_config(&dir, &existing, true).ok()
+        .map(|p| p.display().to_string())
 }
 
 /// V5PARITY-25 helper: enumerate every remote on a checkout via git2.

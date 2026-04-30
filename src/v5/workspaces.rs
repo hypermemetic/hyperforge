@@ -180,6 +180,28 @@ pub enum WorkspacesEvent {
         #[serde(skip_serializing_if = "std::ops::Not::not", default)]
         already_present: bool,
     },
+    /// V5PARITY-35: per-member result of `workspaces.set_forges`.
+    ForgesSet {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        forges: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        changed: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
+    },
+    /// V5PARITY-35: aggregate of `workspaces.set_forges`.
+    WorkspaceSetForgesSummary {
+        name: String,
+        total: u32,
+        ok: u32,
+        errored: u32,
+        unchanged: u32,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+    },
     /// V5PARITY-4: per-member analytics event (size/loc/large/dirty).
     /// `metric` is `size`, `loc`, `large_files`, or `dirty`; fields
     /// populated depend on the metric.
@@ -2219,6 +2241,88 @@ impl WorkspacesHub {
     }
 
     // ==================================================================
+    // V5PARITY-35: workspace-wide forges scoping.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        forges = "Comma-separated providers (github,codeberg,gitlab) | 'none' (= []) | 'unset' (= null)",
+        filter = "Glob filter on member names (comma-separated)",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn set_forges(
+        &self,
+        name: String,
+        forges: String,
+        filter: Option<String>,
+        dry_run: Option<serde_json::Value>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if name.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'name'".into(),
+                };
+                return;
+            }
+            let dry = dry_run.as_ref().is_some_and(to_bool);
+            let glob = match filter.as_deref().map(GlobSet::from_csv).transpose() {
+                Ok(g) => g,
+                Err(e) => {
+                    yield WorkspacesEvent::Error {
+                        code: Some("validation".into()),
+                        message: format!("invalid filter: {e}"),
+                    };
+                    return;
+                }
+            };
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let mut total = 0u32; let mut ok = 0u32;
+            let mut errored = 0u32; let mut unchanged = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                if !glob.as_ref().map_or(true, |g| g.matches(&ctx.reference.name)) {
+                    continue;
+                }
+                total += 1;
+                // Delegate to repos::set_forges shape — call the same
+                // helper directly to keep one implementation.
+                let result = apply_set_forges(
+                    &config_dir,
+                    &ctx.reference.org,
+                    &ctx.reference.name,
+                    &forges,
+                    dry,
+                ).await;
+                match result {
+                    Ok((target_str, changed, local_path)) => {
+                        if changed { ok += 1; } else { unchanged += 1; }
+                        yield WorkspacesEvent::ForgesSet {
+                            reference: ctx.reference.clone(),
+                            forges: target_str,
+                            changed,
+                            dry_run: dry,
+                            local_path,
+                        };
+                    }
+                    Err(msg) => {
+                        errored += 1;
+                        yield member_err(&ctx.reference, "set_forges", msg);
+                    }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceSetForgesSummary {
+                name: ws.name.as_str().to_string(),
+                total, ok, errored, unchanged,
+                dry_run: dry,
+            };
+        }
+    }
+
+    // ==================================================================
     // V5PARITY-4: workspace-level analytics aggregates.
     // ==================================================================
 
@@ -2645,6 +2749,51 @@ fn glob_match(pattern: &str, s: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// V5PARITY-35: shared logic for `workspaces.set_forges`. Returns
+/// `(forges_as_strings, changed, local_path_if_written)` or an error
+/// message on failure. Mirrors the body of `repos.set_forges` so both
+/// paths land the same result on disk.
+async fn apply_set_forges(
+    config_dir: &std::path::Path,
+    org: &str,
+    name: &str,
+    forges: &str,
+    dry: bool,
+) -> Result<(Option<Vec<String>>, bool, Option<String>), String> {
+    let target = crate::v5::repos::parse_forges_arg(forges)
+        .map_err(|e| e.to_string())?;
+    let loaded = crate::v5::ops::state::load_all(config_dir)
+        .map_err(|e| e.to_string())?;
+    let org_key = crate::v5::config::OrgName::from(org);
+    let existing = loaded.orgs.get(&org_key).cloned()
+        .ok_or_else(|| format!("org '{org}' not found"))?;
+    if crate::v5::ops::state::find_repo(&existing, name).is_none() {
+        return Err(format!("repo '{name}' not in org '{org}'"));
+    }
+    let mut updated = existing.clone();
+    let mut changed = false;
+    if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, name) {
+        if mr.forges != target {
+            mr.forges = target.clone();
+            changed = true;
+        }
+    }
+    if changed && !dry {
+        let orgs_dir = config_dir.join("orgs");
+        crate::v5::ops::state::save_org(&orgs_dir, &updated)
+            .map_err(|e| e.to_string())?;
+    }
+    let local_path = if dry { None } else {
+        crate::v5::repos::write_through_repo_config(config_dir, org, name, target.as_deref(), &loaded)
+    };
+    let target_str = target.map(|v| v.into_iter().map(|p| match p {
+        crate::v5::config::ProviderKind::Github => "github".to_string(),
+        crate::v5::config::ProviderKind::Codeberg => "codeberg".to_string(),
+        crate::v5::config::ProviderKind::Gitlab => "gitlab".to_string(),
+    }).collect());
+    Ok((target_str, changed, local_path))
 }
 
 /// V5PARITY-22 helper: resolve the org's SSH private key path. Mirrors
