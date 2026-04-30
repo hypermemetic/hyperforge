@@ -7,8 +7,8 @@ use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 
 use crate::v5::adapters::{
-    extract_host, ForgeAuth, ForgeMetadata, ForgePort, ForgePortError, MetadataFields,
-    ProviderVisibility,
+    extract_host, ForgeAuth, ForgeErrorClass, ForgeMetadata, ForgePort, ForgePortError,
+    MetadataFields, ProviderVisibility,
 };
 use crate::v5::config::{ProviderKind, Remote, RepoRef};
 
@@ -91,6 +91,65 @@ impl GithubAdapter {
             }
             _ => ForgePortError::network(format!("github {status}: {body}")),
         }
+    }
+}
+
+impl GithubAdapter {
+    /// V5PARITY-33: shared paginator. `owner_filter` (when present)
+    /// keeps only items whose `owner.login` matches — used by the
+    /// `/user/repos` path so cross-user calls don't pollute results.
+    async fn list_paginated(
+        client: &reqwest::Client,
+        headers: &reqwest::header::HeaderMap,
+        start_url: &str,
+        owner_filter: Option<&str>,
+    ) -> Result<Vec<crate::v5::adapters::RemoteRepo>, ForgePortError> {
+        let mut items: Vec<crate::v5::adapters::RemoteRepo> = Vec::new();
+        let mut url_opt = Some(start_url.to_string());
+        while let Some(url) = url_opt.take() {
+            let resp = client
+                .get(&url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let b = resp.text().await.unwrap_or_default();
+                return Err(Self::map_status_error(status, &b));
+            }
+            let next = resp.headers().get(reqwest::header::LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_next_link);
+            let body: serde_json::Value = resp.json().await
+                .map_err(|e| ForgePortError::network(format!("parse repos list: {e}")))?;
+            if let Some(arr) = body.as_array() {
+                for item in arr {
+                    if let Some(want) = owner_filter {
+                        let got = item.get("owner")
+                            .and_then(|o| o.get("login"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        if got != want { continue; }
+                    }
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if name.is_empty() { continue; }
+                    let url = item.get("clone_url").and_then(|v| v.as_str())
+                        .or_else(|| item.get("html_url").and_then(|v| v.as_str()))
+                        .unwrap_or("").to_string();
+                    items.push(crate::v5::adapters::RemoteRepo {
+                        name,
+                        url,
+                        default_branch: item.get("default_branch").and_then(|v| v.as_str()).map(String::from),
+                        description: item.get("description").and_then(|v| v.as_str()).map(String::from),
+                        archived: item.get("archived").and_then(|v| v.as_bool()),
+                        visibility: item.get("visibility").and_then(|v| v.as_str()).map(String::from),
+                    });
+                }
+            }
+            url_opt = next;
+        }
+        Ok(items)
     }
 }
 
@@ -360,56 +419,36 @@ impl ForgePort for GithubAdapter {
         let token = Self::token(auth).await?;
         let client = Self::build_client()?;
         let headers = Self::auth_headers(&token)?;
-        // Prefer the org endpoint; fall back to the user endpoint on 404
-        // (GitHub treats user accounts as a distinct endpoint shape).
+
+        // 1. Try the org endpoint. Real orgs return here.
         let org_url = format!("https://api.github.com/orgs/{}/repos?per_page=100", org.as_str());
-        let mut items = Vec::new();
-        let mut url_opt = Some(org_url);
-        let mut tried_user = false;
-        while let Some(url) = url_opt.take() {
-            let resp = client
-                .get(&url)
-                .headers(headers.clone())
-                .send()
-                .await
-                .map_err(|e| ForgePortError::network(format!("get {url}: {e}")))?;
-            let status = resp.status();
-            if status == StatusCode::NOT_FOUND && !tried_user && items.is_empty() {
-                tried_user = true;
-                url_opt = Some(format!("https://api.github.com/users/{}/repos?per_page=100", org.as_str()));
-                continue;
-            }
-            if !status.is_success() {
-                let b = resp.text().await.unwrap_or_default();
-                return Err(Self::map_status_error(status, &b));
-            }
-            // Pagination via Link header.
-            let next = resp.headers().get(reqwest::header::LINK)
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_next_link);
-            let body: serde_json::Value = resp.json().await
-                .map_err(|e| ForgePortError::network(format!("parse repos list: {e}")))?;
-            if let Some(arr) = body.as_array() {
-                for item in arr {
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if name.is_empty() { continue; }
-                    let url = item.get("clone_url").and_then(|v| v.as_str())
-                        .or_else(|| item.get("html_url").and_then(|v| v.as_str()))
-                        .unwrap_or("").to_string();
-                    items.push(crate::v5::adapters::RemoteRepo {
-                        name,
-                        url,
-                        default_branch: item.get("default_branch").and_then(|v| v.as_str()).map(String::from),
-                        description: item.get("description").and_then(|v| v.as_str()).map(String::from),
-                        archived: item.get("archived").and_then(|v| v.as_bool()),
-                        visibility: item.get("visibility").and_then(|v| v.as_str()).map(String::from),
-                    });
-                }
-            }
-            url_opt = next;
+        match Self::list_paginated(&client, &headers, &org_url, None).await {
+            Ok(v) if !v.is_empty() => return Ok(v),
+            Ok(_) => {} // empty 200 — uncommon; fall through.
+            Err(e) if e.class == ForgeErrorClass::NotFound => {} // user account; fall through.
+            Err(e) => return Err(e),
         }
-        Ok(items)
+
+        // 2. V5PARITY-33: when the target is the authenticated user,
+        // /user/repos?affiliation=owner returns BOTH public and private
+        // repos. /users/{name}/repos (step 3) only returns public.
+        // Filter by owner.login so listing user A's repos while authed
+        // as B doesn't accidentally surface B's repos.
+        let me_url = format!(
+            "https://api.github.com/user/repos?affiliation=owner&per_page=100",
+        );
+        if let Ok(v) = Self::list_paginated(&client, &headers, &me_url, Some(org.as_str())).await {
+            if !v.is_empty() {
+                return Ok(v);
+            }
+        }
+
+        // 3. Public-only fallback for someone else's user account
+        // (or unauthenticated requests).
+        let user_url = format!("https://api.github.com/users/{}/repos?per_page=100", org.as_str());
+        Self::list_paginated(&client, &headers, &user_url, None).await
     }
+
 
     async fn rename_repo(
         &self,
