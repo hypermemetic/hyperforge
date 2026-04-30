@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "hyperforge"
-version = "4.1.3"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-stream",

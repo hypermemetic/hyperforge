@@ -81,7 +81,7 @@ as open.
 
 | # | Decision                                                                                                                                                                                                |
 |---|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| D1 | v5 daemon default port is **44105** (v4 keeps 44104). v5 registers in the Plexus registry as `lforge-v5`.                                                                                              |
+| D1 | v5 daemon default port is **44104** (v5 became canonical hyperforge in 5.0.0 / V5PARITY-32; v4 retired to `hyperforge-legacy`). v5 registers in the Plexus registry as `lforge-v5` during the transition; will normalize to `lforge` in 6.0.0. |
 | D2 | No `hyperforge-auth` sidecar. Secret store is embedded; YAML backend only in v1.                                                                                                                       |
 | D3 | **Superseded by D10.** (Original scoping was "intersection of portable metadata only"; tightened too narrowly — see D10 for the revised trait surface.) |
 | D4 | `repos.push` **pushes to every remote in sequence**, provider-dispatched per remote. First failure aborts; already-succeeded remotes are reported in the result. Caller may pass `--remote <url>` to target one. |

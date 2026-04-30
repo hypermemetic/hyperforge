@@ -49,8 +49,10 @@ synapse() {
 # already exists in the exported env. Subshells that need the shim will
 # re-`source` this file themselves; that's cheap and avoids the crash.
 
-# Locate the v5 binary. Prefer explicit $HF_BIN (tests can override), then
-# look for debug/release build outputs.
+# Locate the hyperforge daemon binary. Prefer explicit $HF_BIN (tests
+# can override). Try the canonical `hyperforge` name first (the v5
+# default since V5PARITY-32 / 5.0.0); fall back to `hyperforge-v5` for
+# in-flight branches that haven't migrated yet.
 __hf_find_bin() {
     if [[ -n "${HF_BIN:-}" ]]; then
         if [[ -x "$HF_BIN" ]]; then
@@ -59,6 +61,8 @@ __hf_find_bin() {
         fi
     fi
     for candidate in \
+        "$__HF_REPO_ROOT/target/debug/hyperforge" \
+        "$__HF_REPO_ROOT/target/release/hyperforge" \
         "$__HF_REPO_ROOT/target/debug/hyperforge-v5" \
         "$__HF_REPO_ROOT/target/release/hyperforge-v5"; do
         if [[ -x "$candidate" ]]; then
@@ -67,7 +71,7 @@ __hf_find_bin() {
         fi
     done
     # Fall back to PATH lookup.
-    command -v hyperforge-v5 || return 1
+    command -v hyperforge || command -v hyperforge-v5 || return 1
 }
 
 # Pick a free ephemeral TCP port. V5PARITY-12: we set SO_REUSEADDR so

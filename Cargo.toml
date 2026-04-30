@@ -1,6 +1,6 @@
 [package]
 name = "hyperforge"
-version = "4.1.3"
+version = "5.0.0"
 edition = "2021"
 description = "Multi-forge repository management"
 license = "MIT"
@@ -9,9 +9,26 @@ license = "MIT"
 name = "hyperforge"
 path = "src/lib.rs"
 
+# --- canonical hyperforge binary (V5PARITY-32). v5 became the default
+# in 5.0.0; the source previously lived at src/bin/hyperforge-v5.rs and
+# was renamed to src/bin/hyperforge.rs in the same change.
 [[bin]]
 name = "hyperforge"
 path = "src/bin/hyperforge.rs"
+
+# --- alias for tests + scripts that pinned the v5-prefixed name.
+# Same source as `hyperforge`; one extra build artifact, identical bytes.
+[[bin]]
+name = "hyperforge-v5"
+path = "src/bin/hyperforge.rs"
+
+# --- one-release courtesy: the v4 source kept under hyperforge-legacy.
+# v4's wire surface is unchanged from 4.1.3 — anyone with hard-coded
+# automation runs `hyperforge-legacy` and gets the old code. Will be
+# removed in 6.0.0.
+[[bin]]
+name = "hyperforge-legacy"
+path = "src/bin/hyperforge-legacy.rs"
 
 [[bin]]
 name = "hyperforge-auth"
@@ -20,12 +37,6 @@ path = "src/bin/hyperforge-auth.rs"
 [[bin]]
 name = "hyperforge-ssh"
 path = "src/bin/hyperforge-ssh.rs"
-
-# --- v5 rewrite binary (lives alongside v4; separate port, separate registry
-# name; does not share code with v4 activations). See plans/v5/.
-[[bin]]
-name = "hyperforge-v5"
-path = "src/bin/hyperforge-v5.rs"
 
 [dependencies]
 # Hub framework integration
