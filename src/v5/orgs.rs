@@ -801,6 +801,7 @@ impl OrgsHub {
                         url: crate::v5::config::RemoteUrl::from(r.url.as_str()),
                         provider: None,
                     }],
+                    forges: None,
                     metadata: None,
                 });
                 added += 1;

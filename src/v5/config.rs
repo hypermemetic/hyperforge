@@ -164,6 +164,14 @@ pub struct OrgRepo {
     pub name: RepoName,
     #[serde(default)]
     pub remotes: Vec<Remote>,
+    /// V5PARITY-34: when present, scopes which forges this repo lives
+    /// on. Routing ops (sync, push, set_archived, …) intersect this
+    /// list with the providers derived from `remotes`. `None` =
+    /// unscoped; every remote's provider participates (legacy
+    /// behavior, byte-identical for fixtures that don't carry the
+    /// field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forges: Option<Vec<ProviderKind>>,
     /// Optional declared-local values for the D3 portable metadata set.
     /// When absent, `repos.sync` treats the local side as "unknown" for
     /// that field and reports drift only against the declared keys.

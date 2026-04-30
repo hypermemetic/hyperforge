@@ -1376,9 +1376,12 @@ impl WorkspacesHub {
                     yield skip;
                     continue;
                 }
-                // Take the first remote as the canonical sync target
+                // Take the first in-scope remote as the canonical
+                // sync target (V5PARITY-34: per-repo `forges` filter).
                 // (per-member single SyncDiff per the ticket).
-                let Some(remote) = repo.remotes.first() else {
+                let Some(remote) = crate::v5::ops::repo::canonical_remote_in_scope(
+                    repo, &loaded.global.provider_map,
+                ) else {
                     let diff = WorkspacesEvent::SyncDiff {
                         reference: wire.clone(),
                         url: None,

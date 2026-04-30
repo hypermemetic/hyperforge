@@ -138,6 +138,50 @@ pub fn default_token_ref_for(org: &OrgConfig) -> String {
     format!("secrets://{provider}/_default/token")
 }
 
+/// V5PARITY-34: filter remotes by the per-repo `forges` scope.
+///
+/// When `repo.forges` is `None`, every remote participates (legacy
+/// behavior). When it's `Some(list)`, only remotes whose derived
+/// provider is in `list` are returned. Empty `Some([])` means
+/// "the repo is currently scoped to no forges" — no remotes
+/// participate; callers emit a `forge_excluded` signal.
+#[must_use]
+pub fn filter_remotes_by_forges<'a>(
+    repo: &'a OrgRepo,
+    provider_map: &BTreeMap<DomainName, ProviderKind>,
+) -> Vec<&'a Remote> {
+    let Some(scope) = repo.forges.as_ref() else {
+        return repo.remotes.iter().collect();
+    };
+    repo.remotes
+        .iter()
+        .filter(|r| match derive_provider(r, provider_map) {
+            Ok(p) => scope.contains(&p),
+            Err(_) => false,
+        })
+        .collect()
+}
+
+/// V5PARITY-34: canonical remote that's in scope. Mirrors
+/// `OrgRepo::canonical_remote()` (== `remotes.first()`) but applies
+/// the `forges` filter. Returns `None` when the repo has no remotes
+/// OR when every remote was excluded by the per-repo scope.
+#[must_use]
+pub fn canonical_remote_in_scope<'a>(
+    repo: &'a OrgRepo,
+    provider_map: &BTreeMap<DomainName, ProviderKind>,
+) -> Option<&'a Remote> {
+    filter_remotes_by_forges(repo, provider_map).into_iter().next()
+}
+
+/// V5PARITY-34: did the per-repo `forges` scope exclude every remote?
+/// Used by routing methods to emit `forge_excluded` rather than a
+/// generic `no_remotes` error.
+#[must_use]
+pub fn all_remotes_excluded(repo: &OrgRepo, provider_map: &BTreeMap<DomainName, ProviderKind>) -> bool {
+    !repo.remotes.is_empty() && filter_remotes_by_forges(repo, provider_map).is_empty()
+}
+
 /// Does this remote exist on its forge?
 pub async fn exists_on_forge(
     remote: &Remote,
@@ -320,10 +364,13 @@ pub async fn sync_one(
         org: org.name.clone(),
         name: repo.name.clone(),
     };
+    // V5PARITY-34: scope by per-repo `forges` first, then narrow by
+    // explicit URL filter if the caller asked for one.
+    let scoped: Vec<&Remote> = filter_remotes_by_forges(repo, provider_map);
     let filtered: Vec<&Remote> = if let Some(f) = remote_filter.filter(|s| !s.is_empty()) {
-        repo.remotes.iter().filter(|r| r.url.as_str() == f).collect()
+        scoped.into_iter().filter(|r| r.url.as_str() == f).collect()
     } else {
-        repo.remotes.iter().collect()
+        scoped
     };
     let mut out = Vec::new();
     for r in filtered {

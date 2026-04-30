@@ -317,6 +317,15 @@ pub enum RepoEvent {
         #[serde(skip_serializing_if = "std::ops::Not::not", default)]
         persisted: bool,
     },
+    // V5PARITY-34: sync_config event.
+    ConfigSynced {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        mode: String, // "push" | "pull"
+        local_path: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        changed: bool,
+    },
     // V5PARITY-25: adopt-existing-checkout events.
     /// `repos.register` succeeded — the local checkout is now tracked.
     RepoRegistered {
@@ -758,6 +767,7 @@ impl ReposHub {
             updated.repos.push(OrgRepo {
                 name: RepoName::from(name.as_str()),
                 remotes: parsed_remotes.clone(),
+                forges: None,
                 metadata: None,
             });
             let orgs_dir = dir.join("orgs");
@@ -1238,15 +1248,27 @@ impl ReposHub {
                 yield validation_event("no fields to push; supply `fields` or declare repo.metadata locally");
                 return;
             }
+            // V5PARITY-34: scope by per-repo forges, then narrow by URL filter.
+            let scoped: Vec<&Remote> = crate::v5::ops::repo::filter_remotes_by_forges(
+                repo, &loaded.global.provider_map,
+            );
+            if crate::v5::ops::repo::all_remotes_excluded(repo, &loaded.global.provider_map) {
+                yield RepoEvent::Error {
+                    code: Some("forge_excluded".into()),
+                    error_class: None,
+                    message: format!("repo '{name}' has remotes but per-repo `forges` scope excludes all of them"),
+                };
+                return;
+            }
             let remotes: Vec<&Remote> = if let Some(filter_url) = remote.as_ref().filter(|s| !s.is_empty()) {
-                let matched: Vec<&Remote> = repo.remotes.iter().filter(|r| r.url.as_str() == filter_url).collect();
+                let matched: Vec<&Remote> = scoped.into_iter().filter(|r| r.url.as_str() == filter_url).collect();
                 if matched.is_empty() {
-                    yield not_found_event(format!("remote url '{filter_url}' not present on repo"));
+                    yield not_found_event(format!("remote url '{filter_url}' not present on repo (or excluded by `forges` scope)"));
                     return;
                 }
                 matched
             } else {
-                repo.remotes.iter().collect()
+                scoped
             };
             let resolver = YamlSecretStore::new(&dir);
             let token_ref = org_cfg
@@ -1384,7 +1406,9 @@ impl ReposHub {
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
             let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let mut privatized: std::collections::BTreeSet<ProviderKind> = std::collections::BTreeSet::new();
-            for r in &repo.remotes {
+            // V5PARITY-34: only privatize forges in scope.
+            let scoped = crate::v5::ops::repo::filter_remotes_by_forges(repo, &loaded.global.provider_map);
+            for r in scoped {
                 let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
                     Ok(p) => p,
                     Err(e) => { yield validation_event(e); continue; }
@@ -1485,10 +1509,12 @@ impl ReposHub {
                 return;
             }
             // Forge-delete every remote.
+            // V5PARITY-34: only forges in scope; purge respects per-repo policy.
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
             let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
-            for r in &repo.remotes {
+            let scoped_remotes = crate::v5::ops::repo::filter_remotes_by_forges(repo, &loaded.global.provider_map);
+            for r in scoped_remotes {
                 let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
                     Ok(p) => p,
                     Err(e) => { yield validation_event(e); continue; }
@@ -1741,6 +1767,7 @@ impl ReposHub {
                         url: crate::v5::config::RemoteUrl::from(rr.url.as_str()),
                         provider: None,
                     }],
+                    forges: None,
                     metadata: None,
                 };
                 updated.repos.push(new_repo);
@@ -1799,8 +1826,19 @@ impl ReposHub {
             let Some(repo) = crate::v5::ops::state::find_repo(org_cfg, &name) else {
                 yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
             };
-            let Some(first) = repo.remotes.first() else {
-                yield validation_event(format!("repo '{name}' has no remotes")); return;
+            // V5PARITY-34: clone uses the canonical remote in scope.
+            let Some(first) = crate::v5::ops::repo::canonical_remote_in_scope(
+                repo, &loaded.global.provider_map,
+            ) else {
+                if crate::v5::ops::repo::all_remotes_excluded(repo, &loaded.global.provider_map) {
+                    yield RepoEvent::Error {
+                        code: Some("forge_excluded".into()), error_class: None,
+                        message: format!("repo '{name}' has remotes but `forges` scope excludes all"),
+                    };
+                } else {
+                    yield validation_event(format!("repo '{name}' has no remotes"));
+                }
+                return;
             };
             let dest_path = std::path::PathBuf::from(&dest);
             let url = first.url.as_str();
@@ -2080,8 +2118,19 @@ impl ReposHub {
             let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
                 yield not_found_event(format!("repo '{name}' not found under org '{org}'")); return;
             };
-            let Some(first) = repo.remotes.first() else {
-                yield validation_event(format!("repo '{name}' has no remotes")); return;
+            // V5PARITY-34: rename hits the canonical remote in scope.
+            let Some(first) = crate::v5::ops::repo::canonical_remote_in_scope(
+                repo, &loaded.global.provider_map,
+            ) else {
+                if crate::v5::ops::repo::all_remotes_excluded(repo, &loaded.global.provider_map) {
+                    yield RepoEvent::Error {
+                        code: Some("forge_excluded".into()), error_class: None,
+                        message: format!("repo '{name}' has remotes but `forges` scope excludes all"),
+                    };
+                } else {
+                    yield validation_event(format!("repo '{name}' has no remotes"));
+                }
+                return;
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
@@ -2177,8 +2226,19 @@ impl ReposHub {
             let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
                 yield not_found_event(format!("repo '{name}' not found")); return;
             };
-            let Some(first) = repo.remotes.first() else {
-                yield validation_event("no remotes"); return;
+            // V5PARITY-34: canonical remote in scope.
+            let Some(first) = crate::v5::ops::repo::canonical_remote_in_scope(
+                repo, &loaded.global.provider_map,
+            ) else {
+                if crate::v5::ops::repo::all_remotes_excluded(repo, &loaded.global.provider_map) {
+                    yield RepoEvent::Error {
+                        code: Some("forge_excluded".into()), error_class: None,
+                        message: format!("repo '{name}' has remotes but `forges` scope excludes all"),
+                    };
+                } else {
+                    yield validation_event("no remotes");
+                }
+                return;
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
@@ -2242,8 +2302,19 @@ impl ReposHub {
             let Some(repo) = crate::v5::ops::state::find_repo(existing, &name) else {
                 yield not_found_event(format!("repo '{name}' not found")); return;
             };
-            let Some(first) = repo.remotes.first() else {
-                yield validation_event("no remotes"); return;
+            // V5PARITY-34: canonical remote in scope.
+            let Some(first) = crate::v5::ops::repo::canonical_remote_in_scope(
+                repo, &loaded.global.provider_map,
+            ) else {
+                if crate::v5::ops::repo::all_remotes_excluded(repo, &loaded.global.provider_map) {
+                    yield RepoEvent::Error {
+                        code: Some("forge_excluded".into()), error_class: None,
+                        message: format!("repo '{name}' has remotes but `forges` scope excludes all"),
+                    };
+                } else {
+                    yield validation_event("no remotes");
+                }
+                return;
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(existing);
@@ -2540,6 +2611,7 @@ impl ReposHub {
                 org_cfg.repos.push(crate::v5::config::OrgRepo {
                     name: RepoName::from(name.as_str()),
                     remotes: observed_remotes.clone(),
+                    forges: None,
                     metadata: None,
                 });
                 let orgs_dir = config_dir.join("orgs");
@@ -2576,6 +2648,119 @@ impl ReposHub {
                 remotes: remotes_wire,
                 init_done,
             };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-34: sync .hyperforge/config.toml ↔ org yaml.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        target_path = "Path to the checkout (named target_path because synapse path-expands params named exactly 'path')",
+        mode = "push (yaml → file) | pull (file → yaml; default)"
+    ))]
+    pub async fn sync_config(
+        &self,
+        target_path: String,
+        mode: Option<String>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if target_path.is_empty() {
+                yield validation_event("missing required parameter 'target_path'"); return;
+            }
+            let mode = mode.as_deref().unwrap_or("pull");
+            if mode != "pull" && mode != "push" {
+                yield validation_event(format!("unknown mode '{mode}'; expected 'pull' or 'push'"));
+                return;
+            }
+            let dir = std::path::PathBuf::from(&target_path);
+            let local_path = dir.join(".hyperforge").join("config.toml");
+
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => { yield cfg_error_event(e); return; }
+            };
+
+            // Read the per-repo file to find the (org, name) identity.
+            let Ok(Some(local)) = crate::v5::ops::fs::read_hyperforge_config(&dir) else {
+                yield not_found_event(format!(
+                    "no .hyperforge/config.toml in {} (run repos.init first)",
+                    dir.display()
+                ));
+                return;
+            };
+            let org_name = local.org.clone();
+            let repo_name = local.repo_name.clone();
+            let Some(existing) = loaded.orgs.get(&org_name).cloned() else {
+                yield not_found_event(format!("org '{}' not found", org_name.as_str())); return;
+            };
+            if crate::v5::ops::state::find_repo(&existing, &repo_name).is_none() {
+                yield not_found_event(format!("repo '{repo_name}' not found in org '{}'", org_name.as_str()));
+                return;
+            };
+
+            match mode {
+                "pull" => {
+                    // file → yaml.
+                    let mut updated = existing.clone();
+                    let mut changed = false;
+                    if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated, &repo_name) {
+                        let new_forges = if local.forges.is_empty() {
+                            None
+                        } else {
+                            Some(local.forges.clone())
+                        };
+                        if mr.forges != new_forges {
+                            mr.forges = new_forges;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let orgs_dir = config_dir.join("orgs");
+                        if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated) {
+                            yield cfg_error_event(e); return;
+                        }
+                    }
+                    yield RepoEvent::ConfigSynced {
+                        reference: RepoRefWire {
+                            org: org_name.as_str().to_string(),
+                            name: repo_name.as_str().to_string(),
+                        },
+                        mode: "pull".into(),
+                        local_path: local_path.display().to_string(),
+                        changed,
+                    };
+                }
+                "push" => {
+                    // yaml → file.
+                    let mr = crate::v5::ops::state::find_repo(&existing, &repo_name).unwrap();
+                    let cfg_to_write = crate::v5::ops::fs::HyperforgeRepoConfig {
+                        repo_name: repo_name.as_str().to_string(),
+                        org: org_name.clone(),
+                        forges: mr.forges.clone().unwrap_or_else(Vec::new),
+                        default_branch: local.default_branch.clone(),
+                        visibility: local.visibility.clone(),
+                        description: local.description.clone(),
+                    };
+                    let _ = std::fs::create_dir_all(dir.join(".hyperforge"));
+                    if let Err(e) = crate::v5::ops::fs::write_hyperforge_config(&dir, &cfg_to_write, true) {
+                        yield RepoEvent::Error {
+                            code: Some(e.code().into()), error_class: None, message: e.to_string(),
+                        };
+                        return;
+                    }
+                    yield RepoEvent::ConfigSynced {
+                        reference: RepoRefWire {
+                            org: org_name.as_str().to_string(),
+                            name: repo_name.as_str().to_string(),
+                        },
+                        mode: "push".into(),
+                        local_path: local_path.display().to_string(),
+                        changed: true,
+                    };
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }
