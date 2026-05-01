@@ -8,8 +8,8 @@ use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 
 use crate::v5::adapters::{
-    extract_host, ForgeAuth, ForgeMetadata, ForgePort, ForgePortError, MetadataFields,
-    ProviderVisibility,
+    extract_host, ForgeAuth, ForgeErrorClass, ForgeMetadata, ForgePort, ForgePortError,
+    MetadataFields, ProviderVisibility,
 };
 use crate::v5::config::{ProviderKind, Remote, RepoRef};
 
@@ -413,5 +413,23 @@ impl ForgePort for GitlabAdapter {
         if status.is_success() { return Ok(()); }
         let b = resp.text().await.unwrap_or_default();
         Err(Self::map_status_error(status, &b))
+    }
+
+    /// V5PARITY-36: gitlab has import APIs but they're per-source (e.g.
+    /// `/projects/import/github`). Generic migrate-from-any-git not
+    /// implemented in v1; codeberg's `/repos/migrate` is the working
+    /// target for now.
+    async fn migrate_from(
+        &self,
+        _source_url: &str,
+        _dest_repo_ref: &crate::v5::config::RepoRef,
+        _options: &crate::v5::adapters::MigrateOptions,
+        _source_auth: Option<&str>,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<crate::v5::adapters::RemoteRepo, ForgePortError> {
+        Err(ForgePortError::new(
+            ForgeErrorClass::UnsupportedField,
+            "gitlab migrate_from not implemented in v1 (use codeberg as migrate target)",
+        ))
     }
 }

@@ -419,6 +419,57 @@ impl ForgePort for CodebergAdapter {
         let b = resp.text().await.unwrap_or_default();
         Err(Self::map_status_error(status, &b))
     }
+
+    /// V5PARITY-36: codeberg/gitea pull-mirror or one-shot import via
+    /// `POST /api/v1/repos/migrate`.
+    async fn migrate_from(
+        &self,
+        source_url: &str,
+        dest_repo_ref: &crate::v5::config::RepoRef,
+        options: &crate::v5::adapters::MigrateOptions,
+        source_auth: Option<&str>,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<crate::v5::adapters::RemoteRepo, ForgePortError> {
+        let token = Self::token(auth).await?;
+        let client = Self::build_client()?;
+        let headers = Self::auth_headers(&token)?;
+        let url = format!("https://{}/api/v1/repos/migrate", self.host);
+        let mut body = serde_json::json!({
+            "clone_addr": source_url,
+            "repo_owner": dest_repo_ref.org.as_str(),
+            "repo_name":  dest_repo_ref.name.as_str(),
+            "mirror":     options.mirror,
+            "private":    options.private,
+            "description": options.description,
+        });
+        if let Some(t) = source_auth {
+            body["auth_token"] = serde_json::Value::String(t.to_string());
+        }
+        let resp = client
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ForgePortError::network(format!("post {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let b = resp.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(status, &b));
+        }
+        let v: serde_json::Value = resp.json().await
+            .map_err(|e| ForgePortError::network(format!("parse migrate response: {e}")))?;
+        let clone_url = v.get("clone_url").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let name = v.get("name").and_then(|s| s.as_str()).unwrap_or(dest_repo_ref.name.as_str()).to_string();
+        Ok(crate::v5::adapters::RemoteRepo {
+            name,
+            url: clone_url,
+            default_branch: v.get("default_branch").and_then(|s| s.as_str()).map(String::from),
+            description: v.get("description").and_then(|s| s.as_str()).map(String::from),
+            archived: v.get("archived").and_then(|s| s.as_bool()),
+            visibility: v.get("visibility").and_then(|s| s.as_str()).map(String::from),
+        })
+    }
 }
 
 fn push_gitea_items(items: &mut Vec<crate::v5::adapters::RemoteRepo>, body: &serde_json::Value) {

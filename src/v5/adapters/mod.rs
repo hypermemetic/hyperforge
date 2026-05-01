@@ -367,6 +367,41 @@ pub trait ForgePort: Send + Sync {
         new_name: &str,
         auth: &ForgeAuth<'_>,
     ) -> Result<(), ForgePortError>;
+
+    /// V5PARITY-36: pull-clone a repo from another forge into this
+    /// one. Codeberg/Gitea implements via `POST /api/v1/repos/migrate`.
+    /// GitHub returns `Unimplemented` (no equivalent import-from-git
+    /// endpoint). GitLab implementation can land later.
+    ///
+    /// `source_auth` is an optional token for cloning the source when
+    /// it's private. The target adapter's own `auth` is used for the
+    /// migrate call itself.
+    async fn migrate_from(
+        &self,
+        source_url: &str,
+        dest_repo_ref: &RepoRef,
+        options: &MigrateOptions,
+        source_auth: Option<&str>,
+        auth: &ForgeAuth<'_>,
+    ) -> Result<RemoteRepo, ForgePortError>;
+}
+
+/// V5PARITY-36: options for `ForgePort::migrate_from`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MigrateOptions {
+    pub private: bool,
+    pub description: String,
+    pub mirror: bool,
+}
+
+impl Default for MigrateOptions {
+    fn default() -> Self {
+        Self {
+            private: true,
+            description: String::new(),
+            mirror: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

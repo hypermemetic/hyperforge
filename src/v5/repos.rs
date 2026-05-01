@@ -317,6 +317,34 @@ pub enum RepoEvent {
         #[serde(skip_serializing_if = "std::ops::Not::not", default)]
         persisted: bool,
     },
+    // V5PARITY-36: cross-forge migrate / retire events.
+    MigrateStarted {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        source_url: String,
+        dest_provider: String,
+        dest_org: String,
+        dest_name: String,
+    },
+    ForgeMigrated {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        dest_url: String,
+    },
+    MigrateDone {
+        source_ref: RepoRefWire,
+        dest_ref: RepoRefWire,
+        retired: bool,
+        archived: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+    },
+    MigrateFailed {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        stage: String, // precheck | source_resolve | forge_migrate | v5_register | retire | archive
+        message: String,
+    },
     // V5PARITY-34: sync_config event.
     ConfigSynced {
         #[serde(rename = "ref")]
@@ -2845,6 +2873,257 @@ impl ReposHub {
                 changed,
                 dry_run: dry,
                 local_path,
+            };
+        }
+    }
+
+    // ==================================================================
+    // V5PARITY-36: typed retire/migrate across forges.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        org = "Source org name",
+        name = "Source repo name",
+        to = "Destination as <provider>/<org>[/<rename>] (e.g., codeberg/hyperslop)",
+        retire = "After migrate succeeds, scope source to forges=[] (default true)",
+        archive_source = "Set archived=true on the source forge BEFORE retiring (default false)",
+        mirror = "Continuous pull mirror at destination instead of one-shot copy (default false)",
+        private = "Destination visibility (default true; matches archive intent)",
+        description = "Optional description for the destination repo",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn migrate(
+        &self,
+        org: String,
+        name: String,
+        to: String,
+        retire: Option<serde_json::Value>,
+        archive_source: Option<serde_json::Value>,
+        mirror: Option<serde_json::Value>,
+        private: Option<serde_json::Value>,
+        description: Option<String>,
+        dry_run: Option<serde_json::Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            if org.is_empty() || name.is_empty() || to.is_empty() {
+                yield validation_event("missing required parameter 'org', 'name', or 'to'");
+                return;
+            }
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            let do_retire = retire.as_ref().map_or(true, |v| to_bool(v, true));
+            let do_archive = archive_source.as_ref().is_some_and(|v| to_bool(v, false));
+            let do_mirror = mirror.as_ref().is_some_and(|v| to_bool(v, false));
+            let is_private = private.as_ref().map_or(true, |v| to_bool(v, true));
+
+            // Parse destination spec.
+            let parts: Vec<&str> = to.splitn(3, '/').collect();
+            if parts.len() < 2 {
+                yield validation_event(format!("--to must be '<provider>/<org>[/<rename>]'; got '{to}'"));
+                return;
+            }
+            let dest_provider = match parts[0].to_ascii_lowercase().as_str() {
+                "github" => ProviderKind::Github,
+                "codeberg" => ProviderKind::Codeberg,
+                "gitlab" => ProviderKind::Gitlab,
+                other => { yield validation_event(format!("unknown provider '{other}'")); return; }
+            };
+            let dest_org = parts[1].to_string();
+            let dest_name = parts.get(2).map(|s| s.to_string()).unwrap_or_else(|| name.clone());
+
+            let source_wire = RepoRefWire { org: org.clone(), name: name.clone() };
+            let dest_wire = RepoRefWire { org: dest_org.clone(), name: dest_name.clone() };
+
+            // ---- precheck: source + dest org both configured. ----
+            let loaded = match crate::v5::ops::state::load_all(&config_dir) {
+                Ok(l) => l, Err(e) => {
+                    yield RepoEvent::MigrateFailed {
+                        reference: source_wire.clone(), stage: "precheck".into(),
+                        message: format!("load config: {e}"),
+                    };
+                    return;
+                }
+            };
+            let Some(source_org_cfg) = loaded.orgs.get(&OrgName::from(org.as_str())) else {
+                yield RepoEvent::MigrateFailed {
+                    reference: source_wire.clone(), stage: "precheck".into(),
+                    message: format!("source org '{org}' not configured"),
+                };
+                return;
+            };
+            let Some(source_repo) = crate::v5::ops::state::find_repo(source_org_cfg, &name) else {
+                yield RepoEvent::MigrateFailed {
+                    reference: source_wire.clone(), stage: "precheck".into(),
+                    message: format!("source repo '{name}' not in org '{org}'"),
+                };
+                return;
+            };
+            let Some(dest_org_cfg) = loaded.orgs.get(&OrgName::from(dest_org.as_str())) else {
+                yield RepoEvent::MigrateFailed {
+                    reference: source_wire.clone(), stage: "precheck".into(),
+                    message: format!("dest org '{dest_org}' not configured (run orgs.bootstrap first)"),
+                };
+                return;
+            };
+            if dest_org_cfg.forge.provider != dest_provider {
+                yield RepoEvent::MigrateFailed {
+                    reference: source_wire.clone(), stage: "precheck".into(),
+                    message: format!(
+                        "dest provider mismatch: --to says '{}' but org '{}' is provider {:?}",
+                        parts[0], dest_org, dest_org_cfg.forge.provider
+                    ),
+                };
+                return;
+            };
+
+            // ---- source_resolve: pick the source remote URL + auth. ----
+            let Some(source_remote) = source_repo.canonical_remote() else {
+                yield RepoEvent::MigrateFailed {
+                    reference: source_wire.clone(), stage: "source_resolve".into(),
+                    message: format!("source repo '{name}' has no remotes"),
+                };
+                return;
+            };
+            let source_url = source_remote.url.as_str().to_string();
+            let resolver = YamlSecretStore::new(&config_dir);
+            // Resolve source token via the same chain repos.sync uses
+            // (V5PARITY-24 explicit-then-default).
+            let source_token = {
+                let auth = crate::v5::adapters::ForgeAuth {
+                    token_ref: crate::v5::ops::repo::token_ref_for(source_org_cfg),
+                    fallback_token_ref: Some(crate::v5::ops::repo::default_token_ref_for(source_org_cfg)),
+                    resolver: &resolver,
+                };
+                auth.resolve_token().ok()
+            };
+
+            yield RepoEvent::MigrateStarted {
+                reference: source_wire.clone(),
+                source_url: source_url.clone(),
+                dest_provider: parts[0].to_string(),
+                dest_org: dest_org.clone(),
+                dest_name: dest_name.clone(),
+            };
+
+            if dry {
+                yield RepoEvent::MigrateDone {
+                    source_ref: source_wire, dest_ref: dest_wire,
+                    retired: do_retire, archived: do_archive, dry_run: true,
+                };
+                return;
+            }
+
+            // ---- forge_migrate: pull-clone source into dest. ----
+            let dest_repo_ref = RepoRef {
+                org: OrgName::from(dest_org.as_str()),
+                name: RepoName::from(dest_name.as_str()),
+            };
+            let migrate_options = crate::v5::adapters::MigrateOptions {
+                private: is_private,
+                description: description.unwrap_or_else(|| format!("Retired from {}/{}.", org, name)),
+                mirror: do_mirror,
+            };
+            let dest_token_ref = crate::v5::ops::repo::token_ref_for(dest_org_cfg);
+            let dest_fallback = Some(crate::v5::ops::repo::default_token_ref_for(dest_org_cfg));
+            let dest_remote_repo = match crate::v5::ops::repo::migrate_on_forge(
+                dest_provider, &source_url, &dest_repo_ref, &migrate_options,
+                source_token.as_deref(), &resolver, dest_token_ref, dest_fallback,
+            ).await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield RepoEvent::MigrateFailed {
+                        reference: source_wire.clone(), stage: "forge_migrate".into(),
+                        message: format!("{}: {}", e.class.as_str(), e.message),
+                    };
+                    return;
+                }
+            };
+            yield RepoEvent::ForgeMigrated {
+                reference: source_wire.clone(),
+                dest_url: dest_remote_repo.url.clone(),
+            };
+
+            // ---- v5_register: add dest to v5's destination org yaml. ----
+            let mut updated_dest = dest_org_cfg.clone();
+            let already = updated_dest.repos.iter().any(|r| r.name.as_str() == dest_name);
+            if !already {
+                updated_dest.repos.push(crate::v5::config::OrgRepo {
+                    name: RepoName::from(dest_name.as_str()),
+                    remotes: vec![crate::v5::config::Remote {
+                        url: crate::v5::config::RemoteUrl::from(dest_remote_repo.url.as_str()),
+                        provider: None,
+                    }],
+                    forges: None,
+                    metadata: None,
+                });
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated_dest) {
+                    yield RepoEvent::MigrateFailed {
+                        reference: source_wire.clone(), stage: "v5_register".into(),
+                        message: format!("save dest org yaml: {e}"),
+                    };
+                    return;
+                }
+            }
+
+            // ---- archive: optionally archive on source BEFORE scoping. ----
+            if do_archive {
+                let mut updated_source = source_org_cfg.clone();
+                if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated_source, &name) {
+                    let md = mr.metadata.get_or_insert_with(crate::v5::config::RepoMetadataLocal::default);
+                    md.archived = Some(true);
+                }
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated_source) {
+                    yield RepoEvent::MigrateFailed {
+                        reference: source_wire.clone(), stage: "archive".into(),
+                        message: format!("save source org yaml after archive: {e}"),
+                    };
+                    return;
+                }
+                // Push archived to the source forge.
+                let mut fields: crate::v5::adapters::MetadataFields = std::collections::BTreeMap::new();
+                fields.insert(
+                    crate::v5::adapters::DriftFieldKind::Archived,
+                    serde_json::Value::Bool(true),
+                );
+                if let Err(e) = crate::v5::ops::repo::write_metadata_on_forge(
+                    source_remote, &RepoRef {
+                        org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()),
+                    },
+                    &fields, &loaded.global.provider_map, &resolver,
+                    crate::v5::ops::repo::token_ref_for(source_org_cfg),
+                    Some(crate::v5::ops::repo::default_token_ref_for(source_org_cfg)),
+                ).await {
+                    yield RepoEvent::MigrateFailed {
+                        reference: source_wire.clone(), stage: "archive".into(),
+                        message: format!("archive on source forge: {}", e.message),
+                    };
+                    return;
+                }
+            }
+
+            // ---- retire: scope source to forges=[]. ----
+            if do_retire {
+                let mut updated_source = source_org_cfg.clone();
+                if let Some(mr) = crate::v5::ops::state::find_repo_mut(&mut updated_source, &name) {
+                    mr.forges = Some(Vec::new());
+                }
+                let orgs_dir = config_dir.join("orgs");
+                if let Err(e) = crate::v5::ops::state::save_org(&orgs_dir, &updated_source) {
+                    yield RepoEvent::MigrateFailed {
+                        reference: source_wire.clone(), stage: "retire".into(),
+                        message: format!("save source org yaml: {e}"),
+                    };
+                    return;
+                }
+                // Best-effort: write through to .hyperforge/config.toml if checkout exists.
+                let _ = write_through_repo_config(&config_dir, &org, &name, Some(&[]), &loaded);
+            }
+
+            yield RepoEvent::MigrateDone {
+                source_ref: source_wire, dest_ref: dest_wire,
+                retired: do_retire, archived: do_archive, dry_run: false,
             };
         }
     }

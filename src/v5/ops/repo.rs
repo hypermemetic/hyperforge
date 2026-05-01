@@ -235,6 +235,25 @@ pub async fn delete_on_forge(
     adapter.delete_repo(remote, repo_ref, &auth).await
 }
 
+/// V5PARITY-36: pull-clone a repo from `source_url` into the
+/// destination forge under `dest_repo_ref`. Codeberg implements via
+/// its migrate API; github/gitlab return Unimplemented (D10 ForgePort
+/// surface).
+pub async fn migrate_on_forge(
+    dest_provider: ProviderKind,
+    source_url: &str,
+    dest_repo_ref: &RepoRef,
+    options: &crate::v5::adapters::MigrateOptions,
+    source_auth: Option<&str>,
+    resolver: &dyn SecretResolver,
+    token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
+) -> Result<crate::v5::adapters::RemoteRepo, ForgePortError> {
+    let adapter = for_provider(dest_provider);
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
+    adapter.migrate_from(source_url, dest_repo_ref, options, source_auth, &auth).await
+}
+
 /// V5PARITY-6: rename a repo on the forge.
 pub async fn rename_on_forge(
     remote: &Remote,

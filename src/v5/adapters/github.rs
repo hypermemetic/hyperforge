@@ -474,6 +474,22 @@ impl ForgePort for GithubAdapter {
         let b = resp.text().await.unwrap_or_default();
         Err(Self::map_status_error(status, &b))
     }
+
+    /// V5PARITY-36: github has no public import-from-git API surface.
+    /// Use codeberg or gitlab as the migration target instead.
+    async fn migrate_from(
+        &self,
+        _source_url: &str,
+        _dest_repo_ref: &crate::v5::config::RepoRef,
+        _options: &crate::v5::adapters::MigrateOptions,
+        _source_auth: Option<&str>,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<crate::v5::adapters::RemoteRepo, ForgePortError> {
+        Err(ForgePortError::new(
+            ForgeErrorClass::UnsupportedField,
+            "github does not support migrate_from (no public import-from-git API)",
+        ))
+    }
 }
 
 /// Parse the `rel="next"` URL out of a GitHub Link header.
