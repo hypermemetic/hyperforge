@@ -123,6 +123,39 @@ pub enum BuildEvent {
         errored: u32,
     },
 
+    // PKGPUB-6: drift fix events.
+    DriftFixed {
+        package_name: String,
+        old_version: String,
+        new_version: String,
+        build_system: String,
+        dry_run: bool,
+    },
+    DriftSummary {
+        total_checked: u32,
+        drifted: u32,
+        fixed: u32,
+        dry_run: bool,
+    },
+
+    // PKGPUB-4: workspace publish events.
+    PublishStep {
+        package_name: String,
+        version: String,
+        registry: String,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        dry_run: bool,
+    },
+    PublishSummary {
+        total: u32,
+        published: u32,
+        failed: u32,
+        skipped: u32,
+        auto_bumped: u32,
+    },
+
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         code: Option<String>,
@@ -454,6 +487,148 @@ impl BuildHub {
     }
 
     // ==================================================================
+    // PKGPUB-6: auto-bump drifted packages.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        filter = "Glob patterns to include (optional)",
+        dry_run = "If true (default), show what would be bumped without writing"
+    ))]
+    pub async fn fix_drift(
+        &self,
+        name: String,
+        filter: Option<Vec<String>>,
+        dry_run: Option<bool>,
+    ) -> impl Stream<Item = BuildEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let dry = dry_run.unwrap_or(true);
+            let members = match workspace_members(&config_dir, &name) {
+                Ok(v) => v, Err(e) => { yield err("not_found", e); return; }
+            };
+
+            let mut total_checked = 0u32;
+            let mut drifted = 0u32;
+            let mut fixed = 0u32;
+
+            for (_r, dir) in &members {
+                // Detect build system for this member.
+                let (build_sys, reg) = match registry::detect_build_system(dir) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+
+                // Parse local name + version.
+                let (pkg_name, local_ver) = match registry::parse_local_version(dir, build_sys) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+
+                // Apply filter if provided.
+                if let Some(ref patterns) = filter {
+                    let matched = patterns.iter().any(|pat| glob_match(pat, &pkg_name));
+                    if !matched {
+                        continue;
+                    }
+                }
+
+                total_checked += 1;
+
+                // Query registry.
+                let published = match registry::query_registry(&pkg_name, reg).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield err(e.code(), e.to_string());
+                        continue;
+                    }
+                };
+
+                let status = registry::diff_status(&local_ver, published.as_deref());
+
+                // "up_to_date" means local == published — the package is drifted
+                // (same version on registry, but source may have changed).
+                if status != "up_to_date" {
+                    continue;
+                }
+
+                drifted += 1;
+
+                // Determine the manifest file and bump.
+                let bump_result = match build_sys {
+                    "cargo" => {
+                        let cargo = dir.join("Cargo.toml");
+                        let raw = match std::fs::read_to_string(&cargo) {
+                            Ok(s) => s,
+                            Err(e) => { yield err("io", e.to_string()); continue; }
+                        };
+                        release::bump_cargo_toml(&raw, "patch").map(|(old, new, text)| {
+                            (old, new, text, cargo, "Cargo.toml".to_string())
+                        })
+                    }
+                    "cabal" => {
+                        // Find the .cabal file.
+                        let cabal_path = find_cabal_file(dir);
+                        match cabal_path {
+                            Some(cp) => {
+                                let raw = match std::fs::read_to_string(&cp) {
+                                    Ok(s) => s,
+                                    Err(e) => { yield err("io", e.to_string()); continue; }
+                                };
+                                let file_name = cp.file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                release::bump_cabal_file(&raw, "patch").map(|(old, new, text)| {
+                                    (old, new, text, cp, file_name)
+                                })
+                            }
+                            None => { yield err("manifest_not_found", format!("no .cabal file in {}", dir.display())); continue; }
+                        }
+                    }
+                    _ => {
+                        // node/other — not yet supported for auto-bump.
+                        yield err("unsupported", format!("auto-bump not supported for build system '{build_sys}'"));
+                        continue;
+                    }
+                };
+
+                let (old, new, new_text, manifest_path, manifest_name) = match bump_result {
+                    Ok(t) => t,
+                    Err(e) => { yield err(e.code(), e.to_string()); continue; }
+                };
+
+                if !dry {
+                    if let Err(e) = std::fs::write(&manifest_path, new_text) {
+                        yield err("io", e.to_string());
+                        continue;
+                    }
+                    let _ = crate::v5::ops::git::add(dir, &[&manifest_name]);
+                    let _ = crate::v5::ops::git::commit(
+                        dir,
+                        &format!("chore: bump {pkg_name} {old} \u{2192} {new} (drift)"),
+                    );
+                    fixed += 1;
+                }
+
+                yield BuildEvent::DriftFixed {
+                    package_name: pkg_name,
+                    old_version: old,
+                    new_version: new,
+                    build_system: build_sys.to_string(),
+                    dry_run: dry,
+                };
+            }
+
+            yield BuildEvent::DriftSummary {
+                total_checked,
+                drifted,
+                fixed: if dry { 0 } else { fixed },
+                dry_run: dry,
+            };
+        }
+    }
+
+    // ==================================================================
     // V5PARITY-10: release.
     // ==================================================================
 
@@ -670,6 +845,461 @@ impl BuildHub {
     }
 
     // ==================================================================
+    // PKGPUB-4: workspace-wide publish with dependency ordering.
+    // ==================================================================
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        include = "Glob patterns to include (optional)",
+        exclude = "Glob patterns to exclude (optional)",
+        bump = "major | minor | patch (default: patch)",
+        execute = "Actually publish (default: false = dry-run)",
+        no_tag = "Skip git tags",
+        no_commit = "Skip auto-commit after bumps"
+    ))]
+    pub async fn publish_workspace(
+        &self,
+        name: String,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        bump: Option<String>,
+        execute: Option<bool>,
+        no_tag: Option<bool>,
+        no_commit: Option<bool>,
+    ) -> impl Stream<Item = BuildEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let bump_kind = bump.as_deref().unwrap_or("patch");
+            if !matches!(bump_kind, "patch" | "minor" | "major") {
+                yield err("validation", format!("invalid bump kind: {bump_kind}"));
+                return;
+            }
+            let dry_run = !execute.unwrap_or(false);
+            let skip_tag = no_tag.unwrap_or(false);
+            let skip_commit = no_commit.unwrap_or(false);
+
+            // 1. Resolve workspace members, detect build systems, parse manifests.
+            let members = match workspace_members(&config_dir, &name) {
+                Ok(v) => v,
+                Err(e) => { yield err("not_found", e); return; }
+            };
+
+            // Collect package info for each member.
+            struct PkgInfo {
+                pkg_name: String,
+                local_version: String,
+                build_system: String,
+                registry: String,
+                dir: PathBuf,
+                manifest: manifest::PackageManifest,
+            }
+
+            let mut packages: Vec<PkgInfo> = Vec::new();
+            for (_r, dir) in &members {
+                let (build_sys, reg) = match registry::detect_build_system(dir) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+                let (pkg_name, local_ver) = match registry::parse_local_version(dir, build_sys) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+                let m = match manifest::detect_and_parse(dir) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                packages.push(PkgInfo {
+                    pkg_name,
+                    local_version: local_ver,
+                    build_system: build_sys.to_string(),
+                    registry: reg.to_string(),
+                    dir: dir.clone(),
+                    manifest: m,
+                });
+            }
+
+            // 2. Query registries and determine status.
+            struct PkgStatus {
+                pkg_name: String,
+                local_version: String,
+                build_system: String,
+                registry: String,
+                dir: PathBuf,
+                status: String,
+                #[allow(dead_code)]
+                published_version: Option<String>,
+                deps: Vec<String>,
+            }
+
+            let workspace_names: std::collections::BTreeSet<String> =
+                packages.iter().map(|p| p.pkg_name.clone()).collect();
+
+            let mut statuses: Vec<PkgStatus> = Vec::new();
+            for pkg in &packages {
+                let published = match registry::query_registry(&pkg.pkg_name, &pkg.registry).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield err(e.code(), e.to_string());
+                        continue;
+                    }
+                };
+                let status = registry::diff_status(&pkg.local_version, published.as_deref());
+                let ws_deps: Vec<String> = pkg.manifest.deps.iter()
+                    .filter(|d| workspace_names.contains(&d.name))
+                    .map(|d| d.name.clone())
+                    .collect();
+                statuses.push(PkgStatus {
+                    pkg_name: pkg.pkg_name.clone(),
+                    local_version: pkg.local_version.clone(),
+                    build_system: pkg.build_system.clone(),
+                    registry: pkg.registry.clone(),
+                    dir: pkg.dir.clone(),
+                    status: status.to_string(),
+                    published_version: published,
+                    deps: ws_deps,
+                });
+            }
+
+            // 3. Filter by include/exclude globs.
+            let mut selected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for st in &statuses {
+                let inc = match &include {
+                    Some(pats) => pats.iter().any(|p| glob_match(p, &st.pkg_name)),
+                    None => true,
+                };
+                let exc = match &exclude {
+                    Some(pats) => pats.iter().any(|p| glob_match(p, &st.pkg_name)),
+                    None => false,
+                };
+                if inc && !exc {
+                    selected.insert(st.pkg_name.clone());
+                }
+            }
+
+            // 4. Auto-include transitive deps.
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let current: Vec<String> = selected.iter().cloned().collect();
+                for name_sel in &current {
+                    if let Some(st) = statuses.iter().find(|s| s.pkg_name == *name_sel) {
+                        for dep in &st.deps {
+                            if !selected.contains(dep) {
+                                selected.insert(dep.clone());
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build manifests for selected packages (for topo sort).
+            let selected_manifests: Vec<manifest::PackageManifest> = packages.iter()
+                .filter(|p| selected.contains(&p.pkg_name))
+                .map(|p| p.manifest.clone())
+                .collect();
+
+            // 5. Build publish order.
+            let tiers = match manifest::build_publish_order(&selected_manifests) {
+                Ok(t) => t,
+                Err(e) => { yield err("cycle", e); return; }
+            };
+
+            // 6. Process tiers (leaves first).
+            let mut total = 0u32;
+            let mut published_count = 0u32;
+            let mut failed = 0u32;
+            let mut skipped = 0u32;
+            let mut auto_bumped = 0u32;
+            let mut tier_failed = false;
+
+            let resolver = crate::v5::secrets::YamlSecretStore::new(&config_dir);
+
+            for (tier_idx, tier) in tiers.iter().enumerate() {
+                for pkg_name in tier {
+                    total += 1;
+
+                    let st = match statuses.iter().find(|s| s.pkg_name == *pkg_name) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+
+                    // If a previous tier failed, mark remaining as failed.
+                    if tier_failed {
+                        failed += 1;
+                        yield BuildEvent::PublishStep {
+                            package_name: pkg_name.clone(),
+                            version: st.local_version.clone(),
+                            registry: st.registry.clone(),
+                            action: "failed".into(),
+                            error: Some("dependency in earlier tier failed".into()),
+                            dry_run,
+                        };
+                        continue;
+                    }
+
+                    // Skip if up_to_date.
+                    if st.status == "up_to_date" {
+                        skipped += 1;
+                        yield BuildEvent::PublishStep {
+                            package_name: pkg_name.clone(),
+                            version: st.local_version.clone(),
+                            registry: st.registry.clone(),
+                            action: "skip".into(),
+                            error: None,
+                            dry_run,
+                        };
+                        continue;
+                    }
+
+                    let mut current_version = st.local_version.clone();
+
+                    // Bump version for packages that need publishing.
+                    let do_bump = st.status == "unpublished"
+                        || st.status == "ahead"
+                        || st.status == "stale";
+                    if do_bump {
+                        let bump_result = if st.build_system == "cargo" {
+                            let cargo_path = st.dir.join("Cargo.toml");
+                            match std::fs::read_to_string(&cargo_path) {
+                                Ok(raw) => match release::bump_cargo_toml(&raw, bump_kind) {
+                                    Ok((old, new, new_text)) => {
+                                        if !dry_run {
+                                            if let Err(e) = std::fs::write(&cargo_path, new_text) {
+                                                Some(Err(e.to_string()))
+                                            } else {
+                                                Some(Ok((old, new)))
+                                            }
+                                        } else {
+                                            Some(Ok((old, new)))
+                                        }
+                                    }
+                                    Err(e) => Some(Err(e.to_string())),
+                                },
+                                Err(e) => Some(Err(e.to_string())),
+                            }
+                        } else if st.build_system == "cabal" {
+                            let cabal_file = std::fs::read_dir(&st.dir).ok()
+                                .and_then(|entries| {
+                                    entries.flatten().find(|e| {
+                                        e.path().extension().and_then(|x| x.to_str()) == Some("cabal")
+                                            && e.path().is_file()
+                                    })
+                                })
+                                .map(|e| e.path());
+                            match cabal_file {
+                                Some(path) => match std::fs::read_to_string(&path) {
+                                    Ok(raw) => match release::bump_cabal_file(&raw, bump_kind) {
+                                        Ok((old, new, new_text)) => {
+                                            if !dry_run {
+                                                if let Err(e) = std::fs::write(&path, new_text) {
+                                                    Some(Err(e.to_string()))
+                                                } else {
+                                                    Some(Ok((old, new)))
+                                                }
+                                            } else {
+                                                Some(Ok((old, new)))
+                                            }
+                                        }
+                                        Err(e) => Some(Err(e.to_string())),
+                                    },
+                                    Err(e) => Some(Err(e.to_string())),
+                                },
+                                None => Some(Err("no .cabal file found".into())),
+                            }
+                        } else {
+                            // node/other: skip bump, publish as-is.
+                            None
+                        };
+
+                        match bump_result {
+                            Some(Ok((_old, new))) => {
+                                auto_bumped += 1;
+                                current_version.clone_from(&new);
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: new.clone(),
+                                    registry: st.registry.clone(),
+                                    action: "auto_bump".into(),
+                                    error: None,
+                                    dry_run,
+                                };
+                                if !dry_run && !skip_commit {
+                                    let _ = crate::v5::ops::git::add(&st.dir, &["."]);
+                                    let _ = crate::v5::ops::git::commit(
+                                        &st.dir,
+                                        &format!("chore: bump {pkg_name} to {new}"),
+                                    );
+                                }
+                                if !dry_run && !skip_tag {
+                                    let _ = crate::v5::ops::git::tag(
+                                        &st.dir,
+                                        &format!("{pkg_name}-v{new}"),
+                                    );
+                                }
+                            }
+                            Some(Err(e)) => {
+                                failed += 1;
+                                tier_failed = true;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version.clone(),
+                                    registry: st.registry.clone(),
+                                    action: "failed".into(),
+                                    error: Some(format!("bump failed: {e}")),
+                                    dry_run,
+                                };
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
+
+                    // Publish step.
+                    if dry_run {
+                        published_count += 1;
+                        yield BuildEvent::PublishStep {
+                            package_name: pkg_name.clone(),
+                            version: current_version,
+                            registry: st.registry.clone(),
+                            action: "publish".into(),
+                            error: None,
+                            dry_run,
+                        };
+                    } else {
+                        let channel = registry_to_channel(&st.registry);
+                        let secret_key = match release::secret_key_for_channel(channel) {
+                            Some(k) => k,
+                            None => {
+                                failed += 1;
+                                tier_failed = true;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version,
+                                    registry: st.registry.clone(),
+                                    action: "failed".into(),
+                                    error: Some(format!("unknown channel: {channel}")),
+                                    dry_run,
+                                };
+                                continue;
+                            }
+                        };
+                        use crate::v5::secrets::SecretResolver as _;
+                        let token = match crate::v5::secrets::SecretRef::parse(
+                            &format!("secrets://{secret_key}"),
+                        ) {
+                            Ok(parsed) => match resolver.resolve(&parsed) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    failed += 1;
+                                    tier_failed = true;
+                                    yield BuildEvent::PublishStep {
+                                        package_name: pkg_name.clone(),
+                                        version: current_version,
+                                        registry: st.registry.clone(),
+                                        action: "failed".into(),
+                                        error: Some(format!("no secret at secrets://{secret_key}")),
+                                        dry_run,
+                                    };
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                failed += 1;
+                                tier_failed = true;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version,
+                                    registry: st.registry.clone(),
+                                    action: "failed".into(),
+                                    error: Some(e.to_string()),
+                                    dry_run,
+                                };
+                                continue;
+                            }
+                        };
+                        let cmd = match release::publish_command(channel, &token) {
+                            Some(c) => c,
+                            None => {
+                                failed += 1;
+                                tier_failed = true;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version,
+                                    registry: st.registry.clone(),
+                                    action: "failed".into(),
+                                    error: Some(format!("no publish command for channel: {channel}")),
+                                    dry_run,
+                                };
+                                continue;
+                            }
+                        };
+                        match exec::run_shell(&st.dir, &cmd) {
+                            Ok(res) if res.exit_code == 0 => {
+                                published_count += 1;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version,
+                                    registry: st.registry.clone(),
+                                    action: "publish".into(),
+                                    error: None,
+                                    dry_run,
+                                };
+                            }
+                            Ok(res) => {
+                                failed += 1;
+                                tier_failed = true;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version,
+                                    registry: st.registry.clone(),
+                                    action: "failed".into(),
+                                    error: Some(format!(
+                                        "exit {}: {}",
+                                        res.exit_code,
+                                        res.stderr.trim()
+                                    )),
+                                    dry_run,
+                                };
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                tier_failed = true;
+                                yield BuildEvent::PublishStep {
+                                    package_name: pkg_name.clone(),
+                                    version: current_version,
+                                    registry: st.registry.clone(),
+                                    action: "failed".into(),
+                                    error: Some(e.to_string()),
+                                    dry_run,
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Wait for registry propagation between tiers (crates.io needs ~30s).
+                if !dry_run && !tier_failed && tier_idx + 1 < tiers.len() {
+                    let has_crates_io = tier.iter().any(|pkg_name| {
+                        statuses.iter().any(|s| s.pkg_name == *pkg_name && s.registry == "crates_io")
+                    });
+                    if has_crates_io {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                }
+            }
+
+            yield BuildEvent::PublishSummary {
+                total,
+                published: published_count,
+                failed,
+                skipped,
+                auto_bumped,
+            };
+        }
+    }
+
+    // ==================================================================
     // V5PARITY-11: dist + exec.
     // ==================================================================
 
@@ -882,6 +1512,18 @@ impl BuildHub {
 }
 
 
+/// Find the first `.cabal` file in a directory.
+fn find_cabal_file(dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("cabal") && p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Simple glob matching: `*` matches any sequence, `?` matches one char.
 fn glob_match(pattern: &str, s: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -910,6 +1552,17 @@ fn glob_match(pattern: &str, s: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Map registry identifier (from `detect_build_system`) to the publish
+/// channel name used by `release::publish_command` / `secret_key_for_channel`.
+fn registry_to_channel(registry: &str) -> &str {
+    match registry {
+        "crates_io" => "crates.io",
+        "hackage" => "hackage",
+        "npm" => "npm",
+        other => other,
+    }
 }
 
 /// Minimal shell-escape: single-quote the value; escape embedded quotes.
