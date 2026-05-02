@@ -10,3 +10,4 @@ pub mod diff;
 pub mod release;
 pub mod exec;
 pub mod dist;
+pub mod registry;

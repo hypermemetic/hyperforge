@@ -1,8 +1,9 @@
-//! `build::release` — version bump logic.
+//! `build::release` — version bump + publish command generation.
 //!
-//! Pure string manipulation; no I/O. `bump_version_in_cargo_toml`
-//! returns the new file contents + old/new version for the caller to
-//! write + commit.
+//! Pure string manipulation; no I/O. `bump_cargo_toml` / `bump_cabal_file`
+//! return the new file contents + old/new version for the caller to
+//! write + commit. `publish_command` maps a channel name to the shell
+//! command that publishes (token injected by caller).
 
 use thiserror::Error;
 
@@ -84,6 +85,126 @@ pub fn bump_cargo_toml(
     Ok((old, new, doc.to_string()))
 }
 
+// ── Cabal (.cabal file) support ─────────────────────────────────────
+
+/// Parse the `version:` field from a `.cabal` file's text content.
+/// Returns `None` if the field is absent or empty.
+pub fn parse_cabal_version(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .to_lowercase()
+            .strip_prefix("version:")
+            .map(|_| trimmed["version:".len()..].trim())
+        {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Bump the `version:` field in a `.cabal` file.
+/// Returns `(old, new, new_text)` — same contract as `bump_cargo_toml`.
+pub fn bump_cabal_file(
+    text: &str,
+    kind_or_target: &str,
+) -> Result<(String, String, String), BumpError> {
+    let old = parse_cabal_version(text).ok_or(BumpError::MissingVersion)?;
+    let new = if ["major", "minor", "patch"].contains(&kind_or_target) {
+        let parsed = parse_semver(&old)?;
+        let nb = apply_bump(parsed, kind_or_target)
+            .ok_or_else(|| BumpError::UnknownKind(kind_or_target.to_string()))?;
+        format!("{}.{}.{}", nb.0, nb.1, nb.2)
+    } else {
+        parse_semver(kind_or_target)?;
+        kind_or_target.to_string()
+    };
+    // Replace the first `version:` line preserving whitespace style.
+    let mut found = false;
+    let new_text: String = text
+        .lines()
+        .map(|line| {
+            if !found {
+                let trimmed = line.trim();
+                if trimmed.to_lowercase().starts_with("version:") {
+                    found = true;
+                    // Preserve the key prefix (indentation + casing) and
+                    // spacing between the colon and value.
+                    let colon_pos = line.find(':').unwrap();
+                    let after_colon = &line[colon_pos + 1..];
+                    let leading_spaces = after_colon.len() - after_colon.trim_start().len();
+                    let padding = if leading_spaces > 0 {
+                        &after_colon[..leading_spaces]
+                    } else {
+                        " "
+                    };
+                    return format!("{}{padding}{new}", &line[..=colon_pos]);
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Preserve trailing newline if original had one.
+    let new_text = if text.ends_with('\n') && !new_text.ends_with('\n') {
+        new_text + "\n"
+    } else {
+        new_text
+    };
+    Ok((old, new, new_text))
+}
+
+// ── Publish command generation ──────────────────────────────────────
+
+/// The secret key path (under `secrets://`) for a given publish channel.
+/// Returns `None` for unknown channels.
+#[must_use]
+pub fn secret_key_for_channel(channel: &str) -> Option<&'static str> {
+    match channel {
+        "crates.io" => Some("cargo/token"),
+        "npm" => Some("npm/token"),
+        "pypi" => Some("pypi/token"),
+        "hackage" => Some("hackage/token"),
+        _ => None,
+    }
+}
+
+/// Build the shell command string to publish a package on `channel`.
+/// The resolved `token` is embedded in the command via env var or flag.
+///
+/// For hackage the flow is:
+///   1. `cabal sdist` — build source distribution tarball
+///   2. `cabal upload --publish --token=<tok> <tarball>`
+///
+/// The tarball path is discovered from `cabal sdist` stdout at runtime,
+/// so we emit a two-step shell pipeline that captures the path.
+#[must_use]
+pub fn publish_command(channel: &str, token: &str) -> Option<String> {
+    let escaped = shell_escape(token);
+    match channel {
+        "crates.io" => Some(format!(
+            "CARGO_REGISTRY_TOKEN={escaped} cargo publish --allow-dirty"
+        )),
+        "npm" => Some(format!("NPM_TOKEN={escaped} npm publish")),
+        "pypi" => Some(format!(
+            "TWINE_USERNAME=__token__ TWINE_PASSWORD={escaped} twine upload dist/*"
+        )),
+        "hackage" => Some(format!(
+            "cabal sdist && cabal upload --publish --token={escaped} \
+             \"$(cabal sdist 2>/dev/null | tail -1)\""
+        )),
+        _ => None,
+    }
+}
+
+/// Minimal shell escaping: wrap in single quotes, escaping embedded
+/// single quotes via the `'\''` idiom.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +236,104 @@ mod tests {
     fn rejects_non_semver() {
         let raw = "[package]\nversion = \"not-a-version\"\n";
         assert!(bump_cargo_toml(raw, "patch").is_err());
+    }
+
+    // ── Cabal tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_cabal_version_basic() {
+        let cabal = "name:           plexus-synapse\nversion:        0.2.0\nlicense:        MIT\n";
+        assert_eq!(parse_cabal_version(cabal), Some("0.2.0".into()));
+    }
+
+    #[test]
+    fn parse_cabal_version_compact() {
+        let cabal = "name: foo\nversion:1.0.0\n";
+        assert_eq!(parse_cabal_version(cabal), Some("1.0.0".into()));
+    }
+
+    #[test]
+    fn parse_cabal_version_missing() {
+        let cabal = "name: foo\nlicense: MIT\n";
+        assert_eq!(parse_cabal_version(cabal), None);
+    }
+
+    #[test]
+    fn bump_cabal_patch() {
+        let cabal = "name:           synapse\nversion:        0.2.0\nlicense:        MIT\n";
+        let (old, new, out) = bump_cabal_file(cabal, "patch").unwrap();
+        assert_eq!(old, "0.2.0");
+        assert_eq!(new, "0.2.1");
+        assert!(out.contains("version:        0.2.1"));
+        // Other lines unchanged.
+        assert!(out.contains("name:           synapse"));
+        assert!(out.contains("license:        MIT"));
+    }
+
+    #[test]
+    fn bump_cabal_minor() {
+        let cabal = "name: x\nversion: 1.4.7\n";
+        let (_, new, _) = bump_cabal_file(cabal, "minor").unwrap();
+        assert_eq!(new, "1.5.0");
+    }
+
+    #[test]
+    fn bump_cabal_exact_target() {
+        let cabal = "name: x\nversion: 0.1.0\n";
+        let (_, new, out) = bump_cabal_file(cabal, "3.0.0").unwrap();
+        assert_eq!(new, "3.0.0");
+        assert!(out.contains("version: 3.0.0"));
+    }
+
+    #[test]
+    fn bump_cabal_missing_version() {
+        let cabal = "name: x\nlicense: MIT\n";
+        assert!(bump_cabal_file(cabal, "patch").is_err());
+    }
+
+    #[test]
+    fn bump_cabal_preserves_trailing_newline() {
+        let cabal = "name: x\nversion: 1.0.0\n";
+        let (_, _, out) = bump_cabal_file(cabal, "patch").unwrap();
+        assert!(out.ends_with('\n'));
+    }
+
+    // ── Publish command tests ───────────────────────────────────────
+
+    #[test]
+    fn hackage_publish_command() {
+        let cmd = publish_command("hackage", "tok123").unwrap();
+        assert!(cmd.contains("cabal sdist"));
+        assert!(cmd.contains("cabal upload --publish"));
+        assert!(cmd.contains("--token="));
+        assert!(cmd.contains("tok123"));
+    }
+
+    #[test]
+    fn crates_io_publish_command() {
+        let cmd = publish_command("crates.io", "secret").unwrap();
+        assert!(cmd.contains("CARGO_REGISTRY_TOKEN="));
+        assert!(cmd.contains("cargo publish"));
+    }
+
+    #[test]
+    fn unknown_channel_returns_none() {
+        assert!(publish_command("bogus", "x").is_none());
+    }
+
+    #[test]
+    fn secret_key_hackage() {
+        assert_eq!(secret_key_for_channel("hackage"), Some("hackage/token"));
+    }
+
+    #[test]
+    fn secret_key_unknown() {
+        assert_eq!(secret_key_for_channel("bogus"), None);
+    }
+
+    #[test]
+    fn shell_escape_single_quotes() {
+        let escaped = shell_escape("it's a test");
+        assert_eq!(escaped, "'it'\\''s a test'");
     }
 }

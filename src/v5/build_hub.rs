@@ -8,7 +8,7 @@ use futures::Stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v5::build::{diff, dist, exec, manifest, release};
+use crate::v5::build::{diff, dist, exec, manifest, registry, release};
 use crate::v5::config::{OrgName, WorkspaceRepo};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -37,6 +37,24 @@ pub enum BuildEvent {
     PackageDiffEntry {
         #[serde(flatten)]
         change: diff::PackageChange,
+    },
+    RegistryDiffEntry {
+        package_name: String,
+        build_system: String,
+        local_version: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        published_version: Option<String>,
+        registry: String,
+        status: String,
+    },
+    RegistryDiffSummary {
+        name: String,
+        total: u32,
+        ahead: u32,
+        stale: u32,
+        up_to_date: u32,
+        unpublished: u32,
+        errored: u32,
     },
 
     // V5PARITY-10 release events.
@@ -343,6 +361,95 @@ impl BuildHub {
                 }
                 let _ = r;
             }
+        }
+    }
+
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        filter = "Glob patterns to include (optional)"
+    ))]
+    pub async fn registry_diff(
+        &self,
+        name: String,
+        filter: Option<Vec<String>>,
+    ) -> impl Stream<Item = BuildEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let members = match workspace_members(&config_dir, &name) {
+                Ok(v) => v, Err(e) => { yield err("not_found", e); return; }
+            };
+
+            let mut total = 0u32;
+            let mut ahead = 0u32;
+            let mut stale = 0u32;
+            let mut up_to_date = 0u32;
+            let mut unpublished = 0u32;
+            let mut errored = 0u32;
+
+            for (_r, dir) in &members {
+                // Detect build system for this member.
+                let (build_sys, reg) = match registry::detect_build_system(dir) {
+                    Some(pair) => pair,
+                    None => continue, // No known manifest, skip.
+                };
+
+                // Parse local name + version.
+                let (pkg_name, local_ver) = match registry::parse_local_version(dir, build_sys) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+
+                // Apply filter if provided.
+                if let Some(ref patterns) = filter {
+                    let matched = patterns.iter().any(|pat| {
+                        glob_match(pat, &pkg_name)
+                    });
+                    if !matched {
+                        continue;
+                    }
+                }
+
+                total += 1;
+
+                // Query registry (async).
+                let published = match registry::query_registry(&pkg_name, reg).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errored += 1;
+                        yield err(e.code(), e.to_string());
+                        continue;
+                    }
+                };
+
+                let status = registry::diff_status(&local_ver, published.as_deref());
+
+                match status {
+                    "ahead" => ahead += 1,
+                    "stale" => stale += 1,
+                    "up_to_date" => up_to_date += 1,
+                    "unpublished" => unpublished += 1,
+                    _ => {}
+                }
+
+                yield BuildEvent::RegistryDiffEntry {
+                    package_name: pkg_name,
+                    build_system: build_sys.to_string(),
+                    local_version: local_ver,
+                    published_version: published,
+                    registry: reg.to_string(),
+                    status: status.to_string(),
+                };
+            }
+
+            yield BuildEvent::RegistryDiffSummary {
+                name,
+                total,
+                ahead,
+                stale,
+                up_to_date,
+                unpublished,
+                errored,
+            };
         }
     }
 
@@ -774,6 +881,36 @@ impl BuildHub {
     }
 }
 
+
+/// Simple glob matching: `*` matches any sequence, `?` matches one char.
+fn glob_match(pattern: &str, s: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
 
 /// Minimal shell-escape: single-quote the value; escape embedded quotes.
 fn shell_escape(s: &str) -> String {

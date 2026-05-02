@@ -3,7 +3,7 @@
 //! Each parser yields a `PackageManifest` with the fields BuildHub
 //! surfaces. Unknown / missing optional fields fall back to empty.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 
 use schemars::JsonSchema;
@@ -215,6 +215,77 @@ pub fn analyze(manifests: &[PackageManifest]) -> Vec<Finding> {
     findings
 }
 
+/// Topological sort of workspace packages into publish tiers.
+///
+/// Returns tiers of package names. Tier 0 has no in-workspace deps,
+/// Tier 1 depends only on Tier 0, etc. Each tier can publish in parallel.
+/// Returns an error if a dependency cycle is detected.
+pub fn build_publish_order(manifests: &[PackageManifest]) -> Result<Vec<Vec<String>>, String> {
+    // Collect workspace package names for filtering.
+    let workspace_names: BTreeSet<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
+
+    // Build adjacency (deps) and in-degree maps.
+    // Edge: dependency -> dependent (dep must publish before dependent).
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for m in manifests {
+        in_degree.entry(&m.name).or_insert(0);
+        for d in &m.deps {
+            if workspace_names.contains(d.name.as_str()) && d.name != m.name {
+                *in_degree.entry(&m.name).or_insert(0) += 1;
+                dependents.entry(d.name.as_str()).or_default().push(&m.name);
+            }
+        }
+    }
+
+    // Kahn's algorithm with tier grouping.
+    let mut tiers: Vec<Vec<String>> = Vec::new();
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&name, _)| name)
+        .collect();
+
+    let mut processed = 0usize;
+    let total = manifests.len();
+
+    while !queue.is_empty() {
+        // Drain current queue into one tier.
+        let mut tier: Vec<String> = Vec::new();
+        let tier_size = queue.len();
+        for _ in 0..tier_size {
+            let node = queue.pop_front().unwrap();
+            tier.push(node.to_string());
+            processed += 1;
+
+            if let Some(deps) = dependents.get(node) {
+                for &dep in deps {
+                    let deg = in_degree.get_mut(dep).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(dep);
+                    }
+                }
+            }
+        }
+        tier.sort();
+        tiers.push(tier);
+    }
+
+    if processed < total {
+        // Cycle detected — report the remaining nodes.
+        let stuck: Vec<String> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg > 0)
+            .map(|(&name, _)| name.to_string())
+            .collect();
+        return Err(format!("dependency cycle detected among: {}", stuck.join(", ")));
+    }
+
+    Ok(tiers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +319,77 @@ mod tests {
         };
         let findings = analyze(&[a, b]);
         assert!(findings.iter().any(|f| matches!(f, Finding::VersionMismatch { dep, .. } if dep == "serde")));
+    }
+
+    fn pkg(name: &str, deps: &[&str]) -> PackageManifest {
+        PackageManifest {
+            kind: "cargo".into(),
+            name: name.into(),
+            version: "0.1.0".into(),
+            deps: deps
+                .iter()
+                .map(|d| Dep {
+                    name: (*d).into(),
+                    version: "*".into(),
+                    source: "cargo".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_topo_sort_linear() {
+        // A depends on B depends on C
+        let manifests = vec![pkg("A", &["B"]), pkg("B", &["C"]), pkg("C", &[])];
+        let tiers = build_publish_order(&manifests).unwrap();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0], vec!["C"]);
+        assert_eq!(tiers[1], vec!["B"]);
+        assert_eq!(tiers[2], vec!["A"]);
+    }
+
+    #[test]
+    fn test_topo_sort_diamond() {
+        // A→B, A→C, B→D, C→D
+        let manifests = vec![
+            pkg("A", &["B", "C"]),
+            pkg("B", &["D"]),
+            pkg("C", &["D"]),
+            pkg("D", &[]),
+        ];
+        let tiers = build_publish_order(&manifests).unwrap();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0], vec!["D"]);
+        assert_eq!(tiers[1], vec!["B", "C"]);
+        assert_eq!(tiers[2], vec!["A"]);
+    }
+
+    #[test]
+    fn test_topo_sort_independent() {
+        let manifests = vec![pkg("A", &[]), pkg("B", &[]), pkg("C", &[])];
+        let tiers = build_publish_order(&manifests).unwrap();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0], vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_topo_sort_cycle() {
+        // A→B→A
+        let manifests = vec![pkg("A", &["B"]), pkg("B", &["A"])];
+        let result = build_publish_order(&manifests);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("A"), "error should mention A: {err}");
+        assert!(err.contains("B"), "error should mention B: {err}");
+    }
+
+    #[test]
+    fn test_topo_sort_mixed_workspace_external() {
+        // A depends on B (workspace) and reqwest (external). Only B in graph.
+        let manifests = vec![pkg("A", &["B", "reqwest"]), pkg("B", &[])];
+        let tiers = build_publish_order(&manifests).unwrap();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0], vec!["B"]);
+        assert_eq!(tiers[1], vec!["A"]);
     }
 }
