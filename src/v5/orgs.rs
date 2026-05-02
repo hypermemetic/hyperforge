@@ -882,8 +882,10 @@ impl OrgsHub {
                 return;
             }
             let resolver = crate::v5::secrets::YamlSecretStore::new(this.config_dir.as_ref());
-            let token_ref = crate::v5::ops::repo::token_ref_for(&cfg);
-            let fallback = Some(crate::v5::ops::repo::default_token_ref_for(&cfg));
+            // MFORGE-6: use the bootstrapped provider's credential, not the
+            // primary provider's (which may differ on a multi-forge org).
+            let token_ref = crate::v5::ops::repo::token_ref_for_provider(&cfg, provider);
+            let fallback = Some(crate::v5::ops::repo::default_token_ref_for_provider(provider));
             let remote_repos = match crate::v5::ops::repo::list_on_forge(
                 provider, &org_name, &resolver, token_ref, fallback,
             ).await {

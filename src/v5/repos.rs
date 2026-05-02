@@ -846,10 +846,10 @@ impl ReposHub {
                 }
 
                 // V5LIFECYCLE-4: route through ops::repo wrappers.
+                // MFORGE-5: per-provider credential dispatch.
                 let resolver = YamlSecretStore::new(&dir);
-                let token_ref = crate::v5::ops::repo::token_ref_for(existing);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
-                let _ = provider; // provider is still derived for logging but we no longer need the adapter handle here
+                let token_ref = crate::v5::ops::repo::token_ref_for_provider(existing, provider);
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(provider));
                 match crate::v5::ops::repo::exists_on_forge(
                     first, &repo_ref, &loaded.global.provider_map, &resolver, token_ref, fallback_token_ref.clone(),
                 ).await {
@@ -1285,13 +1285,6 @@ impl ReposHub {
                 scoped
             };
             let resolver = YamlSecretStore::new(&dir);
-            let pk = org_cfg.primary_provider().unwrap_or(ProviderKind::Github);
-            let token_ref = org_cfg
-                .credentials_for(pk)
-                .iter()
-                .find(|c| matches!(c.cred_type, CredentialType::Token))
-                .map(|c| c.key.clone());
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(org_cfg));
             let repo_ref = RepoRef { org: OrgName::from(org.as_str()), name: RepoName::from(name.as_str()) };
 
             let mut succeeded: Vec<String> = Vec::new();
@@ -1318,6 +1311,10 @@ impl ReposHub {
                         break;
                     }
                 };
+                // MFORGE-5: per-provider credential dispatch.
+                let token_ref = crate::v5::ops::repo::token_ref_for_provider(org_cfg, provider)
+                    .map(|s| s.to_string());
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(provider));
                 if dry {
                     let names: Vec<String> = to_apply
                         .keys()
@@ -1328,7 +1325,6 @@ impl ReposHub {
                     continue;
                 }
                 // V5LIFECYCLE-4: write via ops::repo helper.
-                let _ = provider; // logging placeholder; provider is re-derived inside the helper
                 match crate::v5::ops::repo::write_metadata_on_forge(
                     r, &repo_ref, &to_apply, &loaded.global.provider_map, &resolver, token_ref.as_deref(), fallback_token_ref.clone(),
                 ).await {
@@ -1417,8 +1413,6 @@ impl ReposHub {
             }
             // Privatize on every remote.
             let resolver = YamlSecretStore::new(&config_dir);
-            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let mut privatized: std::collections::BTreeSet<ProviderKind> = std::collections::BTreeSet::new();
             // V5PARITY-34: only privatize forges in scope.
             let scoped = crate::v5::ops::repo::filter_remotes_by_forges(repo, &loaded.global.provider_map);
@@ -1427,6 +1421,9 @@ impl ReposHub {
                     Ok(p) => p,
                     Err(e) => { yield validation_event(e); continue; }
                 };
+                // MFORGE-5: per-provider credential dispatch.
+                let token_ref = crate::v5::ops::repo::token_ref_for_provider(existing, provider);
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(provider));
                 let provider_s = match provider {
                     ProviderKind::Github => "github".to_string(),
                     ProviderKind::Codeberg => "codeberg".to_string(),
@@ -1525,14 +1522,15 @@ impl ReposHub {
             // Forge-delete every remote.
             // V5PARITY-34: only forges in scope; purge respects per-repo policy.
             let resolver = YamlSecretStore::new(&config_dir);
-            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
             let scoped_remotes = crate::v5::ops::repo::filter_remotes_by_forges(repo, &loaded.global.provider_map);
             for r in scoped_remotes {
                 let provider = match crate::v5::ops::repo::derive_provider(r, &loaded.global.provider_map) {
                     Ok(p) => p,
                     Err(e) => { yield validation_event(e); continue; }
                 };
+                // MFORGE-5: per-provider credential dispatch.
+                let token_ref = crate::v5::ops::repo::token_ref_for_provider(existing, provider);
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(provider));
                 let provider_s = match provider {
                     ProviderKind::Github => "github".to_string(),
                     ProviderKind::Codeberg => "codeberg".to_string(),
@@ -1738,61 +1736,90 @@ impl ReposHub {
                 yield not_found_event(format!("org '{org}' not found"));
                 return;
             };
-            // Pick the provider: explicit --forge wins; otherwise the org's declared forge.provider.
-            let provider = if let Some(f) = forge.as_deref().filter(|s| !s.is_empty()) {
+            // MFORGE-6: Build the list of providers to import from.
+            // --forge specified → single provider; omitted → all providers on the org.
+            let providers: Vec<ProviderKind> = if let Some(f) = forge.as_deref().filter(|s| !s.is_empty()) {
                 match f {
-                    "github" => ProviderKind::Github,
-                    "codeberg" => ProviderKind::Codeberg,
-                    "gitlab" => ProviderKind::Gitlab,
+                    "github" => vec![ProviderKind::Github],
+                    "codeberg" => vec![ProviderKind::Codeberg],
+                    "gitlab" => vec![ProviderKind::Gitlab],
                     other => { yield validation_event(format!("unknown provider: {other}")); return; }
                 }
             } else {
-                org_cfg.primary_provider().unwrap_or(ProviderKind::Github)
+                // Multi-forge: iterate all configured providers.
+                org_cfg.providers().collect()
             };
+            if providers.is_empty() {
+                yield validation_event("org has no configured forge providers");
+                return;
+            }
             let resolver = YamlSecretStore::new(&config_dir);
-            let token_ref = crate::v5::ops::repo::token_ref_for(org_cfg);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(org_cfg));
-            let remote_repos = match crate::v5::ops::repo::list_on_forge(
-                provider, &OrgName::from(org.as_str()), &resolver, token_ref, fallback_token_ref.clone(),
-            ).await {
-                Ok(v) => v,
-                Err(e) => {
-                    yield RepoEvent::Error {
-                        code: Some(e.class.as_str().into()),
-                        error_class: Some(e.class.as_str().into()),
-                        message: e.message,
-                    };
-                    return;
-                }
-            };
-            let total = u32::try_from(remote_repos.len()).unwrap_or(u32::MAX);
+            let org_name = OrgName::from(org.as_str());
+            let mut updated = org_cfg.clone();
+            let mut total: u32 = 0;
             let mut added: u32 = 0;
             let mut skipped: u32 = 0;
-            // Clone the org for mutation.
-            let mut updated = org_cfg.clone();
-            for rr in &remote_repos {
-                // Skip if already registered.
-                let already = updated.repos.iter().any(|r| r.name.as_str() == rr.name);
-                if already { skipped += 1; continue; }
-                // Append.
-                let new_repo = crate::v5::config::OrgRepo {
-                    name: RepoName::from(rr.name.as_str()),
-                    remotes: vec![crate::v5::config::Remote {
+
+            for provider in &providers {
+                // MFORGE-6: per-provider credential resolution.
+                let token_ref = crate::v5::ops::repo::token_ref_for_provider(org_cfg, *provider);
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(*provider));
+                let remote_repos = match crate::v5::ops::repo::list_on_forge(
+                    *provider, &org_name, &resolver, token_ref, fallback_token_ref,
+                ).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        yield RepoEvent::Error {
+                            code: Some(e.class.as_str().into()),
+                            error_class: Some(e.class.as_str().into()),
+                            message: format!("{:?}: {}", provider, e.message),
+                        };
+                        // Continue to next provider rather than aborting entirely.
+                        continue;
+                    }
+                };
+                total = total.saturating_add(u32::try_from(remote_repos.len()).unwrap_or(u32::MAX));
+                for rr in &remote_repos {
+                    let new_remote = crate::v5::config::Remote {
                         url: crate::v5::config::RemoteUrl::from(rr.url.as_str()),
-                        provider: None,
-                    }],
-                    forges: None,
-                    metadata: None,
-                };
-                updated.repos.push(new_repo);
-                added += 1;
-                yield RepoEvent::RepoImported {
-                    reference: RepoRefWire {
-                        org: org.clone(),
-                        name: rr.name.clone(),
-                    },
-                    url: rr.url.clone(),
-                };
+                        provider: Some(*provider),
+                    };
+                    // Check if repo already exists in the updated set.
+                    if let Some(existing) = updated.repos.iter_mut().find(|r| r.name.as_str() == rr.name) {
+                        // MFORGE-6 dedup: repo exists — add new remote if URL not already present.
+                        let url_present = existing.remotes.iter().any(|rem| rem.url.as_str() == rr.url.as_str());
+                        if url_present {
+                            skipped += 1;
+                        } else {
+                            existing.remotes.push(new_remote);
+                            added += 1;
+                            yield RepoEvent::RepoImported {
+                                reference: RepoRefWire {
+                                    org: org.clone(),
+                                    name: rr.name.clone(),
+                                },
+                                url: rr.url.clone(),
+                            };
+                        }
+                    } else {
+                        // Brand new repo — create entry with this forge's remote.
+                        let new_repo = crate::v5::config::OrgRepo {
+                            name: RepoName::from(rr.name.as_str()),
+                            remotes: vec![new_remote],
+                            forges: None,
+                            metadata: None,
+                        };
+                        updated.repos.push(new_repo);
+                        added += 1;
+                        yield RepoEvent::RepoImported {
+                            reference: RepoRefWire {
+                                org: org.clone(),
+                                name: rr.name.clone(),
+                            },
+                            url: rr.url.clone(),
+                        };
+                    }
+                }
             }
             if !dry && added > 0 {
                 let orgs_dir = config_dir.join("orgs");
@@ -1856,11 +1883,11 @@ impl ReposHub {
             };
             let dest_path = std::path::PathBuf::from(&dest);
             let url = first.url.as_str();
-            // V5PARITY-5: per-org SSH key routing. If the org has a
-            // `ssh_key` credential, forward it as GIT_SSH_COMMAND for
-            // the clone subprocess, then persist it via `core.sshCommand`
-            // in the newly-cloned repo so later fetch/pull/push reuse it.
-            let key_path = ssh_key_for_org(org_cfg);
+            // MFORGE-5: per-provider SSH key routing. Derive provider
+            // from the canonical remote and look up that provider's SSH
+            // credential instead of the org-wide primary.
+            let clone_provider = crate::v5::ops::repo::derive_provider(first, &loaded.global.provider_map).ok();
+            let key_path = clone_provider.and_then(|pk| ssh_key_for_provider(org_cfg, pk));
             let ssh_cmd = key_path.as_ref().map(|p| crate::v5::ops::git::format_ssh_command(p));
             let env: Vec<(&str, &str)> = match ssh_cmd.as_deref() {
                 Some(s) => vec![("GIT_SSH_COMMAND", s)],
@@ -2147,8 +2174,13 @@ impl ReposHub {
                 return;
             };
             let resolver = YamlSecretStore::new(&config_dir);
-            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
+            // MFORGE-5: per-provider credential dispatch.
+            let rename_provider = match crate::v5::ops::repo::derive_provider(first, &loaded.global.provider_map) {
+                Ok(p) => p,
+                Err(e) => { yield validation_event(e); return; }
+            };
+            let token_ref = crate::v5::ops::repo::token_ref_for_provider(existing, rename_provider);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(rename_provider));
             let repo_ref = RepoRef {
                 org: OrgName::from(org.as_str()),
                 name: RepoName::from(name.as_str()),
@@ -2255,8 +2287,13 @@ impl ReposHub {
                 return;
             };
             let resolver = YamlSecretStore::new(&config_dir);
-            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
+            // MFORGE-5: per-provider credential dispatch.
+            let sdb_provider = match crate::v5::ops::repo::derive_provider(first, &loaded.global.provider_map) {
+                Ok(p) => p,
+                Err(e) => { yield validation_event(e); return; }
+            };
+            let token_ref = crate::v5::ops::repo::token_ref_for_provider(existing, sdb_provider);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(sdb_provider));
             let repo_ref = RepoRef {
                 org: OrgName::from(org.as_str()),
                 name: RepoName::from(name.as_str()),
@@ -2331,8 +2368,13 @@ impl ReposHub {
                 return;
             };
             let resolver = YamlSecretStore::new(&config_dir);
-            let token_ref = crate::v5::ops::repo::token_ref_for(existing);
-            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(existing));
+            // MFORGE-5: per-provider credential dispatch.
+            let sa_provider = match crate::v5::ops::repo::derive_provider(first, &loaded.global.provider_map) {
+                Ok(p) => p,
+                Err(e) => { yield validation_event(e); return; }
+            };
+            let token_ref = crate::v5::ops::repo::token_ref_for_provider(existing, sa_provider);
+            let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(sa_provider));
             let repo_ref = RepoRef {
                 org: OrgName::from(org.as_str()),
                 name: RepoName::from(name.as_str()),
@@ -2961,12 +3003,11 @@ fn collect_all_remotes(dir: &std::path::Path) -> Result<Vec<crate::v5::config::R
     if out.is_empty() { Err(()) } else { Ok(out) }
 }
 
-/// Resolve the SSH private-key path for an org. Returns the path on
-/// the first `CredentialEntry { cred_type: SshKey }`. Consulted from
-/// `repos.clone` (V5PARITY-5) and from `repos.set_ssh_key`.
-fn ssh_key_for_org(org: &OrgConfig) -> Option<PathBuf> {
-    let pk = org.primary_provider()?;
-    org.credentials_for(pk).iter()
+/// MFORGE-5: resolve the SSH private-key path for a specific provider
+/// within an org. Returns the path on the first
+/// `CredentialEntry { cred_type: SshKey }` for that provider.
+fn ssh_key_for_provider(org: &OrgConfig, provider: ProviderKind) -> Option<PathBuf> {
+    org.credentials_for(provider).iter()
         .find(|c| matches!(c.cred_type, CredentialType::SshKey))
         .map(|c| expand_tilde(&c.key))
 }

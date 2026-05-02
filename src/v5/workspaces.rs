@@ -1436,15 +1436,11 @@ impl WorkspacesHub {
                         continue;
                     }
                 };
-                let pk = org_cfg.primary_provider().unwrap_or(crate::v5::config::ProviderKind::Github);
-                let token_ref = org_cfg
-                    .credentials_for(pk)
-                    .iter()
-                    .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::Token))
-                    .map(|c| c.key.clone());
+                // MFORGE-5: per-provider credential dispatch.
+                let token_ref = crate::v5::ops::repo::token_ref_for_provider(org_cfg, provider)
+                    .map(|s| s.to_string());
                 let token_ref_str = token_ref.as_deref();
-                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for(org_cfg));
-                let _ = provider; // provider derivation happens inside ops::repo::*
+                let fallback_token_ref = Some(crate::v5::ops::repo::default_token_ref_for_provider(provider));
                 let repo_ref = crate::v5::config::RepoRef {
                     org: crate::v5::config::OrgName::from(org_s.as_str()),
                     name: crate::v5::config::RepoName::from(name_s.as_str()),
@@ -2190,15 +2186,21 @@ impl WorkspacesHub {
             let total = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
             let mut ok = 0u32;
             let mut errored = 0u32;
-            // Resolve org's SSH key for clone forwarding (V5PARITY-5).
-            let key_path = ssh_key_path_for_org(org_cfg);
-            let ssh_cmd = key_path.as_ref().map(|p| crate::v5::ops::git::format_ssh_command(p));
             for repo in &candidates {
                 let wire = crate::v5::repos::RepoRefWire {
                     org: org.clone(),
                     name: repo.name.as_str().to_string(),
                 };
                 let dir = ws_path.join(repo.name.as_str());
+                // MFORGE-5: per-provider SSH key routing. Derive the
+                // provider from the repo's canonical remote so each
+                // clone uses the correct SSH credential.
+                let canon = repo.canonical_remote();
+                let clone_provider = canon.and_then(|r|
+                    crate::v5::repos::derive_provider(r, &loaded.global.provider_map).ok()
+                );
+                let key_path = clone_provider.and_then(|pk| ssh_key_path_for_provider(org_cfg, pk));
+                let ssh_cmd = key_path.as_ref().map(|p| crate::v5::ops::git::format_ssh_command(p));
                 let result: Result<(), String> = (|| {
                     if dir.exists() {
                         if !do_update { return Ok(()); }
@@ -2796,11 +2798,13 @@ async fn apply_set_forges(
     Ok((target_str, changed, local_path))
 }
 
-/// V5PARITY-22 helper: resolve the org's SSH private key path. Mirrors
-/// `repos.rs::ssh_key_for_org` (different module visibility, same shape).
-fn ssh_key_path_for_org(org: &crate::v5::config::OrgConfig) -> Option<std::path::PathBuf> {
-    let pk = org.primary_provider()?;
-    org.credentials_for(pk).iter()
+/// MFORGE-5: resolve the SSH private key path for a specific provider
+/// within an org. Mirrors `repos.rs::ssh_key_for_provider`.
+fn ssh_key_path_for_provider(
+    org: &crate::v5::config::OrgConfig,
+    provider: crate::v5::config::ProviderKind,
+) -> Option<std::path::PathBuf> {
+    org.credentials_for(provider).iter()
         .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::SshKey))
         .map(|c| {
             let raw = c.key.as_str();
