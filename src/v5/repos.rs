@@ -1285,9 +1285,9 @@ impl ReposHub {
                 scoped
             };
             let resolver = YamlSecretStore::new(&dir);
+            let pk = org_cfg.primary_provider().unwrap_or(ProviderKind::Github);
             let token_ref = org_cfg
-                .forge
-                .credentials
+                .credentials_for(pk)
                 .iter()
                 .find(|c| matches!(c.cred_type, CredentialType::Token))
                 .map(|c| c.key.clone());
@@ -1747,7 +1747,7 @@ impl ReposHub {
                     other => { yield validation_event(format!("unknown provider: {other}")); return; }
                 }
             } else {
-                org_cfg.forge.provider
+                org_cfg.primary_provider().unwrap_or(ProviderKind::Github)
             };
             let resolver = YamlSecretStore::new(&config_dir);
             let token_ref = crate::v5::ops::repo::token_ref_for(org_cfg);
@@ -2501,8 +2501,9 @@ impl ReposHub {
                     };
                     if let Some(existing) = loaded.orgs.get(&OrgName::from(org_name)) {
                         let mut updated = existing.clone();
-                        updated.forge.credentials.retain(|c| !matches!(c.cred_type, CredentialType::SshKey));
-                        updated.forge.credentials.push(crate::v5::config::CredentialEntry {
+                        let creds = updated.primary_credentials_mut();
+                        creds.retain(|c| !matches!(c.cred_type, CredentialType::SshKey));
+                        creds.push(crate::v5::config::CredentialEntry {
                             key: key_path.display().to_string(),
                             cred_type: CredentialType::SshKey,
                         });
@@ -2964,7 +2965,8 @@ fn collect_all_remotes(dir: &std::path::Path) -> Result<Vec<crate::v5::config::R
 /// the first `CredentialEntry { cred_type: SshKey }`. Consulted from
 /// `repos.clone` (V5PARITY-5) and from `repos.set_ssh_key`.
 fn ssh_key_for_org(org: &OrgConfig) -> Option<PathBuf> {
-    org.forge.credentials.iter()
+    let pk = org.primary_provider()?;
+    org.credentials_for(pk).iter()
         .find(|c| matches!(c.cred_type, CredentialType::SshKey))
         .map(|c| expand_tilde(&c.key))
 }

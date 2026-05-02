@@ -238,11 +238,9 @@ impl HyperforgeHub {
         }
     }
 
-    /// V5PARITY-7: probe whether each org's credentials actually work.
-    /// For tokens: resolves the secret, calls
-    /// `adapter.repo_exists("__nonexistent__")` against the configured
-    /// provider — auth-protected endpoint, so a non-`auth` error means
-    /// the cred is fine.
+    /// V5PARITY-7 / MFORGE-7: probe whether each org's credentials
+    /// actually work. Iterates all providers in `org_cfg.forges`, probing
+    /// each provider's token credentials against that provider's endpoint.
     #[plexus_macros::method(params(
         org = "Optional org filter; default = all configured orgs"
     ))]
@@ -271,54 +269,53 @@ impl HyperforgeHub {
                 if let Some(filter) = org.as_deref() {
                     if filter != org_name.as_str() { continue; }
                 }
-                let provider = org_cfg.forge.provider;
-                let provider_str = match provider {
-                    crate::v5::config::ProviderKind::Github => "github",
-                    crate::v5::config::ProviderKind::Codeberg => "codeberg",
-                    crate::v5::config::ProviderKind::Gitlab => "gitlab",
-                };
-                for cred in &org_cfg.forge.credentials {
-                    if !matches!(cred.cred_type, crate::v5::config::CredentialType::Token) { continue; }
-                    let probe_url = match provider {
-                        crate::v5::config::ProviderKind::Github => "https://github.com/__probe__/__probe__.git",
-                        crate::v5::config::ProviderKind::Codeberg => "https://codeberg.org/__probe__/__probe__.git",
-                        crate::v5::config::ProviderKind::Gitlab => "https://gitlab.com/__probe__/__probe__.git",
-                    };
-                    let probe_remote = crate::v5::config::Remote {
-                        url: crate::v5::config::RemoteUrl::from(probe_url),
-                        provider: Some(provider),
-                    };
-                    let result = crate::v5::ops::repo::exists_on_forge(
-                        &probe_remote,
-                        &probe_repo_ref,
-                        &loaded.global.provider_map,
-                        &resolver,
-                        Some(cred.key.as_str()),
-                        Some(crate::v5::ops::repo::default_token_ref_for(org_cfg)),
-                    ).await;
-                    let (valid, msg) = match result {
-                        Ok(_) => (true, None),
-                        Err(e) if matches!(e.class, crate::v5::adapters::ForgeErrorClass::Auth) => {
-                            (false, Some(e.message))
-                        }
-                        // not_found / network / rate_limited / etc — credential
-                        // worked enough to reach the API; mark valid.
-                        Err(_) => (true, None),
-                    };
-                    yield HyperforgeV5Event::AuthCheckResult {
-                        org: org_name.as_str().to_string(),
-                        key: cred.key.clone(),
-                        provider: provider_str.to_string(),
-                        valid,
-                        message: msg,
-                    };
+                // MFORGE-7: iterate ALL forges, not just the primary.
+                for (&provider, block) in &org_cfg.forges {
+                    let pstr = provider_kind_str(provider);
+                    for cred in &block.credentials {
+                        if !matches!(cred.cred_type, crate::v5::config::CredentialType::Token) { continue; }
+                        let probe_url = match provider {
+                            crate::v5::config::ProviderKind::Github => "https://github.com/__probe__/__probe__.git",
+                            crate::v5::config::ProviderKind::Codeberg => "https://codeberg.org/__probe__/__probe__.git",
+                            crate::v5::config::ProviderKind::Gitlab => "https://gitlab.com/__probe__/__probe__.git",
+                        };
+                        let probe_remote = crate::v5::config::Remote {
+                            url: crate::v5::config::RemoteUrl::from(probe_url),
+                            provider: Some(provider),
+                        };
+                        let fallback_ref = crate::v5::ops::repo::default_token_ref_for_provider(provider);
+                        let result = crate::v5::ops::repo::exists_on_forge(
+                            &probe_remote,
+                            &probe_repo_ref,
+                            &loaded.global.provider_map,
+                            &resolver,
+                            Some(cred.key.as_str()),
+                            Some(fallback_ref),
+                        ).await;
+                        let (valid, msg) = match result {
+                            Ok(_) => (true, None),
+                            Err(e) if matches!(e.class, crate::v5::adapters::ForgeErrorClass::Auth) => {
+                                (false, Some(e.message))
+                            }
+                            // not_found / network / rate_limited / etc — credential
+                            // worked enough to reach the API; mark valid.
+                            Err(_) => (true, None),
+                        };
+                        yield HyperforgeV5Event::AuthCheckResult {
+                            org: org_name.as_str().to_string(),
+                            key: cred.key.clone(),
+                            provider: pstr.to_string(),
+                            valid,
+                            message: msg,
+                        };
+                    }
                 }
             }
         }
     }
 
-    /// V5PARITY-7: report which credentials each org needs.
-    /// One `auth_requirement` event per (org, provider, expected key).
+    /// V5PARITY-7 / MFORGE-7: report which credentials each org needs.
+    /// One `auth_requirement` event per forge per credential type.
     #[plexus_macros::method(params(
         org = "Optional org filter; default = all configured orgs"
     ))]
@@ -343,30 +340,29 @@ impl HyperforgeHub {
                 if let Some(filter) = org.as_deref() {
                     if filter != org_name.as_str() { continue; }
                 }
-                let provider_str = match org_cfg.forge.provider {
-                    crate::v5::config::ProviderKind::Github => "github",
-                    crate::v5::config::ProviderKind::Codeberg => "codeberg",
-                    crate::v5::config::ProviderKind::Gitlab => "gitlab",
-                };
-                for cred in &org_cfg.forge.credentials {
-                    let cred_type = match cred.cred_type {
-                        crate::v5::config::CredentialType::Token => "token",
-                        crate::v5::config::CredentialType::SshKey => "ssh_key",
-                    };
-                    // present == Some(true/false) when the ref is
-                    // resolvable; None when we couldn't even check.
-                    let present = if let Ok(parsed) = SecretRef::parse(&cred.key) {
-                        Some(matches!(resolver.resolve(&parsed), Ok(v) if !v.is_empty()))
-                    } else {
-                        None
-                    };
-                    yield HyperforgeV5Event::AuthRequirement {
-                        org: org_name.as_str().to_string(),
-                        provider: provider_str.to_string(),
-                        key: cred.key.clone(),
-                        cred_type: cred_type.to_string(),
-                        present,
-                    };
+                // MFORGE-7: iterate ALL forges, not just the primary.
+                for (&provider, block) in &org_cfg.forges {
+                    let pstr = provider_kind_str(provider);
+                    for cred in &block.credentials {
+                        let cred_type = match cred.cred_type {
+                            crate::v5::config::CredentialType::Token => "token",
+                            crate::v5::config::CredentialType::SshKey => "ssh_key",
+                        };
+                        // present == Some(true/false) when the ref is
+                        // resolvable; None when we couldn't even check.
+                        let present = if let Ok(parsed) = SecretRef::parse(&cred.key) {
+                            Some(matches!(resolver.resolve(&parsed), Ok(v) if !v.is_empty()))
+                        } else {
+                            None
+                        };
+                        yield HyperforgeV5Event::AuthRequirement {
+                            org: org_name.as_str().to_string(),
+                            provider: pstr.to_string(),
+                            key: cred.key.clone(),
+                            cred_type: cred_type.to_string(),
+                            present,
+                        };
+                    }
                 }
             }
         }
@@ -434,22 +430,22 @@ impl HyperforgeHub {
     }
 
     /// Set an SSH-key credential on an org's forge block.
-    /// Convenience wrapper over `orgs.set_credential` with SSH-specific
-    /// shape; the underlying storage is identical.
+    /// MFORGE-7: `forge` is optional. If omitted and the org has exactly
+    /// one forge, that forge is used. Multi-forge without `--forge` errors.
     #[plexus_macros::method(params(
         org = "Org name",
-        forge = "Provider name (github | codeberg | gitlab)",
+        forge = "Optional provider name (github | codeberg | gitlab); auto-resolved for single-forge orgs",
         key = "Filesystem path to the SSH private key (~ expanded)"
     ))]
     pub async fn config_set_ssh_key(
         &self,
         org: String,
-        forge: String,
+        forge: Option<String>,
         key: String,
     ) -> impl Stream<Item = HyperforgeV5Event> + Send + 'static {
         let config_dir = self.state.config_dir.clone();
         stream! {
-            if org.is_empty() || forge.is_empty() || key.is_empty() {
+            if org.is_empty() || key.is_empty() {
                 yield HyperforgeV5Event::Error {
                     code: Some("validation".into()),
                     message: "missing required parameter".into(),
@@ -479,11 +475,30 @@ impl HyperforgeHub {
                 };
                 return;
             };
+            // MFORGE-7: resolve target provider.
+            let target_provider = match resolve_forge_param(forge.as_deref(), existing) {
+                Ok(p) => p,
+                Err(msg) => {
+                    yield HyperforgeV5Event::Error {
+                        code: Some("validation".into()),
+                        message: msg,
+                    };
+                    return;
+                }
+            };
             let mut updated = existing.clone();
+            // Target the specific provider's credential list.
+            let Some(block) = updated.forges.get_mut(&target_provider) else {
+                yield HyperforgeV5Event::Error {
+                    code: Some("not_found".into()),
+                    message: format!("forge '{}' not configured on org '{org}'", provider_kind_str(target_provider)),
+                };
+                return;
+            };
             // Drop any existing ssh_key cred (one per forge convention),
             // then add a fresh one.
-            updated.forge.credentials.retain(|c| !matches!(c.cred_type, crate::v5::config::CredentialType::SshKey));
-            updated.forge.credentials.push(crate::v5::config::CredentialEntry {
+            block.credentials.retain(|c| !matches!(c.cred_type, crate::v5::config::CredentialType::SshKey));
+            block.credentials.push(crate::v5::config::CredentialEntry {
                 key: expanded.clone(),
                 cred_type: crate::v5::config::CredentialType::SshKey,
             });
@@ -495,14 +510,20 @@ impl HyperforgeHub {
                 };
                 return;
             }
-            yield HyperforgeV5Event::SshKeySet { org, forge, path: expanded };
+            yield HyperforgeV5Event::SshKeySet {
+                org,
+                forge: provider_kind_str(target_provider).to_string(),
+                path: expanded,
+            };
         }
     }
 
     /// Read SSH key path(s) configured on an org. Never reveals file CONTENT.
+    /// MFORGE-7: without `--forge`, emits one `SshKeyShow` per configured
+    /// forge. With `--forge`, filters to that single provider.
     #[plexus_macros::method(params(
         org = "Org name",
-        forge = "Optional forge filter"
+        forge = "Optional forge filter (github | codeberg | gitlab)"
     ))]
     pub async fn config_show_ssh_key(
         &self,
@@ -527,31 +548,21 @@ impl HyperforgeHub {
                 };
                 return;
             };
-            let provider_str = match existing.forge.provider {
-                crate::v5::config::ProviderKind::Github => "github",
-                crate::v5::config::ProviderKind::Codeberg => "codeberg",
-                crate::v5::config::ProviderKind::Gitlab => "gitlab",
-            };
-            // Apply optional --forge filter (we only have one forge per org for now,
-            // but the parameter is here for v4-shape compatibility).
-            if let Some(f) = forge.as_deref() {
-                if f != provider_str {
-                    yield HyperforgeV5Event::SshKeyShow {
-                        org: org.clone(),
-                        forge: f.to_string(),
-                        path: None,
-                    };
-                    return;
+            // MFORGE-7: iterate all forges, applying optional filter.
+            for (&provider, block) in &existing.forges {
+                let pstr = provider_kind_str(provider);
+                if let Some(f) = forge.as_deref() {
+                    if f != pstr { continue; }
                 }
+                let path = block.credentials.iter()
+                    .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::SshKey))
+                    .map(|c| c.key.clone());
+                yield HyperforgeV5Event::SshKeyShow {
+                    org: org.clone(),
+                    forge: pstr.to_string(),
+                    path,
+                };
             }
-            let path = existing.forge.credentials.iter()
-                .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::SshKey))
-                .map(|c| c.key.clone());
-            yield HyperforgeV5Event::SshKeyShow {
-                org,
-                forge: provider_str.to_string(),
-                path,
-            };
         }
     }
 
@@ -682,6 +693,57 @@ impl HyperforgeHub {
                     scopes: status.scopes,
                     accessible_orgs,
                 };
+            }
+        }
+    }
+}
+
+/// MFORGE-7: canonical string for a `ProviderKind`.
+fn provider_kind_str(pk: crate::v5::config::ProviderKind) -> &'static str {
+    match pk {
+        crate::v5::config::ProviderKind::Github => "github",
+        crate::v5::config::ProviderKind::Codeberg => "codeberg",
+        crate::v5::config::ProviderKind::Gitlab => "gitlab",
+    }
+}
+
+/// MFORGE-7: resolve an optional `--forge` parameter against an org's
+/// configured forges. Single-forge orgs auto-resolve when `forge` is
+/// `None`. Multi-forge orgs require an explicit value.
+fn resolve_forge_param(
+    forge: Option<&str>,
+    org_cfg: &crate::v5::config::OrgConfig,
+) -> Result<crate::v5::config::ProviderKind, String> {
+    match forge {
+        Some(f) => {
+            let lower = f.to_lowercase();
+            let pk = match lower.as_str() {
+                "github" => crate::v5::config::ProviderKind::Github,
+                "codeberg" => crate::v5::config::ProviderKind::Codeberg,
+                "gitlab" => crate::v5::config::ProviderKind::Gitlab,
+                _ => return Err(format!("unknown provider '{f}'")),
+            };
+            if !org_cfg.forges.contains_key(&pk) {
+                return Err(format!(
+                    "forge '{}' not configured on org '{}'",
+                    provider_kind_str(pk),
+                    org_cfg.name.as_str()
+                ));
+            }
+            Ok(pk)
+        }
+        None => {
+            if org_cfg.forges.len() == 1 {
+                Ok(*org_cfg.forges.keys().next().unwrap())
+            } else if org_cfg.forges.is_empty() {
+                Err(format!("org '{}' has no forges configured", org_cfg.name.as_str()))
+            } else {
+                let names: Vec<&str> = org_cfg.forges.keys().map(|p| provider_kind_str(*p)).collect();
+                Err(format!(
+                    "org '{}' has multiple forges ({}); pass --forge to disambiguate",
+                    org_cfg.name.as_str(),
+                    names.join(", ")
+                ))
             }
         }
     }

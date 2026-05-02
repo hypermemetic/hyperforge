@@ -1436,9 +1436,9 @@ impl WorkspacesHub {
                         continue;
                     }
                 };
+                let pk = org_cfg.primary_provider().unwrap_or(crate::v5::config::ProviderKind::Github);
                 let token_ref = org_cfg
-                    .forge
-                    .credentials
+                    .credentials_for(pk)
                     .iter()
                     .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::Token))
                     .map(|c| c.key.clone());
@@ -2799,7 +2799,8 @@ async fn apply_set_forges(
 /// V5PARITY-22 helper: resolve the org's SSH private key path. Mirrors
 /// `repos.rs::ssh_key_for_org` (different module visibility, same shape).
 fn ssh_key_path_for_org(org: &crate::v5::config::OrgConfig) -> Option<std::path::PathBuf> {
-    org.forge.credentials.iter()
+    let pk = org.primary_provider()?;
+    org.credentials_for(pk).iter()
         .find(|c| matches!(c.cred_type, crate::v5::config::CredentialType::SshKey))
         .map(|c| {
             let raw = c.key.as_str();

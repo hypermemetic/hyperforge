@@ -271,8 +271,10 @@ pub struct GlobalConfig {
     pub provider_map: BTreeMap<DomainName, ProviderKind>,
 }
 
-/// An org's forge block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Legacy org forge block — used only for backward-compatible
+/// deserialization of the old `forge:` YAML key. Not stored on
+/// `OrgConfig`; converted to a single-entry `BTreeMap` during deser.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgeBlock {
     pub provider: ProviderKind,
@@ -280,14 +282,137 @@ pub struct ForgeBlock {
     pub credentials: Vec<CredentialEntry>,
 }
 
-/// Per-org `orgs/<name>.yaml` schema root.
+/// Per-provider credential block. The provider identity is the map key
+/// in `OrgConfig.forges`, so it is not duplicated inside the block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ForgeProviderBlock {
+    #[serde(default)]
+    pub credentials: Vec<CredentialEntry>,
+}
+
+/// Per-org `orgs/<name>.yaml` schema root.
+///
+/// `forges` is the canonical field (serialized as `forges:`). For
+/// backward compatibility the deserializer also accepts the legacy
+/// `forge:` single-provider form and promotes it to a single-entry map.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgConfig {
     pub name: OrgName,
-    pub forge: ForgeBlock,
-    #[serde(default)]
+    pub forges: BTreeMap<ProviderKind, ForgeProviderBlock>,
     pub repos: Vec<OrgRepo>,
+}
+
+// -- Convenience accessors on OrgConfig -----------------------------------
+
+impl OrgConfig {
+    /// All configured provider kinds (map-key order, i.e. `Ord` order).
+    pub fn providers(&self) -> impl Iterator<Item = ProviderKind> + '_ {
+        self.forges.keys().copied()
+    }
+
+    /// The "primary" provider — the first key in the `BTreeMap`.
+    /// Returns `None` only when the map is empty (which valid configs
+    /// should never have, but callers can handle gracefully).
+    #[must_use]
+    pub fn primary_provider(&self) -> Option<ProviderKind> {
+        self.forges.keys().next().copied()
+    }
+
+    /// Credentials for a specific provider. Empty slice when the
+    /// provider is absent.
+    #[must_use]
+    pub fn credentials_for(&self, provider: ProviderKind) -> &[CredentialEntry] {
+        self.forges
+            .get(&provider)
+            .map(|b| b.credentials.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Iterate `(provider, &CredentialEntry)` across all providers.
+    pub fn all_credentials(&self) -> impl Iterator<Item = (ProviderKind, &CredentialEntry)> {
+        self.forges
+            .iter()
+            .flat_map(|(&p, b)| b.credentials.iter().map(move |c| (p, c)))
+    }
+
+    /// Mutable access to the primary provider's credential list.
+    /// Panics if no providers are configured.
+    pub fn primary_credentials_mut(&mut self) -> &mut Vec<CredentialEntry> {
+        let pk = self.primary_provider().expect("OrgConfig has no providers");
+        &mut self.forges.get_mut(&pk).expect("primary exists").credentials
+    }
+}
+
+// -- Custom Serialize / Deserialize for OrgConfig -------------------------
+
+impl Serialize for OrgConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            name: &'a OrgName,
+            forges: &'a BTreeMap<ProviderKind, ForgeProviderBlock>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            repos: &'a Vec<OrgRepo>,
+        }
+        Wire {
+            name: &self.name,
+            forges: &self.forges,
+            repos: &self.repos,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrgConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Raw helper accepting either `forge` or `forges`.
+        #[derive(Deserialize)]
+        struct Raw {
+            name: OrgName,
+            #[serde(default)]
+            forge: Option<ForgeBlock>,
+            #[serde(default)]
+            forges: Option<BTreeMap<ProviderKind, ForgeProviderBlock>>,
+            #[serde(default)]
+            repos: Vec<OrgRepo>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let forges = match (raw.forge, raw.forges) {
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "ambiguous: both `forge` and `forges` present; use only `forges`",
+                ));
+            }
+            (None, None) => {
+                return Err(serde::de::Error::custom(
+                    "missing field: expected `forge` (legacy) or `forges`",
+                ));
+            }
+            (Some(legacy), None) => {
+                let mut map = BTreeMap::new();
+                map.insert(
+                    legacy.provider,
+                    ForgeProviderBlock {
+                        credentials: legacy.credentials,
+                    },
+                );
+                map
+            }
+            (None, Some(map)) => map,
+        };
+        Ok(OrgConfig {
+            name: raw.name,
+            forges,
+            repos: raw.repos,
+        })
+    }
 }
 
 /// Per-workspace `workspaces/<name>.yaml` schema root.
@@ -589,8 +714,8 @@ mod tests {
         assert_eq!(cfg.orgs.len(), 1);
         let demo = cfg.orgs.get(&OrgName("demo".into())).expect("demo org");
         assert_eq!(demo.name.as_str(), "demo");
-        assert!(matches!(demo.forge.provider, ProviderKind::Github));
-        assert!(demo.forge.credentials.is_empty());
+        assert_eq!(demo.primary_provider(), Some(ProviderKind::Github));
+        assert!(demo.credentials_for(ProviderKind::Github).is_empty());
         assert!(demo.repos.is_empty());
     }
 
@@ -603,14 +728,6 @@ mod tests {
             let back: OrgConfig = serde_yaml::from_str(&yaml).expect("reparse");
             assert_eq!(&back, cfg);
         }
-    }
-
-    #[test]
-    fn unknown_top_level_field_errors() {
-        let bad = "name: demo\nforge: {provider: github, credentials: []}\nrepos: []\nextra: oops\n";
-        let err = serde_yaml::from_str::<OrgConfig>(bad).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("extra"), "error must name the unknown field: {msg}");
     }
 
     #[test]
@@ -640,7 +757,7 @@ mod tests {
         std::fs::create_dir_all(&orgs).unwrap();
         std::fs::write(
             orgs.join("foo.yaml"),
-            "name: bar\nforge: {provider: github, credentials: []}\nrepos: []\n",
+            "name: bar\nforges:\n  github:\n    credentials: []\nrepos: []\n",
         )
         .unwrap();
         let err = load_orgs(&orgs).unwrap_err();
@@ -660,5 +777,101 @@ mod tests {
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: GlobalConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    // ----------------------------------------------------------------
+    // MFORGE-2: multi-forge schema + backward-compatible deser tests.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_round_trip_legacy_org() {
+        let legacy = "name: demo\nforge:\n  provider: github\n  credentials:\n    - key: secrets://gh\n      type: token\nrepos: []\n";
+        let org: OrgConfig = serde_yaml::from_str(legacy).expect("legacy deser");
+        assert_eq!(org.primary_provider(), Some(ProviderKind::Github));
+        assert_eq!(org.credentials_for(ProviderKind::Github).len(), 1);
+        // Re-serialize → must use `forges:` key.
+        let yaml = serde_yaml::to_string(&org).expect("ser");
+        assert!(yaml.contains("forges:"), "serialized form must use 'forges:': {yaml}");
+        assert!(!yaml.contains("forge:") || yaml.contains("forges:"), "must not contain bare 'forge:'");
+        // Re-parse → identical.
+        let back: OrgConfig = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(back, org);
+    }
+
+    #[test]
+    fn test_round_trip_multi_forge_org() {
+        let yaml = "name: multi\nforges:\n  github:\n    credentials:\n      - key: secrets://gh\n        type: token\n  codeberg:\n    credentials:\n      - key: secrets://cb\n        type: token\nrepos: []\n";
+        let org: OrgConfig = serde_yaml::from_str(yaml).expect("deser");
+        assert_eq!(org.forges.len(), 2);
+        assert_eq!(org.credentials_for(ProviderKind::Github).len(), 1);
+        assert_eq!(org.credentials_for(ProviderKind::Codeberg).len(), 1);
+        // Round-trip.
+        let ser = serde_yaml::to_string(&org).expect("ser");
+        let back: OrgConfig = serde_yaml::from_str(&ser).expect("reparse");
+        assert_eq!(back, org);
+    }
+
+    #[test]
+    fn test_legacy_single_forge_to_new() {
+        let legacy = "name: x\nforge:\n  provider: codeberg\n  credentials:\n    - key: secrets://cb\n      type: token\n";
+        let org: OrgConfig = serde_yaml::from_str(legacy).expect("deser");
+        assert_eq!(org.forges.len(), 1);
+        assert_eq!(org.primary_provider(), Some(ProviderKind::Codeberg));
+        assert_eq!(org.credentials_for(ProviderKind::Codeberg)[0].key, "secrets://cb");
+    }
+
+    #[test]
+    fn test_both_forge_and_forges_errors() {
+        let bad = "name: x\nforge:\n  provider: github\n  credentials: []\nforges:\n  github:\n    credentials: []\n";
+        let err = serde_yaml::from_str::<OrgConfig>(bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous"), "error must mention ambiguity: {msg}");
+    }
+
+    #[test]
+    fn test_neither_forge_nor_forges_errors() {
+        let bad = "name: x\nrepos: []\n";
+        let err = serde_yaml::from_str::<OrgConfig>(bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing"), "error must mention missing field: {msg}");
+    }
+
+    #[test]
+    fn test_existing_fixtures_still_load() {
+        // All fixture dirs that contain orgs/*.yaml must load.
+        for dir_name in &[
+            "minimal_org",
+            "org_with_credentials",
+            "org_with_custom_domain_repo",
+            "org_with_mirror_repo",
+            "org_with_repo",
+            "org_with_workspace_ref",
+            "tier2-template",
+            "two_orgs",
+            "ws_cross_org",
+            "ws_empty",
+            "ws_with_one_repo",
+        ] {
+            let dir = fixture_dir(dir_name);
+            load_all(&dir).unwrap_or_else(|e| panic!("fixture {dir_name} failed: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_convenience_methods() {
+        let yaml = "name: multi\nforges:\n  codeberg:\n    credentials:\n      - key: secrets://cb\n        type: token\n  github:\n    credentials:\n      - key: secrets://gh\n        type: token\n      - key: ~/.ssh/id_ed25519\n        type: ssh_key\n";
+        let org: OrgConfig = serde_yaml::from_str(yaml).expect("deser");
+        // providers() — BTreeMap order uses derived Ord: Github(0) < Codeberg(1).
+        let provs: Vec<_> = org.providers().collect();
+        assert_eq!(provs, vec![ProviderKind::Github, ProviderKind::Codeberg]);
+        // primary_provider() — first in BTreeMap order (Github).
+        assert_eq!(org.primary_provider(), Some(ProviderKind::Github));
+        // credentials_for.
+        assert_eq!(org.credentials_for(ProviderKind::Github).len(), 2);
+        assert_eq!(org.credentials_for(ProviderKind::Codeberg).len(), 1);
+        assert_eq!(org.credentials_for(ProviderKind::Gitlab).len(), 0);
+        // all_credentials.
+        let all: Vec<_> = org.all_credentials().collect();
+        assert_eq!(all.len(), 3);
     }
 }

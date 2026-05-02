@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::v5::config::{
-    load_orgs, save_org, CredentialEntry, CredentialType, ForgeBlock, OrgConfig, OrgName,
+    load_orgs, save_org, CredentialEntry, CredentialType, ForgeProviderBlock, OrgConfig, OrgName,
     ProviderKind, RepoName,
 };
 
@@ -31,13 +31,19 @@ pub enum OrgsEvent {
     /// Org summary (§types). Emitted by `list`, `create`, `update`.
     OrgSummary {
         name: OrgName,
+        /// Deprecated — use `providers`. Kept for backward compat.
         provider: ProviderKind,
+        /// All configured providers for this org (MFORGE-4).
+        providers: Vec<ProviderKind>,
         repo_count: u32,
     },
     /// Org detail (§types). Emitted by `get`.
     OrgDetail {
         name: OrgName,
+        /// Deprecated — use `providers`. Kept for backward compat.
         provider: ProviderKind,
+        /// All configured providers for this org (MFORGE-4).
+        providers: Vec<ProviderKind>,
         credentials: Vec<CredentialEntry>,
         repos: Vec<RepoName>,
     },
@@ -49,6 +55,8 @@ pub enum OrgsEvent {
     /// assert on the discriminator alone.
     CredentialAdded {
         org: OrgName,
+        /// Which forge the credential was added to (MFORGE-4).
+        forge: ProviderKind,
         entry: CredentialEntry,
         dry_run: bool,
     },
@@ -56,6 +64,8 @@ pub enum OrgsEvent {
     /// org — the entry at that index is swapped in place.
     CredentialReplaced {
         org: OrgName,
+        /// Which forge the credential was replaced on (MFORGE-4).
+        forge: ProviderKind,
         entry: CredentialEntry,
         dry_run: bool,
     },
@@ -63,6 +73,8 @@ pub enum OrgsEvent {
     /// removed key. The secret store entry at that key is untouched.
     CredentialRemoved {
         org: OrgName,
+        /// Which forge the credential was removed from (MFORGE-4).
+        forge: ProviderKind,
         key: String,
         dry_run: bool,
     },
@@ -105,6 +117,51 @@ pub enum BootstrapStage {
     OrgCreate,
     Credential,
     Import,
+}
+
+// ---------------------------------------------------------------------
+// Helpers for building events with both `provider` and `providers`.
+// ---------------------------------------------------------------------
+
+/// Build an `OrgSummary` from an `OrgConfig`, populating both the
+/// deprecated `provider` field and the new `providers` list.
+fn org_summary(cfg: &OrgConfig) -> OrgsEvent {
+    let providers: Vec<ProviderKind> = cfg.providers().collect();
+    OrgsEvent::OrgSummary {
+        name: cfg.name.clone(),
+        provider: cfg.primary_provider().unwrap_or(ProviderKind::Github),
+        providers,
+        repo_count: u32::try_from(cfg.repos.len()).unwrap_or(u32::MAX),
+    }
+}
+
+/// Resolve which forge to target for a credential operation. If `forge`
+/// is explicitly provided, validates it exists on the org. If omitted
+/// and exactly one forge is configured, uses it. Otherwise errors.
+fn resolve_forge_target(
+    cfg: &OrgConfig,
+    forge: Option<ProviderKind>,
+) -> Result<ProviderKind, (String, String)> {
+    match forge {
+        Some(f) => {
+            if cfg.forges.contains_key(&f) {
+                Ok(f)
+            } else {
+                Err(("forge_not_found".into(), format!("org {:?} has no forge {f:?}", cfg.name.as_str())))
+            }
+        }
+        None => {
+            if cfg.forges.len() == 1 {
+                Ok(*cfg.forges.keys().next().unwrap())
+            } else {
+                Err(("ambiguous_forge".into(), format!(
+                    "org {:?} has {} forges; pass --forge to disambiguate",
+                    cfg.name.as_str(),
+                    cfg.forges.len()
+                )))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -159,11 +216,7 @@ impl OrgsHub {
                 Ok(map) => {
                     // BTreeMap iterates ascending by key → deterministic.
                     for (_name, cfg) in map {
-                        yield OrgsEvent::OrgSummary {
-                            name: cfg.name.clone(),
-                            provider: cfg.forge.provider,
-                            repo_count: u32::try_from(cfg.repos.len()).unwrap_or(u32::MAX),
-                        };
+                        yield org_summary(&cfg);
                     }
                 }
                 Err(e) => {
@@ -199,10 +252,12 @@ impl OrgsHub {
             }
             match read_org(&config_dir, &org) {
                 Ok(cfg) => {
+                    let providers: Vec<ProviderKind> = cfg.providers().collect();
                     yield OrgsEvent::OrgDetail {
                         name: cfg.name.clone(),
-                        provider: cfg.forge.provider,
-                        credentials: cfg.forge.credentials.clone(),
+                        provider: cfg.primary_provider().unwrap_or(ProviderKind::Github),
+                        providers,
+                        credentials: cfg.all_credentials().map(|(_, c)| c.clone()).collect(),
                         repos: cfg.repos.iter().map(|r| r.name.clone()).collect(),
                     };
                 }
@@ -268,9 +323,10 @@ impl OrgsHub {
             }
             let cfg = OrgConfig {
                 name: OrgName(name),
-                forge: ForgeBlock {
-                    provider,
-                    credentials: Vec::new(),
+                forges: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(provider, ForgeProviderBlock { credentials: Vec::new() });
+                    m
                 },
                 repos: Vec::new(),
             };
@@ -284,11 +340,7 @@ impl OrgsHub {
                     return;
                 }
             }
-            yield OrgsEvent::OrgSummary {
-                name: cfg.name,
-                provider: cfg.forge.provider,
-                repo_count: 0,
-            };
+            yield org_summary(&cfg);
         }
     }
 
@@ -344,16 +396,18 @@ impl OrgsHub {
         }
     }
 
-    /// `orgs.update` — patch the provider on an existing org. Every
-    /// other field (credentials, repos) is preserved byte-equivalent
-    /// through the V5CORE-3 load/save round-trip. Omitting every
+    /// `orgs.update` — patch the provider on an existing org. Supports
+    /// legacy single-provider migration (`--provider`) and multi-forge
+    /// add/remove (`--add_forge`, `--remove_forge`). Omitting every
     /// optional field is a typed no-op error, never a silent success.
-    /// (V5ORGS-6)
+    /// (V5ORGS-6, MFORGE-4)
     #[plexus_macros::method(
-        description = "Patch org provider without touching credentials or repos",
+        description = "Patch org forges without touching credentials or repos",
         params(
             org = "Org name",
-            provider = "New forge provider (optional)",
+            provider = "New forge provider — legacy single-forge migration (optional)",
+            add_forge = "Add a forge provider to this org (optional)",
+            remove_forge = "Remove a forge provider from this org (optional)",
             dry_run = "Preview without writing (default false)"
         )
     )]
@@ -361,6 +415,8 @@ impl OrgsHub {
         &self,
         org: Option<String>,
         provider: Option<ProviderKind>,
+        add_forge: Option<ProviderKind>,
+        remove_forge: Option<ProviderKind>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
         let this = self.clone();
@@ -376,7 +432,7 @@ impl OrgsHub {
                 yield OrgsEvent::Error { code: "invalid_name".into(), message: e };
                 return;
             }
-            if provider.is_none() {
+            if provider.is_none() && add_forge.is_none() && remove_forge.is_none() {
                 yield OrgsEvent::Error {
                     code: "no_op".into(),
                     message: "orgs.update requires at least one optional field to change".into(),
@@ -401,8 +457,37 @@ impl OrgsHub {
                     return;
                 }
             };
+            // Legacy single-provider migration: moves all credentials to the
+            // new provider, dropping the old key.
             if let Some(p) = provider {
-                cfg.forge.provider = p;
+                let old_pk = cfg.primary_provider();
+                let creds = old_pk
+                    .and_then(|k| cfg.forges.remove(&k))
+                    .map(|b| b.credentials)
+                    .unwrap_or_default();
+                cfg.forges.insert(p, ForgeProviderBlock { credentials: creds });
+            }
+            // MFORGE-4: add a forge with an empty credential block.
+            if let Some(af) = add_forge {
+                cfg.forges.entry(af).or_insert_with(|| ForgeProviderBlock { credentials: Vec::new() });
+            }
+            // MFORGE-4: remove a forge and all its credentials.
+            if let Some(rf) = remove_forge {
+                if !cfg.forges.contains_key(&rf) {
+                    yield OrgsEvent::Error {
+                        code: "forge_not_found".into(),
+                        message: format!("org {org:?} has no forge {rf:?}"),
+                    };
+                    return;
+                }
+                if cfg.forges.len() <= 1 {
+                    yield OrgsEvent::Error {
+                        code: "last_forge".into(),
+                        message: "cannot remove the last forge from an org".into(),
+                    };
+                    return;
+                }
+                cfg.forges.remove(&rf);
             }
             let is_dry = dry_run.unwrap_or(false);
             if !is_dry {
@@ -414,25 +499,23 @@ impl OrgsHub {
                     return;
                 }
             }
-            yield OrgsEvent::OrgSummary {
-                name: cfg.name,
-                provider: cfg.forge.provider,
-                repo_count: u32::try_from(cfg.repos.len()).unwrap_or(u32::MAX),
-            };
+            yield org_summary(&cfg);
         }
     }
 
     /// `orgs.set_credential` — add or replace one credential entry by
-    /// key. If no existing entry matches `key`, append; otherwise
-    /// replace in place preserving index. Keys MUST be `secrets://…`
+    /// key on a specific forge. If `--forge` is omitted and the org has
+    /// exactly one forge, that forge is used. If omitted with multiple
+    /// forges, returns `ambiguous_forge` error. Keys MUST be `secrets://…`
     /// refs or absolute filesystem paths — plaintext secrets are
-    /// rejected at the wire boundary. (V5ORGS-7)
+    /// rejected at the wire boundary. (V5ORGS-7, MFORGE-4)
     #[plexus_macros::method(
-        description = "Add or replace one credential entry by key",
+        description = "Add or replace one credential entry by key on a forge",
         params(
             org = "Org name",
             key = "Credential key (secrets:// ref or absolute path)",
             credential_type = "Credential kind (token, ssh_key)",
+            forge = "Target forge provider (optional — inferred if org has one forge)",
             dry_run = "Preview without writing (default false)"
         )
     )]
@@ -441,6 +524,7 @@ impl OrgsHub {
         org: Option<String>,
         key: Option<String>,
         credential_type: Option<CredentialType>,
+        forge: Option<ProviderKind>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
         let this = self.clone();
@@ -493,14 +577,24 @@ impl OrgsHub {
                 }
             };
 
+            // MFORGE-4: resolve which forge to target.
+            let target_forge = match resolve_forge_target(&cfg, forge) {
+                Ok(f) => f,
+                Err((code, message)) => {
+                    yield OrgsEvent::Error { code, message };
+                    return;
+                }
+            };
+
             let entry = CredentialEntry { key: key.clone(), cred_type };
+            let creds = &mut cfg.forges.get_mut(&target_forge).expect("resolve_forge_target validated").credentials;
             let replaced = if let Some(existing) =
-                cfg.forge.credentials.iter_mut().find(|c| c.key == key)
+                creds.iter_mut().find(|c| c.key == key)
             {
                 *existing = entry.clone();
                 true
             } else {
-                cfg.forge.credentials.push(entry.clone());
+                creds.push(entry.clone());
                 false
             };
 
@@ -515,22 +609,25 @@ impl OrgsHub {
                 }
             }
             yield if replaced {
-                OrgsEvent::CredentialReplaced { org: cfg.name, entry, dry_run: is_dry }
+                OrgsEvent::CredentialReplaced { org: cfg.name, forge: target_forge, entry, dry_run: is_dry }
             } else {
-                OrgsEvent::CredentialAdded { org: cfg.name, entry, dry_run: is_dry }
+                OrgsEvent::CredentialAdded { org: cfg.name, forge: target_forge, entry, dry_run: is_dry }
             };
         }
     }
 
     /// `orgs.remove_credential` — remove exactly the `CredentialEntry`
-    /// whose `key` equals the input. Order of remaining entries is
-    /// preserved. The secret store entry at the removed `key` is
-    /// untouched — that's a separate user action. (V5ORGS-8)
+    /// whose `key` equals the input from a specific forge. If `--forge`
+    /// is omitted and the org has exactly one forge, that forge is used.
+    /// If omitted with multiple forges, returns `ambiguous_forge` error.
+    /// The secret store entry at the removed `key` is untouched — that's
+    /// a separate user action. (V5ORGS-8, MFORGE-4)
     #[plexus_macros::method(
-        description = "Remove one credential entry by key",
+        description = "Remove one credential entry by key from a forge",
         params(
             org = "Org name",
             key = "Credential key to remove",
+            forge = "Target forge provider (optional — inferred if org has one forge)",
             dry_run = "Preview without writing (default false)"
         )
     )]
@@ -538,6 +635,7 @@ impl OrgsHub {
         &self,
         org: Option<String>,
         key: Option<String>,
+        forge: Option<ProviderKind>,
         dry_run: Option<bool>,
     ) -> impl Stream<Item = OrgsEvent> + Send + 'static {
         let this = self.clone();
@@ -578,12 +676,23 @@ impl OrgsHub {
                     return;
                 }
             };
-            let original_len = cfg.forge.credentials.len();
-            cfg.forge.credentials.retain(|c| c.key != key);
-            if cfg.forge.credentials.len() == original_len {
+
+            // MFORGE-4: resolve which forge to target.
+            let target_forge = match resolve_forge_target(&cfg, forge) {
+                Ok(f) => f,
+                Err((code, message)) => {
+                    yield OrgsEvent::Error { code, message };
+                    return;
+                }
+            };
+
+            let creds = &mut cfg.forges.get_mut(&target_forge).expect("resolve_forge_target validated").credentials;
+            let original_len = creds.len();
+            creds.retain(|c| c.key != key);
+            if creds.len() == original_len {
                 yield OrgsEvent::Error {
                     code: "key_not_found".into(),
-                    message: format!("credential key {key:?} not found on org {org:?}"),
+                    message: format!("credential key {key:?} not found on org {org:?} forge {target_forge:?}"),
                 };
                 return;
             }
@@ -599,6 +708,7 @@ impl OrgsHub {
             }
             yield OrgsEvent::CredentialRemoved {
                 org: cfg.name,
+                forge: target_forge,
                 key,
                 dry_run: is_dry,
             };
@@ -725,17 +835,22 @@ impl OrgsHub {
             };
             let mut cfg = existing.unwrap_or_else(|| crate::v5::config::OrgConfig {
                 name: org_name.clone(),
-                forge: crate::v5::config::ForgeBlock {
-                    provider,
-                    credentials: Vec::new(),
+                forges: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(provider, ForgeProviderBlock { credentials: Vec::new() });
+                    m
                 },
                 repos: Vec::new(),
             });
-            cfg.forge.provider = provider;
+            // Ensure the target provider exists (may migrate from a different one).
+            if !cfg.forges.contains_key(&provider) {
+                cfg.forges.insert(provider, ForgeProviderBlock { credentials: Vec::new() });
+            }
 
             // --- Stage: credential. Replace any existing token cred with the new ref. ---
-            cfg.forge.credentials.retain(|c| !matches!(c.cred_type, CredentialType::Token));
-            cfg.forge.credentials.push(CredentialEntry {
+            let creds = cfg.forges.get_mut(&provider).expect("just ensured");
+            creds.credentials.retain(|c| !matches!(c.cred_type, CredentialType::Token));
+            creds.credentials.push(CredentialEntry {
                 key: secret_path,
                 cred_type: CredentialType::Token,
             });
@@ -749,14 +864,11 @@ impl OrgsHub {
                     return;
                 }
             }
-            yield OrgsEvent::OrgSummary {
-                name: org_name.clone(),
-                provider,
-                repo_count: u32::try_from(cfg.repos.len()).unwrap_or(0),
-            };
+            yield org_summary(&cfg);
             yield OrgsEvent::CredentialAdded {
                 org: org_name.clone(),
-                entry: cfg.forge.credentials.last().expect("just pushed").clone(),
+                forge: provider,
+                entry: cfg.forges.get(&provider).expect("just ensured").credentials.last().expect("just pushed").clone(),
                 dry_run: dry,
             };
 

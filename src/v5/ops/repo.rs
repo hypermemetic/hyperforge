@@ -115,27 +115,60 @@ pub fn compute_drift(local: &Option<RepoMetadataLocal>, remote: &ForgeMetadata) 
 // Forge-call wrappers (V5LIFECYCLE-4).
 // ---------------------------------------------------------------------
 
-/// Token credential-ref lookup for an org (first cred of type Token,
-/// if any).
-pub fn token_ref_for(org: &OrgConfig) -> Option<&str> {
-    org.forge
-        .credentials
+// -- Per-provider credential resolution (MFORGE-3) --------------------
+
+/// Token credential-ref for a specific provider within an org.
+/// Returns the `key` of the first `CredentialType::Token` entry
+/// in that provider's block, or `None` when the provider is absent
+/// or has no token credential.
+pub fn token_ref_for_provider(org: &OrgConfig, provider: ProviderKind) -> Option<&str> {
+    org.credentials_for(provider)
         .iter()
         .find(|c| matches!(c.cred_type, CredentialType::Token))
         .map(|c| c.key.as_str())
 }
 
-/// V5PARITY-24: provider-default secret path for an org. The convention
-/// is `secrets://<provider>/_default/token`. Always returns a path; the
-/// secret may or may not exist — that's a runtime resolution concern.
+/// Provider-default secret path. Convention:
+/// `secrets://<provider>/_default/token`. Always returns a path;
+/// the secret may or may not exist — that is a runtime resolution
+/// concern.
 #[must_use]
-pub fn default_token_ref_for(org: &OrgConfig) -> String {
-    let provider = match org.forge.provider {
+pub fn default_token_ref_for_provider(provider: ProviderKind) -> String {
+    let label = match provider {
         ProviderKind::Github => "github",
         ProviderKind::Codeberg => "codeberg",
         ProviderKind::Gitlab => "gitlab",
     };
-    format!("secrets://{provider}/_default/token")
+    format!("secrets://{label}/_default/token")
+}
+
+/// SSH-key credential-ref for a specific provider within an org.
+/// Returns the `key` of the first `CredentialType::SshKey` entry
+/// in that provider's block, or `None`.
+pub fn ssh_key_for_provider(org: &OrgConfig, provider: ProviderKind) -> Option<&str> {
+    org.credentials_for(provider)
+        .iter()
+        .find(|c| matches!(c.cred_type, CredentialType::SshKey))
+        .map(|c| c.key.as_str())
+}
+
+// -- Backward-compatible wrappers (delegate to primary_provider) ------
+
+/// Token credential-ref lookup for an org's *primary* provider.
+/// Thin wrapper over `token_ref_for_provider`; prefer the explicit
+/// variant in new code.
+pub fn token_ref_for(org: &OrgConfig) -> Option<&str> {
+    let pk = org.primary_provider()?;
+    token_ref_for_provider(org, pk)
+}
+
+/// Provider-default secret path for the org's *primary* provider.
+/// Thin wrapper over `default_token_ref_for_provider`; prefer the
+/// explicit variant in new code.
+#[must_use]
+pub fn default_token_ref_for(org: &OrgConfig) -> String {
+    let pk = org.primary_provider().unwrap_or(ProviderKind::Github);
+    default_token_ref_for_provider(pk)
 }
 
 /// V5PARITY-34: filter remotes by the per-repo `forges` scope.
@@ -358,8 +391,6 @@ pub async fn sync_one(
     resolver: &dyn SecretResolver,
     remote_filter: Option<&str>,
 ) -> Vec<SyncOutcomeEntry> {
-    let tref = token_ref_for(org);
-    let fallback = Some(default_token_ref_for(org));
     let repo_ref = RepoRef {
         org: org.name.clone(),
         name: repo.name.clone(),
@@ -389,10 +420,14 @@ pub async fn sync_one(
                 continue;
             }
         };
-        let adapter = for_provider(provider.unwrap());
+        // MFORGE-3: resolve credentials per-remote, not once for the repo.
+        let pk = provider.unwrap();
+        let tref = token_ref_for_provider(org, pk);
+        let fallback = Some(default_token_ref_for_provider(pk));
+        let adapter = for_provider(pk);
         let auth = ForgeAuth {
             token_ref: tref,
-            fallback_token_ref: fallback.clone(),
+            fallback_token_ref: fallback,
             resolver,
         };
         match adapter.read_metadata(r, &repo_ref, &auth).await {
@@ -478,3 +513,147 @@ pub enum PurgeError {
 // Suppress unused imports we expose for hub consumers.
 #[allow(unused_imports)]
 use adapters as _adapters_anchor;
+
+// ---------------------------------------------------------------------
+// Tests (MFORGE-3).
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v5::config::{
+        CredentialEntry, CredentialType, ForgeProviderBlock, OrgConfig, OrgName, ProviderKind,
+    };
+    use std::collections::BTreeMap;
+
+    /// Helper: build an `OrgConfig` from a map of provider → credentials.
+    fn org_with(entries: Vec<(ProviderKind, Vec<CredentialEntry>)>) -> OrgConfig {
+        let mut forges = BTreeMap::new();
+        for (pk, creds) in entries {
+            forges.insert(pk, ForgeProviderBlock { credentials: creds });
+        }
+        OrgConfig {
+            name: OrgName("test".into()),
+            forges,
+            repos: vec![],
+        }
+    }
+
+    fn token_cred(key: &str) -> CredentialEntry {
+        CredentialEntry {
+            key: key.to_string(),
+            cred_type: CredentialType::Token,
+        }
+    }
+
+    fn ssh_cred(key: &str) -> CredentialEntry {
+        CredentialEntry {
+            key: key.to_string(),
+            cred_type: CredentialType::SshKey,
+        }
+    }
+
+    #[test]
+    fn test_token_ref_for_provider_github() {
+        let org = org_with(vec![
+            (ProviderKind::Github, vec![token_cred("secrets://gh")]),
+        ]);
+        assert_eq!(
+            token_ref_for_provider(&org, ProviderKind::Github),
+            Some("secrets://gh"),
+        );
+        assert_eq!(
+            token_ref_for_provider(&org, ProviderKind::Codeberg),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_token_ref_for_provider_multi() {
+        let org = org_with(vec![
+            (ProviderKind::Github, vec![token_cred("secrets://gh")]),
+            (ProviderKind::Codeberg, vec![token_cred("secrets://cb")]),
+        ]);
+        assert_eq!(
+            token_ref_for_provider(&org, ProviderKind::Github),
+            Some("secrets://gh"),
+        );
+        assert_eq!(
+            token_ref_for_provider(&org, ProviderKind::Codeberg),
+            Some("secrets://cb"),
+        );
+        assert_eq!(
+            token_ref_for_provider(&org, ProviderKind::Gitlab),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_default_token_ref_for_provider() {
+        assert_eq!(
+            default_token_ref_for_provider(ProviderKind::Github),
+            "secrets://github/_default/token",
+        );
+        assert_eq!(
+            default_token_ref_for_provider(ProviderKind::Codeberg),
+            "secrets://codeberg/_default/token",
+        );
+        assert_eq!(
+            default_token_ref_for_provider(ProviderKind::Gitlab),
+            "secrets://gitlab/_default/token",
+        );
+    }
+
+    #[test]
+    fn test_ssh_key_for_provider() {
+        let org = org_with(vec![
+            (
+                ProviderKind::Github,
+                vec![
+                    token_cred("secrets://gh"),
+                    ssh_cred("~/.ssh/id_ed25519"),
+                ],
+            ),
+            (ProviderKind::Codeberg, vec![token_cred("secrets://cb")]),
+        ]);
+        assert_eq!(
+            ssh_key_for_provider(&org, ProviderKind::Github),
+            Some("~/.ssh/id_ed25519"),
+        );
+        assert_eq!(
+            ssh_key_for_provider(&org, ProviderKind::Codeberg),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_wrappers() {
+        // primary_provider is Github (first in BTreeMap order).
+        let org = org_with(vec![
+            (ProviderKind::Github, vec![token_cred("secrets://gh")]),
+            (ProviderKind::Codeberg, vec![token_cred("secrets://cb")]),
+        ]);
+        // token_ref_for delegates to primary (Github).
+        assert_eq!(token_ref_for(&org), Some("secrets://gh"));
+        // default_token_ref_for delegates to primary (Github).
+        assert_eq!(
+            default_token_ref_for(&org),
+            "secrets://github/_default/token",
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_empty_org() {
+        let org = OrgConfig {
+            name: OrgName("empty".into()),
+            forges: BTreeMap::new(),
+            repos: vec![],
+        };
+        assert_eq!(token_ref_for(&org), None);
+        // Falls back to Github when no providers.
+        assert_eq!(
+            default_token_ref_for(&org),
+            "secrets://github/_default/token",
+        );
+    }
+}
