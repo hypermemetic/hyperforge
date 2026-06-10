@@ -55,6 +55,14 @@ pub fn detect_and_parse(dir: &Path) -> Result<PackageManifest, ManifestError> {
     if cargo.is_file() {
         return parse_cargo(&cargo);
     }
+    // Cabal BEFORE npm — mirrors registry::detect_build_system. A
+    // Haskell repo carrying an auxiliary package.json (e.g. a codegen
+    // client config) must not be misread as an npm package, or the
+    // publish tiering silently drops it (HF-PUBLISH-SAFETY finding:
+    // synapse-cc's `@plexus/client` package.json shadowed its .cabal).
+    if let Some(cabal) = find_cabal_file(dir) {
+        return parse_cabal(&cabal);
+    }
     let npm = dir.join("package.json");
     if npm.is_file() {
         return parse_npm(&npm);
@@ -64,6 +72,48 @@ pub fn detect_and_parse(dir: &Path) -> Result<PackageManifest, ManifestError> {
         return parse_pyproject(&py);
     }
     Err(ManifestError::NotFound(dir.display().to_string()))
+}
+
+fn find_cabal_file(dir: &Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        (p.extension().and_then(|x| x.to_str()) == Some("cabal") && p.is_file())
+            .then_some(p)
+    })
+}
+
+/// Minimal `.cabal` parse: `name:` + `version:` top-level fields.
+/// Dependencies are NOT extracted (cabal `build-depends` grammar is
+/// section-scoped); Hackage packages therefore tier independently.
+pub fn parse_cabal(path: &Path) -> Result<PackageManifest, ManifestError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ManifestError::Io(format!("{}: {e}", path.display())))?;
+    let field = |key: &str| -> String {
+        raw.lines()
+            .find_map(|line| {
+                let t = line.trim();
+                let ok = t.len() > key.len()
+                    && t[..key.len()].eq_ignore_ascii_case(key)
+                    && t.as_bytes()[key.len()] == b':';
+                if ok {
+                    let v = t[key.len() + 1..].trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default()
+    };
+    let name = field("name");
+    let version = field("version");
+    if name.is_empty() || version.is_empty() {
+        return Err(ManifestError::ParseError {
+            file: path.display().to_string(),
+            message: "missing name: or version: field".into(),
+        });
+    }
+    Ok(PackageManifest { kind: "cabal".into(), name, version, deps: Vec::new() })
 }
 
 pub fn parse_cargo(path: &Path) -> Result<PackageManifest, ManifestError> {
@@ -391,5 +441,66 @@ mod tests {
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0], vec!["B"]);
         assert_eq!(tiers[1], vec!["A"]);
+    }
+}
+
+#[cfg(test)]
+mod cabal_tests {
+    use super::*;
+
+    #[test]
+    fn parse_cabal_name_and_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("synapse-cc.cabal");
+        std::fs::write(&p, "cabal-version:      3.0\nname:               synapse-cc\nversion:            0.3.4\n").unwrap();
+        let m = parse_cabal(&p).unwrap();
+        assert_eq!(m.kind, "cabal");
+        assert_eq!(m.name, "synapse-cc");
+        assert_eq!(m.version, "0.3.4");
+        assert!(m.deps.is_empty());
+    }
+
+    #[test]
+    fn parse_cabal_missing_version_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("x.cabal");
+        std::fs::write(&p, "name: x\n").unwrap();
+        assert!(parse_cabal(&p).is_err());
+    }
+
+    #[test]
+    fn detect_prefers_cabal_over_stray_package_json() {
+        // HF-PUBLISH-SAFETY: a Haskell repo with an auxiliary
+        // package.json must resolve as the cabal package, mirroring
+        // registry::detect_build_system — otherwise the publish
+        // tiering operates under the wrong name and silently drops
+        // the package (observed on synapse-cc / @plexus/client).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("thing.cabal"),
+            "name: thing\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            "{\"name\":\"@scope/other\",\"version\":\"0.0.1\"}",
+        )
+        .unwrap();
+        let m = detect_and_parse(tmp.path()).unwrap();
+        assert_eq!(m.kind, "cabal");
+        assert_eq!(m.name, "thing");
+    }
+
+    #[test]
+    fn detect_still_prefers_cargo_over_cabal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"r\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("x.cabal"), "name: h\nversion: 1.0.0\n").unwrap();
+        let m = detect_and_parse(tmp.path()).unwrap();
+        assert_eq!(m.kind, "cargo");
     }
 }
