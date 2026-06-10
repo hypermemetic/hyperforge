@@ -8,7 +8,7 @@ use futures::Stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v5::build::{diff, dist, exec, manifest, registry, release};
+use crate::v5::build::{diff, dist, exec, manifest, preflight, registry, release};
 use crate::v5::config::{OrgName, WorkspaceRepo};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -154,6 +154,37 @@ pub enum BuildEvent {
         failed: u32,
         skipped: u32,
         auto_bumped: u32,
+    },
+
+    // HF-PUBLISH-SAFETY: pre-flight gate events.
+    /// One named pre-flight failure for one package. Codes:
+    /// `dirty_worktree` | `version_regression` | `unpushed_commits`
+    /// | `git_error`. Any of these refuses the whole run.
+    PreflightFailure {
+        package_name: String,
+        #[serde(flatten)]
+        finding: preflight::Finding,
+    },
+    /// Emitted after pre-flight failures; the run stops here — no
+    /// bump, tag, or publish was attempted for ANY package.
+    PreflightRefused {
+        name: String,
+        packages_checked: u32,
+        failures: u32,
+    },
+    /// Consumer-canary hook point (stub — see `build::preflight::
+    /// canary_message`). Emitted on every publish run so the missing
+    /// coverage is visible rather than silently absent.
+    ConsumerCanary {
+        message: String,
+    },
+    /// Post-publish consumer-pin report: workspace members that
+    /// declare a version requirement on the just-published package,
+    /// and whether that requirement admits the new version.
+    ConsumerPinReport {
+        package_name: String,
+        new_version: String,
+        consumers: Vec<preflight::ConsumerPin>,
     },
 
     Error {
@@ -697,6 +728,22 @@ impl BuildHub {
             let dir = match resolve_single_repo_dir(&config_dir, &org, &name) {
                 Ok(d) => d, Err(e) => { yield err("not_found", e); return; }
             };
+            // HF-PUBLISH-SAFETY: a dirty worktree is a hard error that
+            // names the offending files. (Replaces the old hardcoded
+            // `--allow-dirty`, which shipped uncommitted code silently.)
+            match crate::v5::ops::git::changed_paths(&dir) {
+                Ok(paths) => {
+                    if let Some(finding) = preflight::dirty_worktree_finding(&name, &paths) {
+                        yield BuildEvent::PreflightFailure {
+                            package_name: name.clone(),
+                            finding,
+                        };
+                        yield err("preflight_failed", "dirty worktree — refusing to publish");
+                        return;
+                    }
+                }
+                Err(e) => { yield err(e.code(), e.to_string()); return; }
+            }
             let ch = channel.unwrap_or_else(|| "crates.io".into());
             // Resolve publishing token via SecretResolver.
             let resolver = crate::v5::secrets::YamlSecretStore::new(&config_dir);
@@ -715,7 +762,9 @@ impl BuildHub {
                 Err(_) => { yield err("missing_token", format!("no secret at secrets://{secret_key}")); return; }
             };
             let publish_cmd = match ch.as_str() {
-                "crates.io" => format!("CARGO_REGISTRY_TOKEN={} cargo publish --allow-dirty", shell_escape(&token)),
+                // No --allow-dirty: the pre-flight above already
+                // guarantees a clean tree (HF-PUBLISH-SAFETY).
+                "crates.io" => format!("CARGO_REGISTRY_TOKEN={} cargo publish", shell_escape(&token)),
                 "npm" => format!("NPM_TOKEN={} npm publish", shell_escape(&token)),
                 "pypi" => format!("TWINE_USERNAME=__token__ TWINE_PASSWORD={} twine upload dist/*", shell_escape(&token)),
                 _ => unreachable!(),
@@ -852,10 +901,14 @@ impl BuildHub {
         name = "Workspace name",
         include = "Glob patterns to include (optional)",
         exclude = "Glob patterns to exclude (optional)",
-        bump = "major | minor | patch (default: patch)",
+        bump = "major | minor | patch (default: patch; only used with auto_bump=true)",
         execute = "Actually publish (default: false = dry-run)",
         no_tag = "Skip git tags",
-        no_commit = "Skip auto-commit after bumps"
+        no_commit = "Skip auto-commit after bumps",
+        no_push = "Skip pushing the auto-commit + tag (default: push — standing rule)",
+        auto_bump = "Let the tool compute version bumps (default: false — versions publish as-committed; HUMAN confirms any computed bump by passing this)",
+        force_dirty = "Skip ONLY the dirty-worktree gate; requires force_dirty_ack",
+        force_dirty_ack = "Must equal the workspace name; interactive callers MUST prompt before sending"
     ))]
     pub async fn publish_workspace(
         &self,
@@ -866,6 +919,10 @@ impl BuildHub {
         execute: Option<bool>,
         no_tag: Option<bool>,
         no_commit: Option<bool>,
+        no_push: Option<bool>,
+        auto_bump: Option<bool>,
+        force_dirty: Option<bool>,
+        force_dirty_ack: Option<String>,
     ) -> impl Stream<Item = BuildEvent> + Send + 'static {
         let config_dir = self.config_dir.clone();
         stream! {
@@ -877,6 +934,23 @@ impl BuildHub {
             let dry_run = !execute.unwrap_or(false);
             let skip_tag = no_tag.unwrap_or(false);
             let skip_commit = no_commit.unwrap_or(false);
+            let skip_push = no_push.unwrap_or(false);
+            let auto_bump_on = auto_bump.unwrap_or(false);
+            // HF-PUBLISH-SAFETY AC-3: the dirty escape hatch demands an
+            // explicit confirmation token. The wire surface cannot
+            // prompt; interactive front-ends prompt and then send the
+            // ack. A bare force_dirty=true is itself a refusal.
+            let force_dirty_on = force_dirty.unwrap_or(false);
+            if force_dirty_on && force_dirty_ack.as_deref() != Some(name.as_str()) {
+                yield err(
+                    "force_dirty_unconfirmed",
+                    format!(
+                        "force_dirty requires confirmation: set force_dirty_ack to the \
+                         workspace name ('{name}'). Interactive callers must prompt first."
+                    ),
+                );
+                return;
+            }
 
             // 1. Resolve workspace members, detect build systems, parse manifests.
             let members = match workspace_members(&config_dir, &name) {
@@ -926,7 +1000,6 @@ impl BuildHub {
                 registry: String,
                 dir: PathBuf,
                 status: String,
-                #[allow(dead_code)]
                 published_version: Option<String>,
                 deps: Vec<String>,
             }
@@ -999,6 +1072,66 @@ impl BuildHub {
                 .map(|p| p.manifest.clone())
                 .collect();
 
+            // All workspace manifests — for the consumer-pin report.
+            let all_manifests: Vec<manifest::PackageManifest> = packages.iter()
+                .map(|p| p.manifest.clone())
+                .collect();
+
+            // 4.5 HF-PUBLISH-SAFETY pre-flight. Per would-publish
+            // package, BEFORE any bump/tag/publish mutation:
+            //   dirty_worktree    — uncommitted changes, names files
+            //   version_regression — local < registry (the macros trap)
+            //   unpushed_commits  — HEAD ahead of / without upstream
+            // Any failure refuses the WHOLE run — in dry-run too, so
+            // the refusal is rehearsable before tokens are involved.
+            let mut packages_checked = 0u32;
+            let mut preflight_failures = 0u32;
+            for st in statuses.iter().filter(|s| selected.contains(&s.pkg_name)) {
+                if st.status == "up_to_date" {
+                    continue; // skipped by the publish loop; not a publish source
+                }
+                packages_checked += 1;
+                let findings = preflight::run_preflight(
+                    &st.dir,
+                    &st.pkg_name,
+                    &st.local_version,
+                    st.published_version.as_deref(),
+                    force_dirty_on,
+                );
+                for finding in findings {
+                    preflight_failures += 1;
+                    yield BuildEvent::PreflightFailure {
+                        package_name: st.pkg_name.clone(),
+                        finding,
+                    };
+                }
+            }
+            if preflight_failures > 0 {
+                yield BuildEvent::PreflightRefused {
+                    name: name.clone(),
+                    packages_checked,
+                    failures: preflight_failures,
+                };
+                yield err(
+                    "preflight_failed",
+                    format!(
+                        "{preflight_failures} pre-flight failure(s) across \
+                         {packages_checked} package(s) — refusing to publish. \
+                         Nothing was bumped, tagged, or uploaded."
+                    ),
+                );
+                return;
+            }
+
+            // Consumer-canary hook point (stub — build::preflight).
+            let to_publish: Vec<String> = statuses.iter()
+                .filter(|s| selected.contains(&s.pkg_name) && s.status != "up_to_date")
+                .map(|s| s.pkg_name.clone())
+                .collect();
+            yield BuildEvent::ConsumerCanary {
+                message: preflight::canary_message(&to_publish),
+            };
+
             // 5. Build publish order.
             let tiers = match manifest::build_publish_order(&selected_manifests) {
                 Ok(t) => t,
@@ -1055,9 +1188,15 @@ impl BuildHub {
                     let mut current_version = st.local_version.clone();
 
                     // Bump version for packages that need publishing.
-                    let do_bump = st.status == "unpublished"
-                        || st.status == "ahead"
-                        || st.status == "stale";
+                    // HF-PUBLISH-SAFETY: auto-bump is OPT-IN (the human
+                    // confirms a computed bump by passing auto_bump).
+                    // Default: the committed version IS the publish
+                    // version. "stale" never reaches here — version
+                    // regression is a pre-flight hard error (the old
+                    // stale auto-bump shipped 17 commits of feature
+                    // work as a patch on plexus-macros).
+                    let do_bump = auto_bump_on
+                        && (st.status == "unpublished" || st.status == "ahead");
                     if do_bump {
                         let bump_result = if st.build_system == "cargo" {
                             let cargo_path = st.dir.join("Cargo.toml");
@@ -1137,6 +1276,53 @@ impl BuildHub {
                                         &format!("{pkg_name}-v{new}"),
                                     );
                                 }
+                                // HF-PUBLISH-SAFETY: push the bump
+                                // commit + tag (standing rule — local-
+                                // only auto-commit/tag is exactly how
+                                // the forge/registry skew was created).
+                                if !dry_run && !skip_push && !skip_commit {
+                                    let branch = crate::v5::ops::git::status(&st.dir)
+                                        .ok()
+                                        .and_then(|s| s.branch)
+                                        .unwrap_or_else(|| "main".into());
+                                    let push_branch = crate::v5::ops::git::push_refs(
+                                        &st.dir, "origin", Some(&branch),
+                                    );
+                                    let push_tag = if skip_tag {
+                                        Ok(())
+                                    } else {
+                                        crate::v5::ops::git::push_ref(
+                                            &st.dir,
+                                            "origin",
+                                            &format!("refs/tags/{pkg_name}-v{new}"),
+                                        )
+                                    };
+                                    match push_branch.and(push_tag) {
+                                        Ok(()) => {
+                                            yield BuildEvent::PublishStep {
+                                                package_name: pkg_name.clone(),
+                                                version: new.clone(),
+                                                registry: st.registry.clone(),
+                                                action: "pushed".into(),
+                                                error: None,
+                                                dry_run,
+                                            };
+                                        }
+                                        Err(e) => {
+                                            failed += 1;
+                                            tier_failed = true;
+                                            yield BuildEvent::PublishStep {
+                                                package_name: pkg_name.clone(),
+                                                version: new.clone(),
+                                                registry: st.registry.clone(),
+                                                action: "failed".into(),
+                                                error: Some(format!("push failed: {e}")),
+                                                dry_run,
+                                            };
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
                             Some(Err(e)) => {
                                 failed += 1;
@@ -1160,12 +1346,25 @@ impl BuildHub {
                         published_count += 1;
                         yield BuildEvent::PublishStep {
                             package_name: pkg_name.clone(),
-                            version: current_version,
+                            version: current_version.clone(),
                             registry: st.registry.clone(),
                             action: "publish".into(),
                             error: None,
                             dry_run,
                         };
+                        // Consumer-pin report (HF-PUBLISH-3 minimal):
+                        // who in the workspace pins this package, and
+                        // does their requirement admit the new version?
+                        let pins = preflight::consumer_pins(
+                            pkg_name, &current_version, &all_manifests,
+                        );
+                        if !pins.is_empty() {
+                            yield BuildEvent::ConsumerPinReport {
+                                package_name: pkg_name.clone(),
+                                new_version: current_version.clone(),
+                                consumers: pins,
+                            };
+                        }
                     } else {
                         let channel = registry_to_channel(&st.registry);
                         let secret_key = match release::secret_key_for_channel(channel) {
@@ -1239,12 +1438,22 @@ impl BuildHub {
                                 published_count += 1;
                                 yield BuildEvent::PublishStep {
                                     package_name: pkg_name.clone(),
-                                    version: current_version,
+                                    version: current_version.clone(),
                                     registry: st.registry.clone(),
                                     action: "publish".into(),
                                     error: None,
                                     dry_run,
                                 };
+                                let pins = preflight::consumer_pins(
+                                    pkg_name, &current_version, &all_manifests,
+                                );
+                                if !pins.is_empty() {
+                                    yield BuildEvent::ConsumerPinReport {
+                                        package_name: pkg_name.clone(),
+                                        new_version: current_version.clone(),
+                                        consumers: pins,
+                                    };
+                                }
                             }
                             Ok(res) => {
                                 failed += 1;

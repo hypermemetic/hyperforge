@@ -7,6 +7,7 @@
 
 pub mod manifest;
 pub mod diff;
+pub mod preflight;
 pub mod release;
 pub mod exec;
 pub mod dist;

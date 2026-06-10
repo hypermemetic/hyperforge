@@ -184,8 +184,13 @@ pub fn secret_key_for_channel(channel: &str) -> Option<&'static str> {
 pub fn publish_command(channel: &str, token: &str) -> Option<String> {
     let escaped = shell_escape(token);
     match channel {
+        // NB: no `--allow-dirty` — HF-PUBLISH-SAFETY. A dirty tree must
+        // be a named hard error in the pre-flight (build::preflight),
+        // never silently shipped. The `force_dirty` escape hatch skips
+        // the pre-flight gate but still publishes from the committed
+        // index state cargo enforces.
         "crates.io" => Some(format!(
-            "CARGO_REGISTRY_TOKEN={escaped} cargo publish --allow-dirty"
+            "CARGO_REGISTRY_TOKEN={escaped} cargo publish"
         )),
         "npm" => Some(format!("NPM_TOKEN={escaped} npm publish")),
         "pypi" => Some(format!(
@@ -314,6 +319,19 @@ mod tests {
         let cmd = publish_command("crates.io", "secret").unwrap();
         assert!(cmd.contains("CARGO_REGISTRY_TOKEN="));
         assert!(cmd.contains("cargo publish"));
+    }
+
+    #[test]
+    fn no_allow_dirty_in_any_publish_command() {
+        // HF-PUBLISH-SAFETY AC-3: --allow-dirty appears in NO publish
+        // command builder. Dirty trees are pre-flight hard errors.
+        for ch in ["crates.io", "npm", "pypi", "hackage"] {
+            let cmd = publish_command(ch, "tok").unwrap();
+            assert!(
+                !cmd.contains("--allow-dirty"),
+                "{ch} publish command still carries --allow-dirty: {cmd}"
+            );
+        }
     }
 
     #[test]
