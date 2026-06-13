@@ -2618,6 +2618,20 @@ impl WorkspacesHub {
                     org: crate::v5::config::OrgName::from(from_org.as_str()),
                     name: crate::v5::config::RepoName::from(repo_name.as_str()),
                 };
+                // DEFECT 56f3fc38: credentials for the DESTINATION org, used
+                // by the two-sided probe below. A private repo transferred to
+                // `to_org` 301-redirects, but if `from_org`'s token lacks read
+                // access at the destination GitHub answers 404 — so we must
+                // re-probe `to_org` with `to_org`'s OWN token (which may be a
+                // different, destination-scoped credential).
+                let to_org_cfg = loaded.orgs.get(&crate::v5::config::OrgName::from(to_org.as_str()));
+                let to_token_ref = to_org_cfg
+                    .and_then(|o| crate::v5::ops::repo::token_ref_for_provider(o, provider))
+                    .map(|s| s.to_string());
+                let to_repo_ref = crate::v5::config::RepoRef {
+                    org: crate::v5::config::OrgName::from(to_org.as_str()),
+                    name: crate::v5::config::RepoName::from(repo_name.as_str()),
+                };
 
                 // Query the forge for the canonical owner (follows renames).
                 let event = match crate::v5::ops::repo::canonical_owner_on_forge(
@@ -2626,7 +2640,7 @@ impl WorkspacesHub {
                     &loaded.global.provider_map,
                     &resolver,
                     token_ref.as_deref(),
-                    fallback_token_ref,
+                    fallback_token_ref.clone(),
                 ).await {
                     Ok(owner) => {
                         let verdict = crate::v5::ops::repo::OrgDiffVerdict::classify(
@@ -2646,12 +2660,36 @@ impl WorkspacesHub {
                         }
                     }
                     Err(e) if e.class == crate::v5::adapters::ForgeErrorClass::NotFound => {
-                        missing.push(repo_name.clone());
+                        // DEFECT 56f3fc38: not-found at `from_org` is NOT
+                        // conclusive. Probe `to_org` with its own credentials
+                        // before bucketing. Exists there => MOVED; absent at
+                        // both ends => genuinely MISSING.
+                        let exists_at_to = crate::v5::ops::repo::exists_on_forge(
+                            remote,
+                            &to_repo_ref,
+                            &loaded.global.provider_map,
+                            &resolver,
+                            to_token_ref.as_deref(),
+                            fallback_token_ref.clone(),
+                        ).await.unwrap_or(false);
+                        let verdict = crate::v5::ops::repo::OrgDiffVerdict::classify_not_found_at_source(
+                            exists_at_to,
+                        );
+                        let canonical_org = match verdict {
+                            crate::v5::ops::repo::OrgDiffVerdict::Moved => {
+                                moved.push(repo_name.clone());
+                                Some(to_org.clone())
+                            }
+                            _ => {
+                                missing.push(repo_name.clone());
+                                None
+                            }
+                        };
                         WorkspacesEvent::OrgDiffEntry {
                             name: repo_name.clone(),
                             declared_org: from_org.clone(),
-                            canonical_org: None,
-                            verdict: crate::v5::ops::repo::OrgDiffVerdict::Missing.as_str().into(),
+                            canonical_org,
+                            verdict: verdict.as_str().into(),
                         }
                     }
                     Err(e) => {

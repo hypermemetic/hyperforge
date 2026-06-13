@@ -413,6 +413,23 @@ impl OrgDiffVerdict {
             Self::Elsewhere
         }
     }
+
+    /// Two-sided classifier (DEFECT 56f3fc38). When the `from_org`
+    /// canonical-owner lookup returns `not_found`, we CANNOT conclude the
+    /// repo is gone: a private repo that was transferred to `to_org`
+    /// 301-redirects, but if the source token lacks read access at the
+    /// destination GitHub returns 404 (hides existence). So we probe
+    /// `to_org` directly with `to_org`'s OWN credentials. If it exists
+    /// there, the repo MOVED; only when it is absent at BOTH ends is it
+    /// genuinely MISSING.
+    #[must_use]
+    pub const fn classify_not_found_at_source(exists_at_to_org: bool) -> Self {
+        if exists_at_to_org {
+            Self::Moved
+        } else {
+            Self::Missing
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -732,6 +749,18 @@ mod tests {
     }
 
     #[test]
+    fn test_org_diff_verdict_classify_not_found_at_source() {
+        use super::OrgDiffVerdict as V;
+        // DEFECT 56f3fc38: a private repo transferred to `to_org` whose
+        // canonical-owner lookup 404s at `from_org` (source token lacks
+        // destination access) is recovered as MOVED once the two-sided
+        // probe confirms it exists at `to_org`.
+        assert_eq!(V::classify_not_found_at_source(true), V::Moved);
+        // Absent at both ends => genuinely MISSING.
+        assert_eq!(V::classify_not_found_at_source(false), V::Missing);
+    }
+
+    #[test]
     fn test_org_diff_verdict_as_str() {
         use super::OrgDiffVerdict as V;
         assert_eq!(V::Moved.as_str(), "moved");
@@ -749,28 +778,41 @@ mod tests {
         use super::OrgDiffVerdict as V;
         let from = "hypermemetic";
         let to = "hypermemetic-ai";
-        // (repo, canonical owner the forge reports)
-        let forge_truth = [
-            ("alpha", "hypermemetic-ai"), // moved
-            ("beta", "hypermemetic"),     // stayed
-            ("gamma", "hypermemetic-ai"), // moved
-            ("delta", "third-party"),     // elsewhere
+        // Forge truth per repo. `Ok(owner)` is a resolved canonical owner;
+        // `Err(exists_at_to)` models a `not_found` at `from_org` plus the
+        // two-sided probe's answer at `to_org` (DEFECT 56fc3f38): a private
+        // repo whose source token lacks destination access 404s at the
+        // source but is recovered via the `to_org` probe.
+        let forge_truth: [(&str, Result<&str, bool>); 6] = [
+            ("alpha", Ok("hypermemetic-ai")), // moved (resolved)
+            ("beta", Ok("hypermemetic")),     // stayed
+            ("gamma", Ok("hypermemetic-ai")), // moved (resolved)
+            ("delta", Ok("third-party")),     // elsewhere
+            ("epsilon", Err(true)),  // transferred private: 404 at source, exists at to => moved
+            ("zeta", Err(false)),    // absent at both ends => missing
         ];
         let mut moved = Vec::new();
         let mut stayed = Vec::new();
         let mut elsewhere = Vec::new();
-        for (repo, owner) in forge_truth {
-            match V::classify(owner, from, to) {
+        let mut missing = Vec::new();
+        for (repo, truth) in forge_truth {
+            let verdict = match truth {
+                Ok(owner) => V::classify(owner, from, to),
+                Err(exists_at_to) => V::classify_not_found_at_source(exists_at_to),
+            };
+            match verdict {
                 V::Moved => moved.push(repo),
                 V::Stayed => stayed.push(repo),
                 V::Elsewhere => elsewhere.push(repo),
-                V::Missing => unreachable!(),
+                V::Missing => missing.push(repo),
             }
         }
-        // The `moved` set is exactly what migrate_org's members must be.
-        assert_eq!(moved, vec!["alpha", "gamma"]);
+        // The `moved` set is exactly what migrate_org's members must be —
+        // including the transferred private repo recovered by the probe.
+        assert_eq!(moved, vec!["alpha", "gamma", "epsilon"]);
         assert_eq!(stayed, vec!["beta"]);
         assert_eq!(elsewhere, vec!["delta"]);
+        assert_eq!(missing, vec!["zeta"]);
     }
 
     #[test]
