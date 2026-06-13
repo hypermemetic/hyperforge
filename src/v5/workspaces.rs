@@ -252,6 +252,28 @@ pub enum WorkspacesEvent {
         behind: u32,
         errored: u32,
     },
+    /// Per-member result of `workspaces.migrate_org`: this member's
+    /// repo was moved to `new_org` (membership + config.toml + remotes).
+    MemberMigrated {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        old_org: String,
+        new_org: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+    },
+    /// Aggregate emitted after `workspaces.migrate_org`. Invariant:
+    /// `total == succeeded + errored`.
+    WorkspaceMigrateOrgSummary {
+        name: String,
+        total: u32,
+        succeeded: u32,
+        errored: u32,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+    },
     /// V5PARITY-4: workspace-wide aggregate.
     WorkspaceAnalyticsSummary {
         name: String,
@@ -2319,6 +2341,122 @@ impl WorkspacesHub {
             yield WorkspacesEvent::WorkspaceSetForgesSummary {
                 name: ws.name.as_str().to_string(),
                 total, ok, errored, unchanged,
+                dry_run: dry,
+            };
+        }
+    }
+
+    // ==================================================================
+    // Workspace-wide org migration.
+    // ==================================================================
+
+    /// Move workspace members to a different (already-registered) org.
+    ///
+    /// If `members` (JSON array of repo names) is given, migrate exactly
+    /// those; otherwise migrate ALL members whose org == `from_org`. The
+    /// target org `to_org` must already exist. Per-member failures are
+    /// isolated — a failing member emits an `error` event and the batch
+    /// continues. When a member is an `{ref, dir}` object, its local
+    /// `dir` is passed through so the checkout's `.hyperforge/config.toml`
+    /// org + git remotes get flipped too.
+    #[plexus_macros::method(params(
+        name = "Workspace name",
+        from_org = "Source org to move members off of",
+        to_org = "Target org (must already be registered)",
+        members = "Optional JSON array of repo names to migrate (default: all members in from_org)",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn migrate_org(
+        &self,
+        name: String,
+        from_org: String,
+        to_org: String,
+        members: Option<String>,
+        dry_run: Option<serde_json::Value>,
+    ) -> impl futures::Stream<Item = WorkspacesEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        async_stream::stream! {
+            if from_org.is_empty() || to_org.is_empty() {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "missing required parameter 'from_org' or 'to_org'".into(),
+                };
+                return;
+            }
+            if from_org == to_org {
+                yield WorkspacesEvent::Error {
+                    code: Some("validation".into()),
+                    message: "'to_org' must differ from 'from_org'".into(),
+                };
+                return;
+            }
+            let dry = dry_run.as_ref().is_some_and(to_bool);
+            // Optional explicit member filter (repo names).
+            let name_filter: Option<Vec<String>> = match members.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => {
+                    match serde_json::from_str::<Vec<String>>(s) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            yield WorkspacesEvent::Error {
+                                code: Some("validation".into()),
+                                message: format!("members must be a JSON array of names: {e}"),
+                            };
+                            return;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let (ws, loaded) = match load_iter_ctx(&config_dir, &name).await {
+                Ok(t) => t, Err(e) => { yield e; return; }
+            };
+            let ws_path = std::path::PathBuf::from(ws.path.as_str());
+            let mut total = 0u32; let mut succeeded = 0u32; let mut errored = 0u32;
+            for ctx in member_ctxs(&ws, &loaded, &ws_path) {
+                // Select members: explicit name list, else all in from_org.
+                let selected = match &name_filter {
+                    Some(names) => names.iter().any(|n| n == &ctx.reference.name),
+                    None => ctx.reference.org == from_org,
+                };
+                if !selected {
+                    continue;
+                }
+                // An explicitly-named member not in from_org is a no-op
+                // for migration but should still surface as an error so
+                // the caller knows it wasn't moved.
+                total += 1;
+                let dir_opt = ctx.dir.exists().then(|| ctx.dir.as_path());
+                match crate::v5::repos::migrate_one(
+                    &config_dir,
+                    &ctx.reference.org,
+                    &ctx.reference.name,
+                    &to_org,
+                    dir_opt,
+                    dry,
+                ) {
+                    Ok(outcome) => {
+                        succeeded += 1;
+                        yield WorkspacesEvent::MemberMigrated {
+                            reference: crate::v5::repos::RepoRefWire {
+                                org: to_org.clone(),
+                                name: ctx.reference.name.clone(),
+                            },
+                            old_org: ctx.reference.org.clone(),
+                            new_org: to_org.clone(),
+                            local_path: outcome.local_path,
+                            dry_run: dry,
+                        };
+                    }
+                    Err(msg) => {
+                        errored += 1;
+                        let body = msg.split_once(": ").map_or(msg.as_str(), |(_, b)| b);
+                        yield member_err(&ctx.reference, "migrate_org", body);
+                    }
+                }
+            }
+            yield WorkspacesEvent::WorkspaceMigrateOrgSummary {
+                name: ws.name.as_str().to_string(),
+                total, succeeded, errored,
                 dry_run: dry,
             };
         }

@@ -276,6 +276,23 @@ pub enum RepoEvent {
         old_ref: RepoRefWire,
         new_ref: RepoRefWire,
     },
+    /// A repo was moved to a different org: org-membership relocated
+    /// (source org yaml → target org yaml), `.hyperforge/config.toml`
+    /// `org` flipped, and remote URLs retargeted. The local
+    /// `config.toml` shows dirty after this — the caller commits it.
+    RepoMigrated {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        old_org: String,
+        new_org: String,
+        /// Path to the local checkout whose `.hyperforge/config.toml`
+        /// org was flipped, when a checkout was known. `None` when no
+        /// `path`/`dir` was supplied (yaml-only migration).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+        dry_run: bool,
+    },
     DefaultBranchSet {
         #[serde(rename = "ref")]
         reference: RepoRefWire,
@@ -558,6 +575,170 @@ fn validation_event(msg: impl Into<String>) -> RepoEvent {
         error_class: None,
         message: msg.into(),
     }
+}
+
+// ---------------------------------------------------------------------
+// Org migration — shared between repos.migrate_org and
+// workspaces.migrate_org (one implementation, no duplication).
+// ---------------------------------------------------------------------
+
+/// Retarget a single remote URL's org segment `old_org` → `new_org`.
+///
+/// Handles both ssh (`host:OLD_ORG/name`) and https
+/// (`host/OLD_ORG/name`) forms by replacing only the path-anchored
+/// occurrences `:OLD_ORG/` and `/OLD_ORG/`, so the host (which never
+/// matches either pattern unless it is literally followed by `/OLD/`)
+/// is left intact.
+fn retarget_remote_url(url: &str, old_org: &str, new_org: &str) -> String {
+    url.replace(&format!(":{old_org}/"), &format!(":{new_org}/"))
+        .replace(&format!("/{old_org}/"), &format!("/{new_org}/"))
+}
+
+/// Outcome of a successful per-repo migration.
+pub(crate) struct MigrateOutcome {
+    /// Local checkout whose `.hyperforge/config.toml` org was flipped,
+    /// when a dir was known and the config existed.
+    pub(crate) local_path: Option<String>,
+}
+
+/// Move ONE repo from org `org` to org `new_org`:
+///
+/// 1. Remove the `OrgRepo` from the source org's `repos` vec, retarget
+///    its remotes, push it into the target org's `repos` vec, save BOTH
+///    org yamls.
+/// 2. When `dir_opt` is a known local checkout: flip its
+///    `.hyperforge/config.toml` `org` (force-write) and `set_remote_url`
+///    for each retargeted remote.
+/// 3. Rewrite every workspace yaml ref `old_org/name` → `new_org/name`.
+///
+/// The TARGET org must already be registered — this never creates it.
+/// On `dry`, all computation runs but NO writes happen (org yamls,
+/// config.toml, git remotes, workspaces).
+pub(crate) fn migrate_one(
+    config_dir: &std::path::Path,
+    org: &str,
+    name: &str,
+    new_org: &str,
+    dir_opt: Option<&std::path::Path>,
+    dry: bool,
+) -> Result<MigrateOutcome, String> {
+    let loaded = crate::v5::ops::state::load_all(config_dir)
+        .map_err(|e| format!("config_error: {e}"))?;
+
+    let Some(source) = loaded.orgs.get(&OrgName::from(org)) else {
+        return Err(format!("not_found: org '{org}' not found"));
+    };
+    // The target org MUST already exist — migration does not create it.
+    if loaded.orgs.get(&OrgName::from(new_org)).is_none() {
+        return Err(format!(
+            "org_not_found: target org '{new_org}' is not registered (register it first)"
+        ));
+    }
+    let Some(existing_repo) = crate::v5::ops::state::find_repo(source, name) else {
+        return Err(format!("not_found: repo '{name}' not found under org '{org}'"));
+    };
+
+    // Compute the retargeted OrgRepo (org-segment swap on every remote).
+    let mut moved = existing_repo.clone();
+    for r in &mut moved.remotes {
+        let new_url = retarget_remote_url(r.url.as_str(), org, new_org);
+        r.url = RemoteUrl::from(new_url.as_str());
+    }
+
+    // Determine the local-checkout side-effects up front so dry_run can
+    // preview the path without performing them.
+    let mut local_path: Option<String> = None;
+    if let Some(dir) = dir_opt {
+        if let Ok(Some(_cfg)) = crate::v5::ops::fs::read_hyperforge_config(dir) {
+            local_path = Some(dir.display().to_string());
+        }
+    }
+
+    if dry {
+        return Ok(MigrateOutcome { local_path });
+    }
+
+    // --- Writes below this line. ---
+
+    // 1. Move membership: remove from source, push into target.
+    let mut source_updated = source.clone();
+    source_updated.repos.retain(|r| r.name.as_str() != name);
+    let mut target_updated = loaded
+        .orgs
+        .get(&OrgName::from(new_org))
+        .expect("target org existence checked above")
+        .clone();
+    target_updated.repos.push(moved.clone());
+
+    let orgs_dir = config_dir.join("orgs");
+    crate::v5::ops::state::save_org(&orgs_dir, &source_updated)
+        .map_err(|e| format!("config_error: {e}"))?;
+    crate::v5::ops::state::save_org(&orgs_dir, &target_updated)
+        .map_err(|e| format!("config_error: {e}"))?;
+
+    // 2. Local checkout: flip config.toml org + retarget git remotes.
+    if let Some(dir) = dir_opt {
+        if let Ok(Some(mut cfg)) = crate::v5::ops::fs::read_hyperforge_config(dir) {
+            cfg.org = OrgName::from(new_org);
+            crate::v5::ops::fs::write_hyperforge_config(dir, &cfg, true)
+                .map_err(|e| format!("config_error: writing .hyperforge/config.toml: {e}"))?;
+            // Retarget the local git remotes to match the moved entry.
+            // Remote names aren't carried in OrgRepo, so map by provider:
+            // we set the URL under each remote's *name* as known to the
+            // checkout. We only have URLs here, so use git remote names
+            // derived from the existing checkout via set_remote_url on a
+            // best-effort basis keyed by the canonical remote name.
+            for (orig, retargeted) in
+                existing_repo.remotes.iter().zip(moved.remotes.iter())
+            {
+                // Provider is the stable remote identity; fall back to
+                // "origin" when unknown. set_remote_url is best-effort —
+                // a missing remote on the local checkout is not fatal.
+                let remote_name = match orig.provider {
+                    Some(ProviderKind::Github) => "github",
+                    Some(ProviderKind::Codeberg) => "codeberg",
+                    Some(ProviderKind::Gitlab) => "gitlab",
+                    None => "origin",
+                };
+                let _ = crate::v5::ops::git::set_remote_url(
+                    dir,
+                    remote_name,
+                    retargeted.url.as_str(),
+                );
+            }
+        }
+    }
+
+    // 3. Rewrite workspace refs old_org/name → new_org/name.
+    let ws_dir = config_dir.join("workspaces");
+    if ws_dir.is_dir() {
+        if let Ok(all_ws) = crate::v5::ops::state::load_workspaces(&ws_dir) {
+            for (_, mut ws) in all_ws {
+                let mut changed = false;
+                for entry in &mut ws.repos {
+                    match entry {
+                        crate::v5::config::WorkspaceRepo::Shorthand(s) => {
+                            if *s == format!("{org}/{name}") {
+                                *s = format!("{new_org}/{name}");
+                                changed = true;
+                            }
+                        }
+                        crate::v5::config::WorkspaceRepo::Object { reference, .. } => {
+                            if reference.org.as_str() == org && reference.name.as_str() == name {
+                                reference.org = OrgName::from(new_org);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    let _ = crate::v5::ops::state::save_workspace(&ws_dir, &ws);
+                }
+            }
+        }
+    }
+
+    Ok(MigrateOutcome { local_path })
 }
 
 // ---------------------------------------------------------------------
@@ -2247,6 +2428,67 @@ impl ReposHub {
         }
     }
 
+    /// Move ONE repo to a different (already-registered) org: relocate
+    /// its org-membership entry, flip the local `.hyperforge/config.toml`
+    /// `org`, and retarget its remote URLs. The target org must already
+    /// exist — this never creates it. The local `config.toml` is
+    /// git-tracked, so it will show dirty afterwards; the caller commits.
+    #[plexus_macros::method(params(
+        org = "Current org name",
+        name = "Repo name",
+        new_org = "Target org (must already be registered)",
+        path = "Optional local checkout dir to flip config.toml + git remotes",
+        dry_run = "Preview without writing"
+    ))]
+    pub async fn migrate_org(
+        &self,
+        org: String,
+        name: String,
+        new_org: String,
+        path: Option<String>,
+        dry_run: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let dry = dry_run.as_ref().is_some_and(|v| to_bool(v, false));
+            if org.is_empty() || name.is_empty() || new_org.is_empty() {
+                yield validation_event("missing required parameter 'org', 'name', or 'new_org'");
+                return;
+            }
+            if new_org == org {
+                yield validation_event("'new_org' must differ from 'org'");
+                return;
+            }
+            let dir_opt = path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from);
+            match migrate_one(&config_dir, &org, &name, &new_org, dir_opt.as_deref(), dry) {
+                Ok(outcome) => {
+                    yield RepoEvent::RepoMigrated {
+                        reference: RepoRefWire { org: new_org.clone(), name: name.clone() },
+                        old_org: org,
+                        new_org,
+                        local_path: outcome.local_path,
+                        dry_run: dry,
+                    };
+                }
+                Err(msg) => {
+                    let (code, body) = msg
+                        .split_once(": ")
+                        .map_or(("validation", msg.as_str()), |(c, b)| (c, b));
+                    yield RepoEvent::Error {
+                        code: Some(code.to_string()),
+                        error_class: matches!(code, "not_found" | "org_not_found")
+                            .then(|| code.to_string()),
+                        message: body.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
     #[plexus_macros::method(params(
         org = "Org name",
         name = "Repo name",
@@ -3092,3 +3334,194 @@ fn metadata_from_local(local: &Option<RepoMetadataLocal>) -> MetadataFields {
 // Silence unused-import lint if adapters are only used indirectly.
 #[allow(dead_code)]
 struct _KeepLinkedTypes(Arc<dyn SecretResolver>, ForgePortError, RemoteUrl);
+
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+    use crate::v5::config::{ForgeProviderBlock, OrgConfig};
+    use futures::StreamExt;
+
+    fn org_with_repo(name: &str, repos: Vec<OrgRepo>) -> OrgConfig {
+        let mut forges = BTreeMap::new();
+        forges.insert(ProviderKind::Github, ForgeProviderBlock { credentials: vec![] });
+        OrgConfig {
+            name: OrgName::from(name),
+            forges,
+            repos,
+        }
+    }
+
+    fn ssh_remote(org: &str, repo: &str) -> Remote {
+        Remote {
+            url: RemoteUrl::from(format!("git@github.com:{org}/{repo}.git").as_str()),
+            provider: Some(ProviderKind::Github),
+        }
+    }
+
+    /// Mirrors the rename anti-story: set up two orgs + a repo under the
+    /// source, migrate it, and assert the OrgRepo moved to the target
+    /// org yaml with remotes retargeted and the local config.toml org
+    /// flipped.
+    #[tokio::test]
+    async fn test_migrate_org_moves_membership_and_flips_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let orgs_dir = config_dir.join("orgs");
+        std::fs::create_dir_all(&orgs_dir).unwrap();
+
+        // Source org owns `widget`; target org starts empty.
+        let repo = OrgRepo {
+            name: RepoName::from("widget"),
+            remotes: vec![ssh_remote("hypermemetic", "widget")],
+            forges: None,
+            metadata: None,
+        };
+        save_org(&orgs_dir, &org_with_repo("hypermemetic", vec![repo])).unwrap();
+        save_org(&orgs_dir, &org_with_repo("hypermemetic-ai", vec![])).unwrap();
+
+        // Local checkout with a .hyperforge/config.toml declaring the
+        // source org.
+        let checkout = config_dir.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let cfg = crate::v5::ops::fs::HyperforgeRepoConfig {
+            repo_name: "widget".into(),
+            org: OrgName::from("hypermemetic"),
+            forges: vec![ProviderKind::Github],
+            default_branch: None,
+            visibility: None,
+            description: None,
+        };
+        crate::v5::ops::fs::write_hyperforge_config(&checkout, &cfg, false).unwrap();
+
+        // Run the migration.
+        let hub = ReposHub::with_config_dir(config_dir.clone());
+        let events: Vec<RepoEvent> = hub
+            .migrate_org(
+                "hypermemetic".into(),
+                "widget".into(),
+                "hypermemetic-ai".into(),
+                Some(checkout.display().to_string()),
+                None,
+            )
+            .await
+            .collect()
+            .await;
+
+        // Exactly one RepoMigrated, no errors.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RepoEvent::RepoMigrated { old_org, new_org, .. }
+                    if old_org == "hypermemetic" && new_org == "hypermemetic-ai"
+            )),
+            "expected RepoMigrated event, got {events:?}",
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, RepoEvent::Error { .. })),
+            "no error events expected, got {events:?}",
+        );
+
+        // Source org no longer lists the repo; target org now does.
+        let reloaded = load_all(&config_dir).unwrap();
+        let source = reloaded.orgs.get(&OrgName::from("hypermemetic")).unwrap();
+        let target = reloaded.orgs.get(&OrgName::from("hypermemetic-ai")).unwrap();
+        assert!(find_repo(source, "widget").is_none(), "repo must leave source org");
+        let moved = find_repo(target, "widget").expect("repo must land in target org");
+
+        // Remote URL org segment retargeted.
+        assert_eq!(
+            moved.remotes[0].url.as_str(),
+            "git@github.com:hypermemetic-ai/widget.git",
+            "remote URL org segment must be retargeted",
+        );
+
+        // Local config.toml org flipped.
+        let flipped = crate::v5::ops::fs::read_hyperforge_config(&checkout)
+            .unwrap()
+            .expect("config.toml present");
+        assert_eq!(flipped.org.as_str(), "hypermemetic-ai", "config.toml org must flip");
+    }
+
+    /// The target org must already exist — migration never creates it.
+    #[tokio::test]
+    async fn test_migrate_org_target_must_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let orgs_dir = config_dir.join("orgs");
+        std::fs::create_dir_all(&orgs_dir).unwrap();
+        let repo = OrgRepo {
+            name: RepoName::from("widget"),
+            remotes: vec![ssh_remote("hypermemetic", "widget")],
+            forges: None,
+            metadata: None,
+        };
+        save_org(&orgs_dir, &org_with_repo("hypermemetic", vec![repo])).unwrap();
+
+        let hub = ReposHub::with_config_dir(config_dir.clone());
+        let events: Vec<RepoEvent> = hub
+            .migrate_org(
+                "hypermemetic".into(),
+                "widget".into(),
+                "ghost-org".into(),
+                None,
+                None,
+            )
+            .await
+            .collect()
+            .await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RepoEvent::Error { code: Some(c), .. } if c == "org_not_found"
+            )),
+            "expected org_not_found error, got {events:?}",
+        );
+        // Source org untouched.
+        let reloaded = load_all(&config_dir).unwrap();
+        let source = reloaded.orgs.get(&OrgName::from("hypermemetic")).unwrap();
+        assert!(find_repo(source, "widget").is_some(), "source must be untouched on failure");
+    }
+
+    /// `dry_run` performs no writes.
+    #[tokio::test]
+    async fn test_migrate_org_dry_run_no_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let orgs_dir = config_dir.join("orgs");
+        std::fs::create_dir_all(&orgs_dir).unwrap();
+        let repo = OrgRepo {
+            name: RepoName::from("widget"),
+            remotes: vec![ssh_remote("hypermemetic", "widget")],
+            forges: None,
+            metadata: None,
+        };
+        save_org(&orgs_dir, &org_with_repo("hypermemetic", vec![repo])).unwrap();
+        save_org(&orgs_dir, &org_with_repo("hypermemetic-ai", vec![])).unwrap();
+
+        let hub = ReposHub::with_config_dir(config_dir.clone());
+        let events: Vec<RepoEvent> = hub
+            .migrate_org(
+                "hypermemetic".into(),
+                "widget".into(),
+                "hypermemetic-ai".into(),
+                None,
+                Some(serde_json::Value::Bool(true)),
+            )
+            .await
+            .collect()
+            .await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RepoEvent::RepoMigrated { dry_run: true, .. }
+            )),
+            "expected dry-run RepoMigrated, got {events:?}",
+        );
+        // Membership unchanged on disk.
+        let reloaded = load_all(&config_dir).unwrap();
+        let source = reloaded.orgs.get(&OrgName::from("hypermemetic")).unwrap();
+        let target = reloaded.orgs.get(&OrgName::from("hypermemetic-ai")).unwrap();
+        assert!(find_repo(source, "widget").is_some(), "dry_run must not move repo");
+        assert!(find_repo(target, "widget").is_none(), "dry_run must not write target");
+    }
+}
