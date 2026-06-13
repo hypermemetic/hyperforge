@@ -346,6 +346,75 @@ pub async fn privatize_on_forge(
         .map(|_| ())
 }
 
+/// Resolve a repo's CANONICAL owner on its forge, following any
+/// rename/transfer redirect (org-diff). Thin wrapper over the adapter's
+/// `canonical_owner` that mirrors `exists_on_forge`'s shape so hubs never
+/// touch the adapter directly.
+pub async fn canonical_owner_on_forge(
+    remote: &Remote,
+    repo_ref: &RepoRef,
+    provider_map: &BTreeMap<DomainName, ProviderKind>,
+    resolver: &dyn SecretResolver,
+    token_ref: Option<&str>,
+    fallback_token_ref: Option<String>,
+) -> Result<String, ForgePortError> {
+    let provider = derive_provider(remote, provider_map)
+        .map_err(|e| ForgePortError::new(ForgeErrorClass::Network, e))?;
+    let adapter = for_provider(provider);
+    let auth = ForgeAuth { token_ref, fallback_token_ref, resolver };
+    adapter.canonical_owner(remote, repo_ref, &auth).await
+}
+
+// ---------------------------------------------------------------------
+// Org-diff — discover which repos moved between two orgs on the forge.
+// Read-only; the bucketing is pure so it unit-tests against an injected
+// resolver. The `moved` bucket is the exact `members` argument an
+// operator then feeds to `workspaces.migrate_org`.
+// ---------------------------------------------------------------------
+
+/// Bucket a single repo lands in after resolving its canonical owner
+/// against the forge, relative to a `(from_org, to_org)` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgDiffVerdict {
+    /// Canonical owner == `to_org`: the repo moved as intended.
+    Moved,
+    /// Canonical owner == `from_org`: the repo did NOT move.
+    Stayed,
+    /// Canonical owner is some third org/user.
+    Elsewhere,
+    /// Repo not found on the forge at all.
+    Missing,
+}
+
+impl OrgDiffVerdict {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Moved => "moved",
+            Self::Stayed => "stayed",
+            Self::Elsewhere => "elsewhere",
+            Self::Missing => "missing",
+        }
+    }
+
+    /// Pure classifier: given the forge's canonical-owner answer for a
+    /// repo (`Ok(owner)` or `Err(class)`), bucket it. A `not_found`
+    /// forge error → `Missing`; any other forge error → `Elsewhere`
+    /// is NOT assumed — errors other than not_found are surfaced by the
+    /// caller as a per-repo error event, so this only handles the
+    /// resolved-owner and not-found cases.
+    #[must_use]
+    pub fn classify(canonical_owner: &str, from_org: &str, to_org: &str) -> Self {
+        if canonical_owner == to_org {
+            Self::Moved
+        } else if canonical_owner == from_org {
+            Self::Stayed
+        } else {
+            Self::Elsewhere
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Sync — single source of truth, called by both hubs (V5LIFECYCLE-3).
 // ---------------------------------------------------------------------
@@ -640,6 +709,68 @@ mod tests {
             default_token_ref_for(&org),
             "secrets://github/_default/token",
         );
+    }
+
+    #[test]
+    fn test_org_diff_verdict_classify() {
+        use super::OrgDiffVerdict as V;
+        // moved: canonical owner is the target org.
+        assert_eq!(
+            V::classify("hypermemetic-ai", "hypermemetic", "hypermemetic-ai"),
+            V::Moved,
+        );
+        // stayed: canonical owner is still the source org.
+        assert_eq!(
+            V::classify("hypermemetic", "hypermemetic", "hypermemetic-ai"),
+            V::Stayed,
+        );
+        // elsewhere: some third owner.
+        assert_eq!(
+            V::classify("someone-else", "hypermemetic", "hypermemetic-ai"),
+            V::Elsewhere,
+        );
+    }
+
+    #[test]
+    fn test_org_diff_verdict_as_str() {
+        use super::OrgDiffVerdict as V;
+        assert_eq!(V::Moved.as_str(), "moved");
+        assert_eq!(V::Stayed.as_str(), "stayed");
+        assert_eq!(V::Elsewhere.as_str(), "elsewhere");
+        assert_eq!(V::Missing.as_str(), "missing");
+    }
+
+    /// The discovery→migration composition: bucketing 53 declared repos
+    /// where only some moved yields exactly the `moved` set that
+    /// `workspaces.migrate_org` should receive as `members` — never
+    /// over-migrating the ones that stayed.
+    #[test]
+    fn test_org_diff_buckets_partial_migration() {
+        use super::OrgDiffVerdict as V;
+        let from = "hypermemetic";
+        let to = "hypermemetic-ai";
+        // (repo, canonical owner the forge reports)
+        let forge_truth = [
+            ("alpha", "hypermemetic-ai"), // moved
+            ("beta", "hypermemetic"),     // stayed
+            ("gamma", "hypermemetic-ai"), // moved
+            ("delta", "third-party"),     // elsewhere
+        ];
+        let mut moved = Vec::new();
+        let mut stayed = Vec::new();
+        let mut elsewhere = Vec::new();
+        for (repo, owner) in forge_truth {
+            match V::classify(owner, from, to) {
+                V::Moved => moved.push(repo),
+                V::Stayed => stayed.push(repo),
+                V::Elsewhere => elsewhere.push(repo),
+                V::Missing => unreachable!(),
+            }
+        }
+        // The `moved` set is exactly what migrate_org's members must be.
+        assert_eq!(moved, vec!["alpha", "gamma"]);
+        assert_eq!(stayed, vec!["beta"]);
+        assert_eq!(elsewhere, vec!["delta"]);
     }
 
     #[test]

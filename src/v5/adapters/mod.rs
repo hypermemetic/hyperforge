@@ -367,6 +367,26 @@ pub trait ForgePort: Send + Sync {
         new_name: &str,
         auth: &ForgeAuth<'_>,
     ) -> Result<(), ForgePortError>;
+
+    /// Resolve the repo's CANONICAL owner (org/user login) on the forge,
+    /// following any rename/redirect the forge applied. Equivalent to
+    /// `gh api repos/<org>/<name> --jq .owner.login`, which transparently
+    /// follows org transfers and repo renames. Returns the current owner
+    /// login — which may differ from `repo_ref.org` when the repo moved.
+    ///
+    /// `Err { class: not_found }` when the repo doesn't exist anywhere on
+    /// the forge. The default impl returns `unsupported_field`; only
+    /// adapters that can follow redirects override it.
+    async fn canonical_owner(
+        &self,
+        _remote: &Remote,
+        _repo_ref: &RepoRef,
+        _auth: &ForgeAuth<'_>,
+    ) -> Result<String, ForgePortError> {
+        Err(ForgePortError::unsupported_field(
+            "canonical_owner is not implemented for this provider",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------
