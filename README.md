@@ -19,12 +19,12 @@ If you've already authenticated with `gh`, the entire onboarding is two commands
 hyperforge --port 44104 --config-dir ~/.config/hyperforge &
 
 # Onboarding (one RPC composes secret + org + credential + import)
-synapse -P 44104 --json lforge-v5 hyperforge orgs bootstrap \
+synapse -P 44104 --json lforge hyperforge orgs bootstrap \
     --name <my-org> --provider github \
     --token gh-token:// --use_default_token true
 
 # Materialize a checkout for everything tracked
-synapse -P 44104 --json lforge-v5 hyperforge workspaces from_org \
+synapse -P 44104 --json lforge hyperforge workspaces from_org \
     --org <my-org> --target_path ~/code/<my-org>
 ```
 
@@ -55,11 +55,13 @@ hyperforge (port 44104)
 
 ## CLI invocation
 
-The daemon's namespace is `lforge-v5` (Plexus naming). Two equivalent forms:
+The daemon's namespace is `lforge` (Plexus naming — normalized from
+the transitional `lforge-v5` once v4 retired to `lforge-deprecated`).
+Two equivalent forms:
 
 ```bash
 # Standalone daemon (v5 default — recommended)
-synapse -P 44104 --json lforge-v5 hyperforge <namespace> <method> --param value …
+synapse -P 44104 --json lforge hyperforge <namespace> <method> --param value …
 
 # When embedded in a substrate Plexus server
 synapse substrate hyperforge <namespace> <method> --param value …

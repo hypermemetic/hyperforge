@@ -101,7 +101,7 @@ __hf_wait_ready() {
         # 0 unconditionally, which made this poll a no-op (it "passed" on
         # the first iteration even before the daemon was listening; under
         # CPU contention the first real command then hit a dead port).
-        if "$__HF_SYNAPSE_BIN" -P "$port" --json lforge-v5 hyperforge status >/dev/null 2>&1; then
+        if "$__HF_SYNAPSE_BIN" -P "$port" --json lforge hyperforge status >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.2
@@ -286,7 +286,7 @@ hf_load_fixture() {
     cp -a "$src/." "$HF_CONFIG/"
 }
 
-# Run `synapse -P $HF_PORT --json lforge-v5 hyperforge <args...>` and
+# Run `synapse -P $HF_PORT --json lforge hyperforge <args...>` and
 # emit the per-event content as NDJSON on stdout. Synapse's transport
 # wrapper (`{type: data, content: {...}}`) is unwrapped so callers can
 # match on content fields directly (e.g. `.type == "status"`).
@@ -336,7 +336,7 @@ hf_cmd() {
     # valid test outcome once hf_spawn's readiness poll has passed, so
     # retry it (bounded) before surfacing.
     for attempt in 1 2 3; do
-        raw="$(synapse -P "$HF_PORT" --json lforge-v5 hyperforge "${translated[@]}" 2>&1)"
+        raw="$(synapse -P "$HF_PORT" --json lforge hyperforge "${translated[@]}" 2>&1)"
         rc=$?
         if [[ "$raw" != *"Protocol handshake failed"* ]]; then
             break
@@ -399,9 +399,9 @@ __hf_emit_schema_for() {
     local child_seg="$1"  # "" = root
     local schema_json
     if [[ -z "$child_seg" ]]; then
-        schema_json="$(synapse -P "$HF_PORT" -s lforge-v5 hyperforge 2>&1)"
+        schema_json="$(synapse -P "$HF_PORT" -s lforge hyperforge 2>&1)"
     else
-        schema_json="$(synapse -P "$HF_PORT" -s lforge-v5 hyperforge "$child_seg" 2>&1)"
+        schema_json="$(synapse -P "$HF_PORT" -s lforge hyperforge "$child_seg" 2>&1)"
     fi
     if ! printf '%s' "$schema_json" | jq -e . >/dev/null 2>&1; then
         return 1
@@ -467,7 +467,7 @@ __hf_emit_capability_probe() {
         return 0
     fi
     local raw
-    raw="$(synapse -P "$HF_PORT" --json lforge-v5 hyperforge "$child" "$method" 2>&1)"
+    raw="$(synapse -P "$HF_PORT" --json lforge hyperforge "$child" "$method" 2>&1)"
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         if printf '%s' "$line" | jq -e . >/dev/null 2>&1; then

@@ -2,7 +2,8 @@
 //!
 //! Listens on `--port` (default 44104, pinned in CONTRACTS D1 since
 //! v5 became the canonical hyperforge in 5.0.0), registers a Plexus
-//! `DynamicHub` namespaced as `lforge-v5` (D1), and serves
+//! `DynamicHub` namespaced as `lforge` (D1, normalized from the
+//! transitional `lforge-v5` once v4 was retired), and serves
 //! `HyperforgeHub` over WebSocket JSON-RPC.
 //!
 //! v4 still builds as `hyperforge-legacy` for one release as a
@@ -103,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the activation tree.
     let lforge = Arc::new(
-        DynamicHub::new("lforge-v5")
+        DynamicHub::new("lforge")
             .register(HyperforgeHub::new(config_dir.clone())),
     );
 
