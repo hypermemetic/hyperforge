@@ -8,7 +8,7 @@ use futures::Stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v5::build::{diff, dist, exec, manifest, registry, release};
+use crate::v5::build::{diff, dist, exec, manifest, patches, registry, release};
 use crate::v5::config::{OrgName, WorkspaceRepo};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -154,6 +154,20 @@ pub enum BuildEvent {
         failed: u32,
         skipped: u32,
         auto_bumped: u32,
+    },
+
+    // Local-patch detection events.
+    PatchFinding {
+        #[serde(rename = "ref")]
+        reference: crate::v5::repos::RepoRefWire,
+        #[serde(flatten)]
+        finding: patches::Finding,
+    },
+    PatchSummary {
+        name: String,
+        repos_scanned: u32,
+        repos_with_patches: u32,
+        findings: u32,
     },
 
     Error {
@@ -328,6 +342,50 @@ impl BuildHub {
             } else {
                 yield BuildEvent::ValidateFailed { name, total, failed };
             }
+        }
+    }
+
+    /// Detect local dependency patching across the workspace,
+    /// language-agnostic. Two categories: `declared_override`
+    /// (Cargo `[patch]`/`[replace]`/`path =`, Go local `replace`,
+    /// npm `file:`/`link:`/`resolutions`/patch-package, Python
+    /// editable/poetry `path`, Composer `path` repos, Ruby
+    /// `path:`/`git:` gems, Gradle `includeBuild`, Maven system
+    /// paths) and `vendored_edit` (uncommitted edits inside a
+    /// checked-in `vendor/`/`third_party/` tree). Emits one
+    /// `PatchFinding` per signal, then a `PatchSummary`.
+    #[plexus_macros::method(params(name = "Workspace name"))]
+    pub async fn detect_patches(
+        &self,
+        name: String,
+    ) -> impl Stream<Item = BuildEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let members = match workspace_members(&config_dir, &name) {
+                Ok(v) => v, Err(e) => { yield err("not_found", e); return; }
+            };
+            let repos_scanned = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            let mut repos_with_patches = 0u32;
+            let mut findings = 0u32;
+            for (r, dir) in members {
+                let hits = patches::scan_repo(&dir);
+                if !hits.is_empty() {
+                    repos_with_patches += 1;
+                }
+                for finding in hits {
+                    findings += 1;
+                    yield BuildEvent::PatchFinding {
+                        reference: r.clone(),
+                        finding,
+                    };
+                }
+            }
+            yield BuildEvent::PatchSummary {
+                name,
+                repos_scanned,
+                repos_with_patches,
+                findings,
+            };
         }
     }
 
