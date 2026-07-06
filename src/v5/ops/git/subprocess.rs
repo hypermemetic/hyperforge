@@ -87,6 +87,37 @@ pub(super) fn status(dir: &Path) -> Result<StatusSnapshot, GitError> {
     Ok(parse_status(&out))
 }
 
+/// Working-tree paths with uncommitted changes (modified, staged, or
+/// untracked), relative to the repo root. Rename entries resolve to the
+/// new path. Used by `build::patches` to spot hand-edited vendored
+/// dependency trees.
+pub(super) fn changed_paths(dir: &Path) -> Result<Vec<String>, GitError> {
+    ensure_git_repo(dir)?;
+    let out = run_git_capture(
+        None,
+        &[
+            "-C",
+            dir.to_str().unwrap_or(""),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
+    )?;
+    let mut paths = Vec::new();
+    for line in out.lines() {
+        // Porcelain v1: `XY <path>` or `XY <orig> -> <new>` for renames.
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = &line[3..];
+        let p = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+        if !p.is_empty() {
+            paths.push(p.to_string());
+        }
+    }
+    Ok(paths)
+}
+
 pub(super) fn is_dirty(dir: &Path) -> Result<bool, GitError> {
     status(dir).map(|s| s.dirty())
 }

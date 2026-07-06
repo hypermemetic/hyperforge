@@ -111,6 +111,29 @@ echo "$out" | hf_assert_event '.type == "name_mismatch" and .ref.name == "beta" 
 out=$(hf_cmd build package_diff --name main --from_ref HEAD~1 --to_ref HEAD)
 echo "$out" | hf_assert_event '.type == "package_diff_entry" and .kind == "version_changed" and .from == "0.1.0" and .to == "0.2.0"'
 
+# --- detect_patches: clean tree reports zero findings, then a local
+#     [patch] + path dep introduced into alpha is flagged ---
+out=$(hf_cmd build detect_patches --name main)
+echo "$out" | hf_assert_event '.type == "patch_summary" and .findings == 0'
+
+cat > "$ALPHA/Cargo.toml" <<'TOML'
+[package]
+name = "alpha"
+version = "0.2.0"
+
+[dependencies]
+serde = "1.0.200"
+beta-pkg = { path = "../beta" }
+
+[patch.crates-io]
+serde = { git = "https://example.invalid/serde" }
+TOML
+
+out=$(hf_cmd build detect_patches --name main)
+echo "$out" | hf_assert_event '.type == "patch_finding" and .ecosystem == "cargo" and .kind == "patch_table" and (.detail | contains("serde"))'
+echo "$out" | hf_assert_event '.type == "patch_finding" and .kind == "path_dep" and (.detail | contains("beta-pkg"))'
+echo "$out" | hf_assert_event '.type == "patch_summary" and .repos_with_patches == 1 and .findings >= 2'
+
 rm -rf "$TMP"
 hf_teardown
 echo "PASS"
