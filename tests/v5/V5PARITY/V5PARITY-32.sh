@@ -59,7 +59,7 @@ nohup target/debug/hyperforge --port "$PORT" --config-dir "$TMP" \
     >/tmp/v5parity32-daemon.log 2>&1 &
 PID=$!
 sleep 1.5
-if synapse -P "$PORT" --json lforge-v5 hyperforge status 2>&1 | grep -q '"version":"5'; then
+if synapse -P "$PORT" --json lforge hyperforge status 2>&1 | grep -q '"version":"5'; then
     echo "daemon: hyperforge --port $PORT responds with v5 status"
 else
     kill $PID 2>/dev/null

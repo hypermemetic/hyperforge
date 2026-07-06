@@ -15,7 +15,7 @@ mv ~/.config/hyperforge/orgs/<each-org>/ ~/.config/hyperforge/orgs/<org>.v4.bak/
 hyperforge --port 44104 --config-dir ~/.config/hyperforge &
 
 # 4. Onboard each org with the new one-RPC flow.
-synapse -P 44104 --json lforge-v5 hyperforge orgs bootstrap \
+synapse -P 44104 --json lforge hyperforge orgs bootstrap \
     --name <org> --provider github \
     --token gh-token:// --use_default_token true
 ```
@@ -38,7 +38,7 @@ synapse -P 44104 --json lforge-v5 hyperforge orgs bootstrap \
 | Workspaces | implicit (via `OrgConfig.workspace_path`) | explicit `workspaces/<name>.yaml`, first-class |
 | Auth setup | `auth_setup` (interactive wizard) | `orgs.bootstrap --token gh-token://` (one RPC) |
 | Token sharing | per-org duplicate entries | provider-default `secrets://github/_default/token` (V5PARITY-24) |
-| Plexus namespace | `lforge` | `lforge-v5` (during the transition; will normalize in 6.0.0) |
+| Plexus namespace | `lforge-deprecated` (v4 retired to this name) | `lforge` (normalized: v5 owns the canonical name) |
 | Activation tree | flat: `repo`, `workspace`, `build` | nested: `orgs`, `repos`, `workspaces`, `secrets`, `build` |
 
 ## v4 features still missing in v5 (Pending)
@@ -69,16 +69,16 @@ hyperforge --port 44104 &          # v5 on the canonical port
 
 ```bash
 # 1. v5 daemon up?
-synapse -P 44104 --json lforge-v5 hyperforge status
+synapse -P 44104 --json lforge hyperforge status
 
 # 2. Orgs registered?
-synapse -P 44104 --json lforge-v5 hyperforge orgs list
+synapse -P 44104 --json lforge hyperforge orgs list
 
 # 3. Auth works against the forge?
-synapse -P 44104 --json lforge-v5 hyperforge auth_check --org <org>
+synapse -P 44104 --json lforge hyperforge auth_check --org <org>
 
 # 4. Workspace state matches disk?
-synapse -P 44104 --json lforge-v5 hyperforge workspaces status --name <ws>
+synapse -P 44104 --json lforge hyperforge workspaces status --name <ws>
 ```
 
 If all four return without errors, v5 is fully your daily driver.

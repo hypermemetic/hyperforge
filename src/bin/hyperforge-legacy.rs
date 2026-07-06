@@ -36,7 +36,7 @@ struct Args {
     registry_port: u16,
 
     /// Name to register as in the registry
-    #[arg(long, default_value = "lforge")]
+    #[arg(long, default_value = "lforge-deprecated")]
     registry_name: String,
 }
 
@@ -81,15 +81,18 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting hyperforge at {}", chrono::Utc::now());
 
-    // Create lforge hub (DynamicHub with "lforge" namespace, hyperforge activation registered)
+    // Create the v4 hub (DynamicHub with "lforge-deprecated" namespace —
+    // v5 owns the canonical "lforge" name since the 5.0.0 normalization;
+    // this binary stays around as a migration courtesy and will be
+    // removed in 6.0.0).
     let lforge = Arc::new(
-        DynamicHub::new("lforge")
+        DynamicHub::new("lforge-deprecated")
             .register(HyperforgeHub::new())
     );
 
     // Log activation info
-    tracing::info!("LFORGE2 initialized");
-    tracing::info!("  Namespace: lforge");
+    tracing::info!("LFORGE2 (v4 deprecated) initialized");
+    tracing::info!("  Namespace: lforge-deprecated");
     tracing::info!("  Activation: hyperforge");
     tracing::info!("  Version: {}", env!("CARGO_PKG_VERSION"));
     tracing::info!("  Description: Multi-forge repository management");
@@ -102,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
             host: "127.0.0.1".into(),
             port: args.port,
             description: "Multi-forge repository management".into(),
-            namespace: "lforge".into(),
+            namespace: "lforge-deprecated".into(),
         };
         let client = RegistryClient::new(config);
 
