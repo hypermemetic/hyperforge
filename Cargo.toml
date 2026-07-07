@@ -39,10 +39,11 @@ name = "hyperforge-ssh"
 path = "src/bin/hyperforge-ssh.rs"
 
 [dependencies]
-# Hub framework integration
-plexus-core = "0.5"
-plexus-macros = "0.5"
-plexus-transport = "0.2"
+# Hub framework integration — 0.6 generation (PLX-11). 0.6 is unpublished:
+# sibling path deps with version guards, per the PLX-9 migration recipe.
+plexus-core = { path = "../plexus-core", version = "0.6" }
+plexus-macros = { path = "../plexus-macros", version = "0.6" }
+plexus-transport = { path = "../plexus-transport", version = "0.4" }
 
 # Async
 tokio = { version = "1", features = ["full"] }

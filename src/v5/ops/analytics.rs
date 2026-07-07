@@ -164,8 +164,12 @@ fn classify(path: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    fn mktmp() -> PathBuf {
-        let base = std::env::temp_dir().join(format!("v5-analytics-{}", std::process::id()));
+    /// Per-test temp dir. Keyed on the test name as well as the pid:
+    /// tests in one binary run in parallel threads, so a pid-only dir is
+    /// shared state — one test's `remove_dir_all` races another's asserts
+    /// (observed as intermittent failures of any one analytics test).
+    fn mktmp(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("v5-analytics-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         base
@@ -173,7 +177,7 @@ mod tests {
 
     #[test]
     fn size_skips_dotgit() {
-        let d = mktmp();
+        let d = mktmp("size_skips_dotgit");
         std::fs::write(d.join("a.txt"), b"hello").unwrap();
         std::fs::create_dir_all(d.join(".git")).unwrap();
         std::fs::write(d.join(".git").join("ignored.txt"), b"nope").unwrap();
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn loc_groups_by_extension() {
-        let d = mktmp();
+        let d = mktmp("loc_groups_by_extension");
         std::fs::write(d.join("a.rs"), "fn main() {}\n// line\n").unwrap();
         std::fs::write(d.join("b.rs"), "pub fn x() {}\n").unwrap();
         std::fs::write(d.join("c.toml"), "[a]\nb = 1\n").unwrap();
@@ -195,7 +199,7 @@ mod tests {
 
     #[test]
     fn large_files_filters_and_sorts() {
-        let d = mktmp();
+        let d = mktmp("large_files_filters_and_sorts");
         std::fs::write(d.join("tiny"), &[0u8; 10]).unwrap();
         std::fs::write(d.join("big"), &[0u8; 1024]).unwrap();
         std::fs::write(d.join("huge"), &[0u8; 4096]).unwrap();

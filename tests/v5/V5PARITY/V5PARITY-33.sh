@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# tier: 1 (source-shape) + tier 2 (real github with private repos).
+# tier: 1
+# (Tier 1 = source-shape checks; the tier-2 half — real github with private
+# repos — self-gates below on HF_V5_TEST_CONFIG_DIR and skips when unset.)
 # V5PARITY-33: list_repos uses /user/repos when target is the authed user.
 set -euo pipefail
 source "$(dirname "$0")/../harness/lib.sh"

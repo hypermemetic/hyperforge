@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tier: 1 (brew-push + distribution publishing are tier-2 and not exercised here).
+# tier: 1
+# (brew-push + distribution publishing are tier-2 and not exercised here.)
 # V5PARITY-11 acceptance: build.{init_configs, binstall_init, brew_formula,
 #   dist_init, dist_show, run, exec}.
 set -euo pipefail

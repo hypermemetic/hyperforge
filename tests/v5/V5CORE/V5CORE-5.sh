@@ -19,11 +19,12 @@ echo "$out" | hf_assert_event '.type == "status" and (.config_dir | endswith("/"
 hf_config_abs=$(readlink -f "$HF_CONFIG")
 echo "$out" | hf_assert_event ".type == \"status\" and .config_dir == \"$hf_config_abs\""
 
-# Schema: root has exactly one method (status) at this ticket's baseline.
-# V5CORE-6/7/8 add children (not methods), so this count stays 1 after
-# those land too.
+# Schema: the root hub exposes `status`. (V5CORE-5's original baseline
+# asserted exactly one method; later tickets legitimately added root
+# methods — auth_check, reload, config_*, begin — so assert the shape,
+# not a count that goes stale with every root-method addition.)
 schema=$(hf_cmd __schema__ 2>/dev/null || hf_cmd)
-echo "$schema" | hf_assert_count '.activation == "HyperforgeHub" and (.methods | length) == 1' 1
+echo "$schema" | hf_assert_count '.activation == "HyperforgeHub" and (.methods | index("status")) != null' 1
 
 hf_teardown
 echo "PASS"

@@ -97,7 +97,11 @@ __hf_wait_ready() {
     local port="$1"
     local deadline=$(( $(date +%s) + 15 ))
     while (( $(date +%s) < deadline )); do
-        if synapse -P "$port" --json lforge-v5 hyperforge status >/dev/null 2>&1; then
+        # NB: must bypass the synapse() wrapper — it folds the exit code to
+        # 0 unconditionally, which made this poll a no-op (it "passed" on
+        # the first iteration even before the daemon was listening; under
+        # CPU contention the first real command then hit a dead port).
+        if "$__HF_SYNAPSE_BIN" -P "$port" --json lforge-v5 hyperforge status >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.2
@@ -325,9 +329,20 @@ hf_cmd() {
         fi
     done
 
-    local raw rc
-    raw="$(synapse -P "$HF_PORT" --json lforge-v5 hyperforge "${translated[@]}" 2>&1)"
-    rc=$?
+    local raw rc attempt
+    # Under parallel `cargo test` dozens of daemons + synapse handshakes
+    # compete for CPU; synapse's fixed 2s _info timeout can then trip on a
+    # perfectly healthy daemon. A transient handshake failure is never a
+    # valid test outcome once hf_spawn's readiness poll has passed, so
+    # retry it (bounded) before surfacing.
+    for attempt in 1 2 3; do
+        raw="$(synapse -P "$HF_PORT" --json lforge-v5 hyperforge "${translated[@]}" 2>&1)"
+        rc=$?
+        if [[ "$raw" != *"Protocol handshake failed"* ]]; then
+            break
+        fi
+        sleep 0.5
+    done
 
     # Unwrap NDJSON events. Non-JSON lines (CLI errors, banners) are
     # surfaced as a synthetic error event.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# tier: 1 (bump + release-without-publish)
-# tier: 2 for actual publish flow — skipped when HF_V5_TEST_CONFIG_DIR not set.
+# tier: 1
+# (Tier 1 = bump + release-without-publish; the actual publish flow is
+# tier-2 and skipped when HF_V5_TEST_CONFIG_DIR is not set.)
 # V5PARITY-10 acceptance: build.{bump, publish, release, release_all}.
 set -euo pipefail
 source "$(dirname "$0")/../harness/lib.sh"
