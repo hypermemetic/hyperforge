@@ -6,6 +6,7 @@
 //! adds build-specific parsing + templating on top.
 
 pub mod manifest;
+pub mod patches;
 pub mod diff;
 pub mod release;
 pub mod exec;

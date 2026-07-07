@@ -150,6 +150,13 @@ pub fn is_dirty(dir: &Path) -> Result<bool, GitError> {
     }
 }
 
+/// Working-tree paths with uncommitted changes (relative to repo root).
+/// Subprocess-only: no other call site needs a path-level listing, and
+/// porcelain parsing is identical across platforms/backends.
+pub fn changed_paths(dir: &Path) -> Result<Vec<String>, GitError> {
+    subprocess::changed_paths(dir)
+}
+
 pub fn add(dir: &Path, paths: &[&str]) -> Result<(), GitError> {
     if force_subprocess() {
         subprocess::add(dir, paths)

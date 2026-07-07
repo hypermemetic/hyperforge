@@ -46,7 +46,7 @@ hf_cmd repos add --org "$ORG" --name "$TEMP_REPO3" \
     --remotes "[{\"url\":\"https://github.com/${ORG}/${TEMP_REPO3}.git\"}]" \
     --create_remote true --visibility private >/dev/null
 hf_put_secret "secrets://gh-token-blank" ""
-sed -i 's|key: secrets://[^[:space:]]*|key: secrets://gh-token-blank|' "$HF_CONFIG/orgs/${ORG}.yaml"
+sed -i.sedbak 's|key: secrets://[^[:space:]]*|key: secrets://gh-token-blank|' "$HF_CONFIG/orgs/${ORG}.yaml" && rm -f "$HF_CONFIG/orgs/${ORG}.yaml.sedbak"
 set +e
 err=$(hf_cmd repos delete --org "$ORG" --name "$TEMP_REPO3" --delete_remote true 2>&1)
 set -e

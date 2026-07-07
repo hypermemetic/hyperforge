@@ -6,8 +6,9 @@ source "$(dirname "$0")/../harness/lib.sh"
 # Spawn daemon on ephemeral port (harness isolates from v4 on 44104).
 hf_spawn
 
-# Registry shows lforge-v5 on our port.
-synapse -P "$HF_PORT" list | hf_assert_event '.name == "lforge-v5"'
+# Registry shows lforge on our port (normalized from lforge-v5 once v4
+# retired; v4 binary now registers as lforge-deprecated).
+synapse -P "$HF_PORT" list | hf_assert_event '.name == "lforge"'
 
 # Schema introspection: root HyperforgeHub has zero methods and zero children
 # at the V5CORE-2 baseline. (This script is the V5CORE-2 acceptance — later

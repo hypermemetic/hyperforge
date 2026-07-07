@@ -33,7 +33,7 @@ hf_cmd repos push --org "$ORG" --name "$REPO" --fields "{\"description\":\"$orig
 
 # --- auth error: point the org cred ref at a blank secret ---
 hf_put_secret "secrets://gh-token-blank" ""
-sed -i 's|key: secrets://[^[:space:]]*|key: secrets://gh-token-blank|' "$HF_CONFIG/orgs/${ORG}.yaml"
+sed -i.sedbak 's|key: secrets://[^[:space:]]*|key: secrets://gh-token-blank|' "$HF_CONFIG/orgs/${ORG}.yaml" && rm -f "$HF_CONFIG/orgs/${ORG}.yaml.sedbak"
 set +e
 err=$(hf_cmd repos sync --org "$ORG" --name "$REPO" 2>&1)
 set -e

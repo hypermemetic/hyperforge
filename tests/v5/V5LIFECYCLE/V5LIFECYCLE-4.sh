@@ -13,7 +13,7 @@ source "$(dirname "$0")/../harness/lib.sh"
 cd "$(dirname "$0")/../../.."
 # Catches direct adapter lifecycle calls and dispatch calls outside
 # the ops/ and adapters/ subtrees. Excludes doc comments.
-violations=$(grep -RnE '[^/]adapter\.(create_repo|delete_repo|repo_exists)|[^a-z:]for_provider\(' src/v5/ 2>/dev/null \
+violations=$(grep -RnE '[^/]adapter\.(create_repo|delete_repo|repo_exists)|[^a-z:_]for_provider\(' src/v5 2>/dev/null \
     | grep -vE '^src/v5/(ops|adapters)/' \
     | grep -vE '^[^:]+:[^:]+:\s*///' || true)
 if [[ -n "$violations" ]]; then

@@ -17,7 +17,7 @@ source "$(dirname "$0")/../harness/lib.sh"
 
 # (a) structural grep — DRY enforcement for the extracted helpers.
 cd "$(dirname "$0")/../../.."
-violations=$(grep -RE 'adapter\.(read_metadata|write_metadata)|compute_drift\(' src/v5/ 2>/dev/null \
+violations=$(grep -RE 'adapter\.(read_metadata|write_metadata)|compute_drift\(' src/v5 2>/dev/null \
     | grep -vE '^src/v5/ops/' || true)
 if [[ -n "$violations" ]]; then
     echo "DRY violation — direct adapter read/write or compute_drift outside ops/:"

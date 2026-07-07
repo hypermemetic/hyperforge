@@ -40,7 +40,7 @@ hf_spawn
 hf_load_fixture org_with_repo
 # Remove github.com entry. Fixture shape is known; a targeted sed line
 # removal is sufficient and avoids a yaml-parser dep.
-sed -i '/^[[:space:]]*github\.com:[[:space:]]*github[[:space:]]*$/d' "$HF_CONFIG/config.yaml"
+sed -i.sedbak '/^[[:space:]]*github\.com:[[:space:]]*github[[:space:]]*$/d' "$HF_CONFIG/config.yaml" && rm -f "$HF_CONFIG/config.yaml.sedbak"
 set +e
 out=$(hf_cmd repos get --org demo --name widget 2>&1)
 set -e

@@ -20,7 +20,7 @@ grep_violation() {
     local hits
     # Always also exclude doc-comment lines (`///`) — textual mentions
     # of adapter methods in documentation aren't actual calls.
-    hits=$(grep -RnE "$pattern" src/v5/ 2>/dev/null \
+    hits=$(grep -RnE "$pattern" src/v5 2>/dev/null \
         | grep -vE "$exclude" \
         | grep -vE '^[^:]+:[0-9]+:\s*///' \
         | grep -vE '^[^:]+:[0-9]+:.*\s*//[^/]' \
@@ -42,7 +42,7 @@ grep_violation() {
 grep_violation "yaml-io"      'serde_yaml::(from_str|to_string|from_reader)' '^src/v5/(ops|secrets|config\.rs)'
 grep_violation "adapter-meta" '[^/]adapter\.(read_metadata|write_metadata)' '^src/v5/ops/'
 grep_violation "adapter-life" '[^/]adapter\.(create_repo|delete_repo|repo_exists|update_repo)' '^src/v5/ops/'
-grep_violation "for_provider" '[^a-z:]for_provider\(' '^src/v5/(ops|adapters)/'
+grep_violation "for_provider" '[^a-z:_]for_provider\(' '^src/v5/(ops|adapters)/'
 grep_violation "compute_drift" '[^a-z_]compute_drift\(' '^src/v5/ops/'
 # V5PARITY-12 new invariant: `Command::new("git")` lives in ops/git/* only.
 # V5PARITY-15 widened the path scope from a single file to the dir after

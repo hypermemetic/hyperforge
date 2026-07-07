@@ -39,7 +39,7 @@ echo "$out" | hf_assert_event '.type == "repo_dismissed" and .already == true'
 hf_cmd repos protect --org "$ORG" --name "$REPO" --protected true >/dev/null 2>&1 || true
 # Un-dismiss it to test the active+protected path. (Implementer may also
 # provide an undismiss method; for this test we hand-edit the metadata.)
-sed -i 's/lifecycle: dismissed/lifecycle: active/' "$HF_CONFIG/orgs/${ORG}.yaml"
+sed -i.sedbak 's/lifecycle: dismissed/lifecycle: active/' "$HF_CONFIG/orgs/${ORG}.yaml" && rm -f "$HF_CONFIG/orgs/${ORG}.yaml.sedbak"
 set +e
 err=$(hf_cmd repos delete --org "$ORG" --name "$REPO" 2>&1)
 set -e

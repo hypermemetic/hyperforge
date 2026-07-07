@@ -75,13 +75,13 @@ grep -q 'codeberg' "$CHECKOUT/.hyperforge/config.toml"
 echo "push: yaml content materialized to file"
 
 # --- (7) Empty `forges` ([]) means "scoped to no forges" — sync emits forge_excluded. ---
-sed -i 's/forges:.*$/forges: []/' "$HF_CONFIG/orgs/demo.yaml"
+sed -i.sedbak 's/forges:.*$/forges: []/' "$HF_CONFIG/orgs/demo.yaml" && rm -f "$HF_CONFIG/orgs/demo.yaml.sedbak"
 out=$(hf_cmd repos sync --org demo --name widget --include_metadata false)
 echo "$out" | hf_assert_no_event '.type == "sync_diff"'
 echo "forges=[]: sync emits no per-remote sync_diff"
 
 # --- (8) Repos with forges=null behave like before (no filter). ---
-sed -i '/forges: \[\]/d' "$HF_CONFIG/orgs/demo.yaml"
+sed -i.sedbak '/forges: \[\]/d' "$HF_CONFIG/orgs/demo.yaml" && rm -f "$HF_CONFIG/orgs/demo.yaml.sedbak"
 hf_cmd reload >/dev/null
 # Without the filter, both remotes are visible to push (we don't actually push,
 # just verify it's not pre-flighted to a forge_excluded error).

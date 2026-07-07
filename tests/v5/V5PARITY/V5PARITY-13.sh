@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tier: mixed
+# tier: 1
+# (Mixed-tier script: the tier-2 half self-gates on HF_V5_TEST_CONFIG_DIR.)
 # V5PARITY-13: checkpoint — verify v5 covers every v4 capability the
 # epic pinned. Tier-2 stories (U1/U5/U6) SKIP cleanly without
 # HF_V5_TEST_CONFIG_DIR; tier-1 stories run always.

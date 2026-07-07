@@ -25,7 +25,7 @@ cd "$(dirname "$0")/../../.."
 #   - secrets.rs (separate secret store module)
 #   - config.rs (the types + loader module — the state impl detail)
 #   - ///  doc comments (textual mentions aren't violations)
-violations=$(grep -RnE 'serde_yaml::(from_str|to_string|from_reader)' src/v5/ 2>/dev/null \
+violations=$(grep -RnE 'serde_yaml::(from_str|to_string|from_reader)' src/v5 2>/dev/null \
     | grep -vE '^src/v5/(ops|secrets|config\.rs)' \
     | grep -vE '^[^:]+:[0-9]+:\s*///' || true)
 
