@@ -409,6 +409,82 @@ pub enum RepoEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         renames_path: Option<String>,
     },
+    // HYPE-9: publishing (repos.publish) ---------------------------------
+    /// `publish --status`: one per repo/forge-remote unpushed-work entry.
+    /// Read-only — `ahead`/`behind` are vs the last-known remote-tracking
+    /// ref (no fetch, `PublishSummary.fetched=false`). `same_identity` is
+    /// HYPE-5 alias-aware: true when the remote URL's owner is the repo's
+    /// declared owner or a curated alias of it.
+    PublishStatusEntry {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        /// The `.git/config` remote name (HYPE-6 rule: names from config).
+        remote: String,
+        provider: String,
+        url: String,
+        ahead: u32,
+        behind: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote_owner: Option<String>,
+        same_identity: bool,
+    },
+    /// `publish` default (dry-run): one push-plan line per repo/forge-remote.
+    /// Emitted instead of pushing; nothing is written.
+    PublishPlan {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remote: String,
+        provider: String,
+        url: String,
+        branch: String,
+    },
+    /// `publish --execute`: a forge remote was pushed (no force).
+    PublishPushed {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remote: String,
+        url: String,
+        branch: String,
+    },
+    /// `publish --execute`: a forge remote was skipped and flagged — its
+    /// URL 404s / the repo is missing on that forge. Publishing continues.
+    PublishSkipped {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remote: String,
+        url: String,
+        reason: String,
+    },
+    /// `publish --execute`: a forge remote push errored (non-404, e.g. the
+    /// pre-push hook blocked it or a non-fast-forward). Publishing continues
+    /// to the next remote; the push is never forced.
+    PublishError {
+        #[serde(rename = "ref")]
+        reference: RepoRefWire,
+        remote: String,
+        url: String,
+        error_class: String,
+        message: String,
+    },
+    /// Final `publish` summary (both modes).
+    PublishSummary {
+        repos: u32,
+        remotes: u32,
+        /// `--status` only: repos with any unpushed work (ahead on a remote).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        with_unpushed: Option<u32>,
+        /// `--status` only: total commits ahead summed across repos/remotes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_ahead: Option<u32>,
+        pushed: u32,
+        skipped: u32,
+        errored: u32,
+        planned: u32,
+        dry_run: bool,
+        /// Always false: neither mode fetches, so ahead/behind is
+        /// last-known. Surfaced so the operator reads the counts correctly.
+        fetched: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -810,6 +886,85 @@ fn read_named_remotes(dir: &std::path::Path) -> Result<Vec<(String, String)>, ()
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// HYPE-9: publishing (repos.publish) — enumerate the forge remotes to
+// publish/inspect for a checkout, bridging registry forge-scope with the
+// actual `.git/config` remote names.
+// ---------------------------------------------------------------------
+
+/// A forge remote to publish to / inspect: the `.git/config` remote NAME
+/// (HYPE-6 rule — never provider convention), its URL, and derived provider.
+struct PublishRemote {
+    name: String,
+    url: String,
+    provider: ProviderKind,
+}
+
+/// One repo in a publish run: its wire ref, resolved checkout dir, and the
+/// registry entry (forge scope + declared owner) when it is registered.
+struct PublishTarget {
+    reference: RepoRefWire,
+    dir: std::path::PathBuf,
+    repo: Option<OrgRepo>,
+}
+
+/// Enumerate the forge remotes of a checkout that are in the repo's forge
+/// scope. Names come from the actual `.git/config` (`read_named_remotes`);
+/// a remote's provider is derived from its host, falling back to the
+/// registry entry's explicit `provider:` when the host is unrecognized
+/// (e.g. a local-path remote in a fixture). Non-forge remotes (no
+/// resolvable provider) and remotes excluded by the repo's `forges` scope
+/// are dropped. So on the split-convention fleet — `origin`=codeberg vs
+/// `origin`=github, plus reversed/`gitvm` — publish targets exactly the
+/// configured forge remotes under their real names.
+fn publish_remotes_for(
+    dir: &std::path::Path,
+    repo: Option<&OrgRepo>,
+    provider_map: &BTreeMap<DomainName, ProviderKind>,
+) -> Vec<PublishRemote> {
+    let scope: Option<&Vec<ProviderKind>> = repo.and_then(|r| r.forges.as_ref());
+    let named = read_named_remotes(dir).unwrap_or_default();
+    let mut out: Vec<PublishRemote> = Vec::new();
+    for (name, url) in named {
+        // Provider: derive from host, else the registry entry with this URL.
+        let probe = Remote { url: RemoteUrl::from(url.as_str()), provider: None };
+        let provider = derive_provider(&probe, provider_map).ok().or_else(|| {
+            repo.and_then(|r| {
+                r.remotes
+                    .iter()
+                    .find(|rr| rr.url.as_str() == url)
+                    .and_then(|rr| rr.provider)
+            })
+        });
+        let Some(provider) = provider else { continue };
+        // Forge-scope filter (unscoped repo → all forge remotes).
+        if scope.is_some_and(|s| !s.contains(&provider)) {
+            continue;
+        }
+        out.push(PublishRemote { name, url, provider });
+    }
+    out
+}
+
+const fn provider_label(p: ProviderKind) -> &'static str {
+    match p {
+        ProviderKind::Github => "github",
+        ProviderKind::Codeberg => "codeberg",
+        ProviderKind::Gitlab => "gitlab",
+    }
+}
+
+/// Classify a `git push` failure: a remote that 404s / is missing on the
+/// forge is skipped-and-flagged (HYPE-9 safety), everything else is a real
+/// error (e.g. the pre-push hook blocked it, or a non-fast-forward).
+fn is_missing_remote_error(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("repository not found")
+        || s.contains("not found")
+        || s.contains("does not exist")
+        || s.contains("could not read from remote repository")
 }
 
 // ---------------------------------------------------------------------
@@ -2840,6 +2995,240 @@ impl ReposHub {
         }
     }
 
+    /// HYPE-9: publishing capability (layer 1 — git publish). Push the
+    /// integration branch to EVERY configured forge remote (github +
+    /// codeberg mirrors), dry-run first. Capability, not act — nothing
+    /// pushes as a side effect of another command. Three shapes:
+    /// * `--status`: inventory — ahead/behind per forge remote for every
+    ///   repo; mutates nothing, no network fetch (`fetched=false`).
+    /// * default (no `--execute`): print the exact per-repo/per-remote push
+    ///   plan, push nothing.
+    /// * `--execute`: push (no force, respecting the alias-aware pre-push
+    ///   hook — subprocess `git push`, never `--no-verify`), skip-and-flag
+    ///   404 remotes and continue.
+    ///
+    /// Targets resolve from `workspace` (repo→dir), a single `path`
+    /// (`+org+name`), or the configured `default_workspace` when neither is
+    /// given; `org`/`name` narrow a workspace to a subset. Owner comparison
+    /// is alias-aware (HYPE-5), so aliased owners are not misreported.
+    #[plexus_macros::method(params(
+        workspace = "Workspace to publish/inspect (repo→dir resolved from it); default: config default_workspace",
+        org = "Org scope — with `name`, a single repo; a subset filter otherwise",
+        name = "Repo name (subset filter / single-repo target)",
+        path = "Explicit checkout dir for a single repo (with `org`+`name`)",
+        branch = "Branch to publish (default: each repo's current branch)",
+        status = "Status mode: report ahead/behind per remote, mutate nothing",
+        execute = "Perform the push (default: dry-run plan only)"
+    ))]
+    pub async fn publish(
+        &self,
+        workspace: Option<String>,
+        org: Option<String>,
+        name: Option<String>,
+        path: Option<String>,
+        branch: Option<String>,
+        status: Option<Value>,
+        execute: Option<Value>,
+    ) -> impl Stream<Item = RepoEvent> + Send + 'static {
+        let config_dir = self.config_dir.clone();
+        stream! {
+            let status_mode = status.as_ref().is_some_and(|v| to_bool(v, false));
+            let do_execute = execute.as_ref().is_some_and(|v| to_bool(v, false));
+            let loaded = match load_all(&config_dir) {
+                Ok(l) => l,
+                Err(e) => { yield cfg_error_event(e); return; }
+            };
+            let global = &loaded.global;
+
+            let org_f = org.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let name_f = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let path_f = path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+            let mut targets: Vec<PublishTarget> = Vec::new();
+
+            if let Some(p) = path_f {
+                // Single-repo mode: explicit checkout dir. `org`+`name`
+                // identify the registry entry (forge scope + declared owner).
+                let (o, n) = match (org_f, name_f) {
+                    (Some(o), Some(n)) => (o.to_string(), n.to_string()),
+                    _ => { yield validation_event("`path` requires `org` and `name`"); return; }
+                };
+                let repo = loaded.orgs.get(&OrgName::from(o.as_str()))
+                    .and_then(|oc| find_repo(oc, &n)).cloned();
+                targets.push(PublishTarget {
+                    reference: RepoRefWire { org: o, name: n },
+                    dir: PathBuf::from(p),
+                    repo,
+                });
+            } else {
+                // Workspace mode: resolve every member's checkout dir
+                // (`<workspace.path>/<dir|name>`), filtered by any org/name.
+                let ws_name = workspace.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    .map(crate::v5::config::WorkspaceName::from)
+                    .or_else(|| global.default_workspace.clone());
+                let Some(ws_name) = ws_name else {
+                    yield validation_event(
+                        "no workspace given and no default_workspace configured; pass `workspace` or `path`+`org`+`name`",
+                    );
+                    return;
+                };
+                let Some(ws) = loaded.workspaces.get(&ws_name) else {
+                    yield not_found_event(format!("workspace '{}' not found", ws_name.as_str()));
+                    return;
+                };
+                let ws_path = PathBuf::from(ws.path.as_str());
+                for entry in &ws.repos {
+                    let (o, n, dir_name) = match entry {
+                        crate::v5::config::WorkspaceRepo::Shorthand(s) => match s.split_once('/') {
+                            Some((o, n)) => (o.to_string(), n.to_string(), n.to_string()),
+                            None => continue,
+                        },
+                        crate::v5::config::WorkspaceRepo::Object { reference, dir } => (
+                            reference.org.as_str().to_string(),
+                            reference.name.as_str().to_string(),
+                            dir.clone(),
+                        ),
+                    };
+                    if org_f.is_some_and(|of| of != o) { continue; }
+                    if name_f.is_some_and(|nf| nf != n) { continue; }
+                    let repo = loaded.orgs.get(&OrgName::from(o.as_str()))
+                        .and_then(|oc| find_repo(oc, &n)).cloned();
+                    targets.push(PublishTarget {
+                        reference: RepoRefWire { org: o, name: n },
+                        dir: ws_path.join(&dir_name),
+                        repo,
+                    });
+                }
+                if targets.is_empty() {
+                    yield validation_event("no repos matched the requested scope in the workspace");
+                    return;
+                }
+            }
+
+            let mut repos_seen = 0u32;
+            let mut remotes_seen = 0u32;
+            let mut with_unpushed = 0u32;
+            let mut total_ahead = 0u32;
+            let mut pushed = 0u32;
+            let mut skipped = 0u32;
+            let mut errored = 0u32;
+            let mut planned = 0u32;
+
+            for t in &targets {
+                repos_seen += 1;
+                let remotes = publish_remotes_for(&t.dir, t.repo.as_ref(), &global.provider_map);
+                let repo_branch = match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(b) => Some(b.to_string()),
+                    None => crate::v5::ops::git::status(&t.dir).ok().and_then(|s| s.branch),
+                };
+                let mut repo_has_unpushed = false;
+                for r in &remotes {
+                    remotes_seen += 1;
+                    let Some(b) = repo_branch.as_deref() else {
+                        if status_mode {
+                            yield RepoEvent::PublishStatusEntry {
+                                reference: t.reference.clone(),
+                                remote: r.name.clone(),
+                                provider: provider_label(r.provider).into(),
+                                url: r.url.clone(),
+                                ahead: 0, behind: 0,
+                                remote_owner: None,
+                                same_identity: true,
+                            };
+                        } else {
+                            yield RepoEvent::PublishError {
+                                reference: t.reference.clone(),
+                                remote: r.name.clone(),
+                                url: r.url.clone(),
+                                error_class: "no_branch".into(),
+                                message: format!("no current branch in {}", t.dir.display()),
+                            };
+                            errored += 1;
+                        }
+                        continue;
+                    };
+                    if status_mode {
+                        let (ahead, behind) =
+                            crate::v5::ops::git::ahead_behind_remote(&t.dir, &r.name, b)
+                                .unwrap_or((0, 0));
+                        if ahead > 0 { repo_has_unpushed = true; total_ahead += ahead; }
+                        let remote_owner =
+                            crate::v5::adapters::parse_remote_url(&r.url).map(|(_, o, _)| o);
+                        let same_identity = match remote_owner.as_deref() {
+                            Some(ro) => global.same_owner(&t.reference.org, ro),
+                            None => true,
+                        };
+                        yield RepoEvent::PublishStatusEntry {
+                            reference: t.reference.clone(),
+                            remote: r.name.clone(),
+                            provider: provider_label(r.provider).into(),
+                            url: r.url.clone(),
+                            ahead, behind,
+                            remote_owner,
+                            same_identity,
+                        };
+                    } else if do_execute {
+                        match crate::v5::ops::git::push_refs(&t.dir, &r.name, Some(b)) {
+                            Ok(()) => {
+                                yield RepoEvent::PublishPushed {
+                                    reference: t.reference.clone(),
+                                    remote: r.name.clone(),
+                                    url: r.url.clone(),
+                                    branch: b.to_string(),
+                                };
+                                pushed += 1;
+                            }
+                            Err(crate::v5::ops::git::GitError::CommandFailed { stderr, .. })
+                                if is_missing_remote_error(&stderr) =>
+                            {
+                                yield RepoEvent::PublishSkipped {
+                                    reference: t.reference.clone(),
+                                    remote: r.name.clone(),
+                                    url: r.url.clone(),
+                                    reason: "remote 404 / repo missing on forge".into(),
+                                };
+                                skipped += 1;
+                            }
+                            Err(e) => {
+                                yield RepoEvent::PublishError {
+                                    reference: t.reference.clone(),
+                                    remote: r.name.clone(),
+                                    url: r.url.clone(),
+                                    error_class: e.code().into(),
+                                    message: e.to_string(),
+                                };
+                                errored += 1;
+                            }
+                        }
+                    } else {
+                        yield RepoEvent::PublishPlan {
+                            reference: t.reference.clone(),
+                            remote: r.name.clone(),
+                            provider: provider_label(r.provider).into(),
+                            url: r.url.clone(),
+                            branch: b.to_string(),
+                        };
+                        planned += 1;
+                    }
+                }
+                if repo_has_unpushed { with_unpushed += 1; }
+            }
+
+            yield RepoEvent::PublishSummary {
+                repos: repos_seen,
+                remotes: remotes_seen,
+                with_unpushed: if status_mode { Some(with_unpushed) } else { None },
+                total_ahead: if status_mode { Some(total_ahead) } else { None },
+                pushed,
+                skipped,
+                errored,
+                planned,
+                dry_run: !status_mode && !do_execute,
+                fetched: false,
+            };
+        }
+    }
+
     #[plexus_macros::method(params(
         org = "Org name",
         name = "Repo name",
@@ -4174,5 +4563,478 @@ mod migrate_tests {
         let target = reloaded.orgs.get(&OrgName::from("hypermemetic-ai")).unwrap();
         assert!(find_repo(source, "widget").is_some(), "dry_run must not move repo");
         assert!(find_repo(target, "widget").is_none(), "dry_run must not write target");
+    }
+}
+
+/// HYPE-9 publish tests — fixture repos with dual (github+codeberg-tagged)
+/// LOCAL bare remotes so status/dry-run/execute are provable offline, plus
+/// the aliased-owner hook-compat fixtures. Forge round-trips stay
+/// integration-only per the repo's no-mock convention.
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use crate::v5::config::{
+        ForgeProviderBlock, FsPath, WorkspaceConfig, WorkspaceName, WorkspaceRepo,
+    };
+    use futures::StreamExt;
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed in {}", dir.display());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_work_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "user.email", "t@t.co"]);
+        run_git(dir, &["config", "user.name", "t"]);
+    }
+
+    fn commit_file(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), name).unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-qm", name]);
+    }
+
+    fn init_bare(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "--bare", "-b", "main"]);
+    }
+
+    fn bare_main_sha(bare: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(bare)
+            .output()
+            .expect("git runs");
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn org_with_repo(name: &str, repos: Vec<OrgRepo>) -> OrgConfig {
+        let mut forges = BTreeMap::new();
+        forges.insert(ProviderKind::Github, ForgeProviderBlock { credentials: vec![] });
+        OrgConfig { name: OrgName::from(name), forges, repos }
+    }
+
+    fn local_remote(url: &std::path::Path, provider: ProviderKind) -> Remote {
+        Remote {
+            url: RemoteUrl::from(url.display().to_string().as_str()),
+            provider: Some(provider),
+        }
+    }
+
+    /// Standard dual-remote fixture: a workspace with one repo `widget`
+    /// whose checkout has TWO forge remotes named in `.git/config` with the
+    /// split convention (`origin`=codeberg, `github`=github), both pointing
+    /// at local bares. Returns (config_dir, checkout, github_bare, codeberg_bare).
+    fn dual_remote_fixture(
+        tmp: &std::path::Path,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let config_dir = tmp.to_path_buf();
+        let orgs_dir = config_dir.join("orgs");
+        let ws_dir = config_dir.join("workspaces");
+        std::fs::create_dir_all(&orgs_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let gh_bare = tmp.join("gh-bare.git");
+        let cb_bare = tmp.join("cb-bare.git");
+        init_bare(&gh_bare);
+        init_bare(&cb_bare);
+
+        let ws_root = tmp.join("ws");
+        let checkout = ws_root.join("widget");
+        init_work_repo(&checkout);
+        commit_file(&checkout, "one.txt");
+        // Split convention (Pattern A): origin = codeberg, github = github.
+        run_git(&checkout, &["remote", "add", "origin", cb_bare.display().to_string().as_str()]);
+        run_git(&checkout, &["remote", "add", "github", gh_bare.display().to_string().as_str()]);
+
+        // Registry entry tags each local-bare URL with its provider (the
+        // host is a path, so provider derivation uses the registry tag).
+        let repo = OrgRepo {
+            name: RepoName::from("widget"),
+            remotes: vec![
+                local_remote(&gh_bare, ProviderKind::Github),
+                local_remote(&cb_bare, ProviderKind::Codeberg),
+            ],
+            forges: None,
+            metadata: None,
+        };
+        save_org(&orgs_dir, &org_with_repo("hypermemetic", vec![repo])).unwrap();
+        crate::v5::config::save_workspace(
+            &ws_dir,
+            &WorkspaceConfig {
+                name: WorkspaceName::from("ws"),
+                path: FsPath::from(ws_root.display().to_string().as_str()),
+                repos: vec![WorkspaceRepo::Shorthand("hypermemetic/widget".into())],
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "provider_map:\n  github.com: github\n  codeberg.org: codeberg\n",
+        )
+        .unwrap();
+        (config_dir, checkout, gh_bare, cb_bare)
+    }
+
+    fn publish_events(
+        config_dir: &std::path::Path,
+        status: bool,
+        execute: bool,
+    ) -> impl std::future::Future<Output = Vec<RepoEvent>> {
+        let hub = ReposHub::with_config_dir(config_dir.to_path_buf());
+        async move {
+            hub.publish(
+                Some("ws".into()),
+                None,
+                None,
+                None,
+                None,
+                status.then(|| Value::Bool(true)),
+                execute.then(|| Value::Bool(true)),
+            )
+            .await
+            .collect()
+            .await
+        }
+    }
+
+    /// HYPE-9 publish-status: ahead/behind per configured remote, remote
+    /// names from `.git/config`, zero mutations (bare refs byte-identical,
+    /// no fetch — `fetched=false` on the summary).
+    #[tokio::test]
+    async fn test_publish_status_lists_ahead_behind_per_remote_and_mutates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config_dir, checkout, gh_bare, cb_bare) = dual_remote_fixture(tmp.path());
+        // Sync both remotes, then go 2 ahead locally.
+        run_git(&checkout, &["push", "-q", "github", "main"]);
+        run_git(&checkout, &["push", "-q", "origin", "main"]);
+        commit_file(&checkout, "two.txt");
+        commit_file(&checkout, "three.txt");
+        let gh_before = bare_main_sha(&gh_bare);
+        let cb_before = bare_main_sha(&cb_bare);
+
+        let events = publish_events(&config_dir, true, false).await;
+
+        let entry = |remote: &str| {
+            events.iter().find_map(|e| match e {
+                RepoEvent::PublishStatusEntry { remote: r, provider, ahead, behind, .. }
+                    if r == remote => Some((provider.clone(), *ahead, *behind)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            entry("github"),
+            Some(("github".to_string(), 2, 0)),
+            "github remote (config name) 2 ahead: {events:?}"
+        );
+        assert_eq!(
+            entry("origin"),
+            Some(("codeberg".to_string(), 2, 0)),
+            "origin (codeberg) 2 ahead: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishSummary { repos: 1, remotes: 2, with_unpushed: Some(1),
+                total_ahead: Some(4), pushed: 0, fetched: false, .. })),
+            "summary counts unpushed work without fetching: {events:?}");
+        // Zero network/ref mutations: both bares untouched.
+        assert_eq!(bare_main_sha(&gh_bare), gh_before);
+        assert_eq!(bare_main_sha(&cb_bare), cb_before);
+    }
+
+    /// HYPE-9 publish-status (alias-aware): a remote whose URL owner is a
+    /// declared alias of the registry org reports `same_identity=true`; an
+    /// unrelated owner reports false. Read-only — the github URL is never
+    /// contacted (`ahead_behind_remote` reads only local refs).
+    #[tokio::test]
+    async fn test_publish_status_owner_comparison_is_alias_aware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let orgs_dir = config_dir.join("orgs");
+        let ws_dir = config_dir.join("workspaces");
+        std::fs::create_dir_all(&orgs_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws_root = tmp.path().join("ws");
+
+        // widget: origin owner is the ALIAS user; registry org is canonical.
+        let widget = ws_root.join("widget");
+        init_work_repo(&widget);
+        commit_file(&widget, "one.txt");
+        run_git(&widget, &["remote", "add", "origin", "git@github.com:hypermemetic/widget.git"]);
+        // gadget: origin owner is an UNRELATED org.
+        let gadget = ws_root.join("gadget");
+        init_work_repo(&gadget);
+        commit_file(&gadget, "one.txt");
+        run_git(&gadget, &["remote", "add", "origin", "git@github.com:evilorg/gadget.git"]);
+
+        let mk = |n: &str, owner: &str| OrgRepo {
+            name: RepoName::from(n),
+            remotes: vec![Remote {
+                url: RemoteUrl::from(format!("git@github.com:{owner}/{n}.git").as_str()),
+                provider: Some(ProviderKind::Github),
+            }],
+            forges: None,
+            metadata: None,
+        };
+        save_org(
+            &orgs_dir,
+            &org_with_repo("hypermemetic-ai", vec![mk("widget", "hypermemetic"), mk("gadget", "evilorg")]),
+        )
+        .unwrap();
+        crate::v5::config::save_workspace(
+            &ws_dir,
+            &WorkspaceConfig {
+                name: WorkspaceName::from("ws"),
+                path: FsPath::from(ws_root.display().to_string().as_str()),
+                repos: vec![
+                    WorkspaceRepo::Shorthand("hypermemetic-ai/widget".into()),
+                    WorkspaceRepo::Shorthand("hypermemetic-ai/gadget".into()),
+                ],
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "provider_map:\n  github.com: github\nowner_aliases:\n  hypermemetic-ai:\n    - hypermemetic\n",
+        )
+        .unwrap();
+
+        let events = publish_events(&config_dir, true, false).await;
+
+        let identity_of = |repo: &str| {
+            events.iter().find_map(|e| match e {
+                RepoEvent::PublishStatusEntry { reference, remote_owner, same_identity, .. }
+                    if reference.name == repo =>
+                        Some((remote_owner.clone(), *same_identity)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            identity_of("widget"),
+            Some((Some("hypermemetic".to_string()), true)),
+            "aliased owner is the same identity: {events:?}"
+        );
+        assert_eq!(
+            identity_of("gadget"),
+            Some((Some("evilorg".to_string()), false)),
+            "unrelated owner is flagged: {events:?}"
+        );
+    }
+
+    /// HYPE-9 publish-dry-run: default (no flags) prints the exact push
+    /// plan per repo/remote and pushes NOTHING.
+    #[tokio::test]
+    async fn test_publish_default_is_dry_run_plan_pushes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config_dir, _checkout, gh_bare, cb_bare) = dual_remote_fixture(tmp.path());
+        // Never pushed: both bares have no main ref at all.
+        assert_eq!(bare_main_sha(&gh_bare), None);
+
+        let events = publish_events(&config_dir, false, false).await;
+
+        let plans: Vec<(String, String)> = events.iter().filter_map(|e| match e {
+            RepoEvent::PublishPlan { remote, branch, .. } => Some((remote.clone(), branch.clone())),
+            _ => None,
+        }).collect();
+        assert!(plans.contains(&("github".to_string(), "main".to_string())), "{events:?}");
+        assert!(plans.contains(&("origin".to_string(), "main".to_string())), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishSummary { planned: 2, pushed: 0, dry_run: true, .. })),
+            "dry-run summary: {events:?}");
+        assert!(!events.iter().any(|e| matches!(e, RepoEvent::PublishPushed { .. })));
+        // Nothing was pushed.
+        assert_eq!(bare_main_sha(&gh_bare), None);
+        assert_eq!(bare_main_sha(&cb_bare), None);
+    }
+
+    /// HYPE-9 mirror-push: `--execute` pushes the SAME branch to both forge
+    /// remotes, remote names from `.git/config`, no force (a diverged
+    /// remote errors instead of being overwritten).
+    #[tokio::test]
+    async fn test_publish_execute_pushes_same_branch_to_both_forges_no_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config_dir, checkout, gh_bare, cb_bare) = dual_remote_fixture(tmp.path());
+        let local = git_out(&checkout, &["rev-parse", "HEAD"]);
+
+        let events = publish_events(&config_dir, false, true).await;
+
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishPushed { remote, branch, .. } if remote == "github" && branch == "main")),
+            "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishPushed { remote, branch, .. } if remote == "origin" && branch == "main")),
+            "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishSummary { pushed: 2, errored: 0, skipped: 0, dry_run: false, .. })),
+            "{events:?}");
+        // Same branch, same sha, on BOTH forges.
+        assert_eq!(bare_main_sha(&gh_bare).as_deref(), Some(local.as_str()));
+        assert_eq!(bare_main_sha(&cb_bare).as_deref(), Some(local.as_str()));
+
+        // No force: diverge the github bare (a commit publish doesn't
+        // have), then republish — the push must ERROR, not overwrite.
+        let other = tmp.path().join("other");
+        run_git(tmp.path(), &["clone", "-q", gh_bare.display().to_string().as_str(), "other"]);
+        run_git(&other, &["config", "user.email", "t@t.co"]);
+        run_git(&other, &["config", "user.name", "t"]);
+        commit_file(&other, "remote-only.txt");
+        run_git(&other, &["push", "-q", "origin", "main"]);
+        let diverged = bare_main_sha(&gh_bare);
+        commit_file(&checkout, "local-only.txt");
+
+        let events = publish_events(&config_dir, false, true).await;
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishError { remote, .. } if remote == "github")),
+            "diverged remote must error, never force: {events:?}");
+        assert_eq!(bare_main_sha(&gh_bare), diverged, "remote history preserved (no force)");
+    }
+
+    /// HYPE-9 safety: a remote that 404s (missing on the forge) is
+    /// skipped-and-flagged; publishing CONTINUES to the other remote.
+    #[tokio::test]
+    async fn test_publish_execute_skips_and_flags_missing_remote_and_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config_dir, checkout, gh_bare, _cb_bare) = dual_remote_fixture(tmp.path());
+        // Break the codeberg remote: point origin at a nonexistent path
+        // (locally what a 404 looks like: "could not read from remote").
+        let gone = tmp.path().join("gone.git");
+        run_git(&checkout, &["remote", "set-url", "origin", gone.display().to_string().as_str()]);
+        // Keep registry in sync so the provider tag still resolves.
+        let orgs_dir = config_dir.join("orgs");
+        let mut org = org_with_repo("hypermemetic", vec![OrgRepo {
+            name: RepoName::from("widget"),
+            remotes: vec![
+                local_remote(&gh_bare, ProviderKind::Github),
+                local_remote(&gone, ProviderKind::Codeberg),
+            ],
+            forges: None,
+            metadata: None,
+        }]);
+        org.forges.insert(ProviderKind::Codeberg, ForgeProviderBlock { credentials: vec![] });
+        save_org(&orgs_dir, &org).unwrap();
+
+        let events = publish_events(&config_dir, false, true).await;
+
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishSkipped { remote, .. } if remote == "origin")),
+            "missing remote skipped+flagged: {events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishPushed { remote, .. } if remote == "github")),
+            "publish continues past the 404: {events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishSummary { pushed: 1, skipped: 1, errored: 0, .. })),
+            "{events:?}");
+    }
+
+    /// HYPE-9 hook-compat (mechanism): `--execute` pushes via subprocess
+    /// `git push` with NO `--no-verify`, so the repo's pre-push hook FIRES
+    /// — and a blocking hook blocks the publish (PublishError, ref
+    /// untouched) rather than being bypassed.
+    #[tokio::test]
+    async fn test_publish_execute_fires_and_respects_pre_push_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config_dir, checkout, gh_bare, cb_bare) = dual_remote_fixture(tmp.path());
+        // Wire a hook the hyperforge way: core.hooksPath -> .hyperforge/hooks.
+        let hooks = checkout.join(".hyperforge").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = tmp.path().join("hook-fired");
+        std::fs::write(
+            hooks.join("pre-push"),
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(hooks.join("pre-push"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        run_git(&checkout, &["config", "core.hooksPath", ".hyperforge/hooks"]);
+
+        let events = publish_events(&config_dir, false, true).await;
+        assert!(marker.exists(), "pre-push hook must fire during publish: {events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            RepoEvent::PublishSummary { pushed: 2, errored: 0, .. })), "{events:?}");
+
+        // Now a BLOCKING hook: publish must respect it (error, no bypass).
+        std::fs::write(hooks.join("pre-push"), "#!/bin/sh\necho blocked >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(hooks.join("pre-push"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let gh_before = bare_main_sha(&gh_bare);
+        let cb_before = bare_main_sha(&cb_bare);
+        commit_file(&checkout, "blocked.txt");
+        let events = publish_events(&config_dir, false, true).await;
+        assert!(events.iter().any(|e| matches!(e, RepoEvent::PublishError { .. })),
+            "blocking hook must surface as PublishError: {events:?}");
+        assert!(!events.iter().any(|e| matches!(e, RepoEvent::PublishPushed { .. })),
+            "nothing pushed past a blocking hook: {events:?}");
+        assert_eq!(bare_main_sha(&gh_bare), gh_before);
+        assert_eq!(bare_main_sha(&cb_bare), cb_before);
+    }
+
+    /// HYPE-9 hook-compat (policy): the RENDERED alias-aware pre-push hook
+    /// (HYPE-5) does not false-block an aliased owner (`hypermemetic` vs
+    /// `hypermemetic-ai`) and still blocks a genuinely unrelated org. Runs
+    /// the actual installed shell script against github-shaped URLs.
+    #[test]
+    fn test_rendered_pre_push_hook_allows_alias_blocks_unrelated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("widget");
+        init_work_repo(&checkout);
+        commit_file(&checkout, "one.txt");
+        std::fs::create_dir_all(checkout.join(".hyperforge")).unwrap();
+        std::fs::write(
+            checkout.join(".hyperforge").join("config.toml"),
+            "org = \"hypermemetic-ai\"\nforges = [\"github\"]\n",
+        )
+        .unwrap();
+        let mut aliases = BTreeMap::new();
+        aliases.insert("hypermemetic".to_string(), "hypermemetic-ai".to_string());
+        let hook = checkout.join("pre-push-under-test");
+        std::fs::write(&hook, crate::commands::hooks::render_pre_push_hook(&aliases)).unwrap();
+
+        let run_hook = |url: &str| -> bool {
+            std::process::Command::new("sh")
+                .arg(&hook)
+                .arg("github")
+                .arg(url)
+                .current_dir(&checkout)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("hook runs")
+                .success()
+        };
+        assert!(
+            run_hook("git@github.com:hypermemetic/widget.git"),
+            "aliased owner must NOT be blocked (HYPE-5)"
+        );
+        assert!(
+            run_hook("git@github.com:hypermemetic-ai/widget.git"),
+            "canonical owner passes"
+        );
+        assert!(
+            !run_hook("git@github.com:evilorg/widget.git"),
+            "an unrelated org must still block"
+        );
     }
 }

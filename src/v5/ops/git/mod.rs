@@ -130,6 +130,13 @@ pub fn push_ref(dir: &Path, remote: &str, refspec: &str) -> Result<(), GitError>
     subprocess::push_ref(dir, remote, refspec)
 }
 
+/// Ahead/behind of local `HEAD` vs `<remote>/<branch>` (HYPE-9). Reads
+/// only local remote-tracking refs — NO fetch — so `repos publish
+/// --status` is read-only. Subprocess-only (uses `git rev-list`).
+pub fn ahead_behind_remote(dir: &Path, remote: &str, branch: &str) -> Result<(u32, u32), GitError> {
+    subprocess::ahead_behind_remote(dir, remote, branch)
+}
+
 // ===================================================================
 // Routed ops — git2 by default, subprocess via HF_GIT_FORCE_SUBPROCESS.
 // ===================================================================
