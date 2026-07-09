@@ -78,6 +78,43 @@ pub(super) fn push_ref(dir: &Path, remote: &str, refspec: &str) -> Result<(), Gi
     )
 }
 
+/// Ahead/behind of local `HEAD` relative to `<remote>/<branch>` via
+/// `git rev-list --left-right --count`, reading ONLY local refs — this
+/// performs NO network fetch (HYPE-9 `repos publish --status` mutates
+/// nothing and touches no remote), so the counts reflect the last-known
+/// remote-tracking ref. Returns `(ahead, behind)`. A missing/never-fetched
+/// remote-tracking ref (unknown revision) yields `(0, 0)`.
+pub(super) fn ahead_behind_remote(
+    dir: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<(u32, u32), GitError> {
+    ensure_git_repo(dir)?;
+    let spec = format!("refs/remotes/{remote}/{branch}...HEAD");
+    match run_git_capture(
+        None,
+        &["-C", dir.to_str().unwrap_or(""), "rev-list", "--left-right", "--count", &spec],
+    ) {
+        Ok(out) => {
+            // Left = commits in <remote>/<branch> not in HEAD (behind);
+            // right = commits in HEAD not in <remote>/<branch> (ahead).
+            let parts: Vec<&str> = out.split_whitespace().collect();
+            if parts.len() != 2 {
+                return Ok((0, 0));
+            }
+            let behind = parts[0].parse().unwrap_or(0);
+            let ahead = parts[1].parse().unwrap_or(0);
+            Ok((ahead, behind))
+        }
+        Err(GitError::CommandFailed { stderr, .. })
+            if stderr.contains("unknown revision") || stderr.contains("bad revision") =>
+        {
+            Ok((0, 0))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub(super) fn status(dir: &Path) -> Result<StatusSnapshot, GitError> {
     ensure_git_repo(dir)?;
     let out = run_git_capture(
