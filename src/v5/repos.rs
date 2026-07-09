@@ -2872,7 +2872,12 @@ impl ReposHub {
                 }
             };
             let _ = provider; // recorded on Remote below if/when needed
-            let org_name = org.as_deref().unwrap_or(&derived_owner).to_string();
+            // HYPE-5: file under the CANONICAL owner. When a repo moved
+            // user→org the URL-derived owner is the old (alias) user; the
+            // registry entry must land under the canonical org, not the raw
+            // URL-derived string. Explicit `org` is canonicalized too.
+            let org_name =
+                loaded.global.canonical_owner(org.as_deref().unwrap_or(&derived_owner));
             let name = repo_name.as_deref().unwrap_or(&derived_name).to_string();
             let org_key = OrgName::from(org_name.as_str());
             let mut org_cfg = match loaded.orgs.get(&org_key).cloned() {
@@ -3356,6 +3361,79 @@ mod migrate_tests {
             url: RemoteUrl::from(format!("git@github.com:{org}/{repo}.git").as_str()),
             provider: Some(ProviderKind::Github),
         }
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// HYPE-5 (adopt-uses-canonical): a checkout whose origin owner is the
+    /// alias user `hypermemetic` must register under the CANONICAL org
+    /// `hypermemetic-ai`, never under the raw URL-derived owner.
+    #[tokio::test]
+    async fn test_register_files_under_canonical_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let orgs_dir = config_dir.join("orgs");
+        std::fs::create_dir_all(&orgs_dir).unwrap();
+
+        // Canonical org exists (empty); the alias-user org does NOT.
+        save_org(&orgs_dir, &org_with_repo("hypermemetic-ai", vec![])).unwrap();
+
+        // Global config: provider_map for github.com + owner_aliases mapping
+        // the canonical org to the old user alias. Written as a raw YAML
+        // string (D13: no direct serde_yaml calls outside ops/config).
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "provider_map:\n  github.com: github\nowner_aliases:\n  hypermemetic-ai:\n    - hypermemetic\n",
+        )
+        .unwrap();
+
+        // A real checkout whose origin owner is the ALIAS user.
+        let checkout = config_dir.join("widget");
+        std::fs::create_dir_all(&checkout).unwrap();
+        run_git(&checkout, &["init", "-q"]);
+        run_git(
+            &checkout,
+            &["remote", "add", "origin", "git@github.com:hypermemetic/widget.git"],
+        );
+
+        let hub = ReposHub::with_config_dir(config_dir.clone());
+        let events: Vec<RepoEvent> = hub
+            .register(
+                checkout.display().to_string(),
+                None,
+                None,
+                Some(serde_json::json!(false)),
+            )
+            .await
+            .collect()
+            .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, RepoEvent::Error { .. })),
+            "no error events expected, got {events:?}",
+        );
+
+        // Repo landed under the CANONICAL org, not the URL-derived alias.
+        let reloaded = load_all(&config_dir).unwrap();
+        let canonical = reloaded
+            .orgs
+            .get(&OrgName::from("hypermemetic-ai"))
+            .expect("canonical org present");
+        assert!(
+            find_repo(canonical, "widget").is_some(),
+            "repo must file under the canonical owner hypermemetic-ai",
+        );
+        assert!(
+            reloaded.orgs.get(&OrgName::from("hypermemetic")).is_none(),
+            "no alias-user org should be created",
+        );
     }
 
     /// Mirrors the rename anti-story: set up two orgs + a repo under the

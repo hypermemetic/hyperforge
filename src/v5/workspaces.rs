@@ -1010,6 +1010,11 @@ impl WorkspacesHub {
                 }
             };
             let _ = &target;
+            // HYPE-5: global config for owner-alias resolution in the
+            // config-drift scan below. Best-effort; missing/invalid → no
+            // aliases (identity comparison), preserving prior behavior.
+            let global = crate::v5::config::load_global(&config_dir.join("config.yaml"))
+                .unwrap_or_default();
             // Load orgs for URL → ref lookup.
             let orgs_dir = config_dir.join("orgs");
             let orgs = match crate::v5::config::load_orgs(&orgs_dir) {
@@ -1264,13 +1269,14 @@ impl WorkspacesHub {
                         let bound = decisions.iter().find(|d| d.dir.as_deref() == Some(dname));
                         if let Some(dec) = bound {
                             let m = &members[dec.idx];
-                            let declared_ref = format!("{}/{}", hf_cfg.org.as_str(), hf_cfg.repo_name);
-                            let ws_ref = format!(
-                                "{}/{}",
-                                m.reference.org.as_str(),
-                                m.reference.name.as_str()
-                            );
-                            if declared_ref != ws_ref {
+                            // HYPE-5: owner half compares canonical identities,
+                            // so an aliased owner (declared user vs workspace
+                            // org, or vice-versa) is NOT reported as drift; only
+                            // a genuine owner or name divergence is.
+                            let owners_agree =
+                                global.same_owner(hf_cfg.org.as_str(), m.reference.org.as_str());
+                            let names_agree = hf_cfg.repo_name == m.reference.name.as_str();
+                            if !(owners_agree && names_agree) {
                                 yield WorkspacesEvent::ConfigDrift {
                                     dir: dname.clone(),
                                     declared_org: hf_cfg.org.as_str().to_string(),
@@ -2643,8 +2649,14 @@ impl WorkspacesHub {
                     fallback_token_ref.clone(),
                 ).await {
                     Ok(owner) => {
+                        // HYPE-5: compare canonical owners so an aliased owner
+                        // (e.g. the forge answers `hypermemetic` for a repo
+                        // registered under `hypermemetic-ai`) buckets as the
+                        // same identity, not `Elsewhere`.
                         let verdict = crate::v5::ops::repo::OrgDiffVerdict::classify(
-                            &owner, &from_org, &to_org,
+                            &loaded.global.canonical_owner(&owner),
+                            &loaded.global.canonical_owner(&from_org),
+                            &loaded.global.canonical_owner(&to_org),
                         );
                         match verdict {
                             crate::v5::ops::repo::OrgDiffVerdict::Moved => moved.push(repo_name.clone()),
