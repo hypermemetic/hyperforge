@@ -121,6 +121,64 @@ to walk. Already-registered repos are counted as skipped.
 These shell out to the user's `git` CLI through `ops::git` so SSH
 agents, credential helpers, and hooks all flow through unchanged.
 
+### Publish — mirror-aware git push (HYPE-9)
+
+> These methods post-date the `lforge-v5` → `lforge` namespace normalization
+> (v5 is now the canonical `hyperforge` binary). Invoke them under the
+> canonical name: `synapse -P 44104 --json lforge hyperforge repos publish …`.
+
+| Method | Params | Emits |
+|---|---|---|
+| `publish` | `workspace?`, `org?`, `name?`, `path?`, `branch?`, `status?`, `execute?` | `--status` → one `publish_status_entry` per remote; default → one `publish_plan` per remote; `--execute` → `publish_pushed` / `publish_skipped` / `publish_error` per remote; always a final `publish_summary` |
+
+Three modes, **dry-run by default** (there is no `dry_run` param; the mode
+is the flag). Scope defaults to `default_workspace`; `workspace` / `org` /
+`name` narrow it, `path` targets one checkout. `publish` pushes the same
+branch to **every** forge remote named in the repo's `.git/config` (the
+mirror-lockstep rationale) via subprocess `git push <remote> <branch>` —
+**never `--force`, never `--no-verify`**, so the alias-aware pre-push hook
+fires.
+
+Event fields (serde snake_case; `ref` is `{org, name}`):
+
+- `publish_status_entry` — `ref`, `remote` (the `.git/config` remote name),
+  `provider`, `url`, `ahead`, `behind`, `remote_owner?`, `same_identity`
+  (alias-aware, via `GlobalConfig::same_owner`). Counts are vs the last-known
+  remote-tracking ref — **no network fetch**.
+- `publish_plan` — `ref`, `remote`, `provider`, `url`, `branch`.
+- `publish_pushed` — `ref`, `remote`, `url`, `branch`.
+- `publish_skipped` — `ref`, `remote`, `url`, `reason` (e.g. a 404 remote;
+  the run continues).
+- `publish_error` — `ref`, `remote`, `url`, `error_class`, `message` (hook
+  block / non-fast-forward; that remote's history is untouched).
+- `publish_summary` — `repos`, `remotes`, `with_unpushed?`, `total_ahead?`
+  (both `--status`-only), `pushed`, `skipped`, `errored`, `planned`,
+  `dry_run`, `fetched` (always `false` — neither mode fetches).
+
+### Doctor / heal — canonical-identity convergence (HYPE-5/6)
+
+| Method | Params | Emits |
+|---|---|---|
+| `doctor` | `org`, `name?`, `heal?`, `path?`, `dry_run?` | one `repo_doctor_entry` per repo; `repo_healed` per repair (heal); final `repo_doctor_summary` |
+| `sync` | `org`, `name`, `remote?`, `heal?`, `path?`, `dry_run?` | the metadata `sync_diff` (above) plus, under `--heal`, the same `repo_healed` / doctor path |
+
+`doctor` resolves each repo's canonical identity from its first in-scope
+remote — `gh api repos/OWNER/NAME` reading `.full_name` with **HTTP
+redirects followed** (`git ls-remote` fallback) — and compares canonical
+owners (so an alias is not a divergence). `doctor` is read-only; `--heal`
+acts (pass `--dry_run` to preview). Healing reuses the provider-scoped
+`migrate_one`: it rewrites only the moved provider's remote(s), by the
+`.git/config` remote name, leaving other-forge URLs byte-identical.
+
+- `repo_doctor_entry` — `ref`, `declared_owner`, `canonical_owner?`,
+  `verdict` ∈ `{clean, diverged, unknown}` (`DoctorVerdict` is `clean` /
+  `diverged`; `unknown` is emitted when no in-scope remote can answer).
+  Aliased owners resolve to `clean`.
+- `repo_healed` — `old_full_name`, `new_full_name`, `local_path?`, `dry_run`.
+- `repo_doctor_summary` — `org`, `checked`, `diverged`, `healed`,
+  `renames_path?` (path to `doctor-renames.json`, written in the config dir
+  as an `old_full_name → new_full_name` JSON map, on a non-dry heal only).
+
 ## WorkspacesHub
 
 Source: [`src/v5/workspaces.rs`](../../src/v5/workspaces.rs).
