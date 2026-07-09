@@ -2464,6 +2464,10 @@ impl WorkspacesHub {
                     &ctx.reference.org,
                     &ctx.reference.name,
                     &to_org,
+                    // Generic workspace migrate-org assumes github as the
+                    // migrating forge; doctor/heal pass the resolved
+                    // provider. HYPE-6.
+                    crate::v5::config::ProviderKind::Github,
                     dir_opt,
                     dry,
                 ) {
